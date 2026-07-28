@@ -1,0 +1,601 @@
+<script setup lang="ts">
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import * as sentimentApi from '@/api/sentiment'
+import * as resultsApi from '@/api/results'
+import type { SentimentData, PostWithSentiment } from '@/types/sentiment'
+import type { PostData } from '@/types/result'
+
+const route = useRoute()
+const router = useRouter()
+const taskId = computed(() => route.params.id as string)
+
+const data = ref<SentimentData | null>(null)
+const loading = ref(false)
+const analyzing = ref(false)
+const error = ref('')
+const eventSource = ref<EventSource | null>(null)
+const showDetail = ref(false)
+const detailPost = ref<PostWithSentiment | null>(null)
+// 帖子原始数据（用于对照查看）
+const postsMap = ref<Map<number, PostData>>(new Map())
+const pendingCount = ref(0)
+// 实时进度
+const progressMsg = ref('')
+const progressPct = ref(0)
+const progressLogs = ref<string[]>([])
+// 过滤条件
+const filterSentiment = ref('')
+const filterDimension = ref('')
+const filterKeyword = ref('')
+
+// 所有维度列表（从数据中提取）
+const allDimensions = computed(() => {
+  const dims = new Set<string>()
+  if (!data.value?.results) return []
+  for (const r of data.value.results) {
+    if (r?.dimensions) {
+      for (const d of r.dimensions) dims.add(d)
+    }
+  }
+  return Array.from(dims).sort()
+})
+
+// 过滤后的结果
+const filteredResults = computed(() => {
+  if (!data.value?.results) return []
+  let results = data.value.results.map((r, i) => ({ ...r, _idx: i }))
+
+  if (filterSentiment.value) {
+    results = results.filter(r => r?.sentiment === filterSentiment.value)
+  }
+  if (filterDimension.value) {
+    results = results.filter(r => r?.dimensions?.includes(filterDimension.value))
+  }
+  if (filterKeyword.value) {
+    const kw = filterKeyword.value.toLowerCase()
+    results = results.filter(r =>
+      r?.reason_cn?.toLowerCase().includes(kw) ||
+      r?.dimensions?.some(d => d.toLowerCase().includes(kw))
+    )
+  }
+  return results
+})
+
+function clearFilters() {
+  filterSentiment.value = ''
+  filterDimension.value = ''
+  filterKeyword.value = ''
+}
+
+const COLORS = {
+  positive: '#10B981',
+  negative: '#EF4444',
+  neutral: '#6B7280',
+}
+
+const DIM_COLORS: Record<string, string> = {
+  '价格/性价比': '#3B82F6',
+  '产品质量/可靠性': '#8B5CF6',
+  '安装/配置体验': '#F59E0B',
+  'App/软件体验': '#06B6D4',
+  '客服/售后支持': '#10B981',
+  'WiFi/连接问题': '#F97316',
+  '固件更新': '#EC4899',
+  '温度/散热': '#EF4444',
+  'P1电表/智能控制': '#6366F1',
+  '认证/合规(如Synergrid)': '#14B8A6',
+  '扩展/兼容性': '#84CC16',
+  '与其他品牌对比(如AEG/Marstek)': '#A855F7',
+  '性能/效率': '#0EA5E9',
+  '安全性': '#DC2626',
+}
+
+onMounted(() => {
+  checkStatus()
+})
+
+onUnmounted(() => {
+  closeSSE()
+})
+
+function closeSSE() {
+  if (eventSource.value) {
+    eventSource.value.close()
+    eventSource.value = null
+  }
+}
+
+function connectSSE() {
+  closeSSE()
+  const url = sentimentApi.getSentimentEventsUrl(taskId.value)
+  const es = new EventSource(url)
+  eventSource.value = es
+
+  es.addEventListener('step_progress', (e: MessageEvent) => {
+    const d = JSON.parse(e.data)
+    progressPct.value = Math.round((d.progress || 0) * 100)
+    if (d.message) progressMsg.value = d.message
+  })
+
+  es.addEventListener('log', (e: MessageEvent) => {
+    const d = JSON.parse(e.data)
+    const msg = d.message || ''
+    // 过滤掉重复的进度计数日志（进度条已展示）
+    if (/已分析\s*\d+\/\d+\s*条/.test(msg)) return
+    progressLogs.value.push(msg)
+    if (progressLogs.value.length > 20) progressLogs.value.shift()
+  })
+
+  es.addEventListener('error', (e: MessageEvent) => {
+    const d = e.data ? JSON.parse(e.data) : { message: '连接中断' }
+    progressLogs.value.push('⚠️ ' + (d.message || '发生错误'))
+  })
+
+  es.addEventListener('sentiment_complete', (e: MessageEvent) => {
+    const d = JSON.parse(e.data)
+    closeSSE()
+    if (d.status === 'completed') {
+      // 拉取最终结果
+      loadResults()
+    } else {
+      analyzing.value = false
+      error.value = '分析失败: ' + (d.error || '未知错误')
+    }
+  })
+
+  es.onerror = () => {
+    // SSE 连接中断，回退到轮询
+    closeSSE()
+  }
+}
+
+async function loadPosts() {
+  // 一次性加载所有帖子数据
+  try {
+    const result = await resultsApi.fetchPosts(taskId.value, 1, 200)
+    postsMap.value.clear()
+    for (const p of result.posts) {
+      postsMap.value.set(p.index - 1, p)  // index 是 1-based
+    }
+  } catch (e) {
+    // 非关键数据，静默失败
+  }
+}
+
+async function loadResults() {
+  try {
+    const result = await sentimentApi.getSentiment(taskId.value)
+    if (result.task_id) {
+      data.value = result
+      analyzing.value = false
+      await loadPosts()
+    }
+  } catch (e: any) {
+    analyzing.value = false
+    error.value = '加载结果失败'
+  }
+}
+
+async function checkStatus() {
+  loading.value = true
+  error.value = ''
+  try {
+    const result = await sentimentApi.getSentiment(taskId.value)
+    if (result.status === 'running') {
+      analyzing.value = true
+      pendingCount.value = 0
+      connectSSE()
+      return
+    }
+    if (result.task_id) {
+      data.value = result
+      await loadPosts()
+    } else {
+      error.value = '尚未进行舆情分析'
+    }
+  } catch (e: any) {
+    if (e.response?.status === 404) {
+      error.value = '尚未进行舆情分析'
+    } else {
+      error.value = '加载失败: ' + (e.response?.data?.detail || e.message)
+    }
+  } finally {
+    loading.value = false
+  }
+}
+
+async function startAnalysis() {
+  analyzing.value = true
+  error.value = ''
+  progressMsg.value = '正在启动分析...'
+  progressPct.value = 0
+  progressLogs.value = []
+  pendingCount.value = 0
+  try {
+    const result = await sentimentApi.triggerSentiment(taskId.value)
+    // 从返回消息中提取待分析数量，如 "增量舆情分析: 132 条已跳过, 4 条待分析"
+    const match = result.message?.match(/(\d+)\s*条待分析/)
+    if (match) pendingCount.value = parseInt(match[1])
+    if (result.status === 'started' || result.status === 'running') {
+      await new Promise(r => setTimeout(r, 500))
+      connectSSE()
+    } else if (result.status === 'completed') {
+      loadResults()
+    }
+  } catch (e: any) {
+    analyzing.value = false
+    error.value = '启动分析失败: ' + (e.response?.data?.detail || e.message)
+  }
+}
+
+// ===== 图表计算 =====
+
+const pieData = computed(() => {
+  if (!data.value?.summary) return []
+  const dist = data.value.summary.sentiment_distribution
+  const total = Object.values(dist).reduce((a: number, b: number) => a + b, 0) || 1
+  return [
+    { label: '正面', value: dist.positive, pct: (dist.positive / total * 100).toFixed(1), color: COLORS.positive },
+    { label: '负面', value: dist.negative, pct: (dist.negative / total * 100).toFixed(1), color: COLORS.negative },
+    { label: '中立', value: dist.neutral, pct: (dist.neutral / total * 100).toFixed(1), color: COLORS.neutral },
+  ]
+})
+
+const pieSegments = computed(() => {
+  const items = pieData.value
+  const total = items.reduce((s, i) => s + i.value, 0) || 1
+  let offset = 0
+  return items.map(item => {
+    const angle = (item.value / total) * 360
+    const start = offset
+    offset += angle
+    return { ...item, start, angle }
+  })
+})
+
+function polarToCartesian(cx: number, cy: number, r: number, angleDeg: number) {
+  const angleRad = (angleDeg - 90) * Math.PI / 180
+  return { x: cx + r * Math.cos(angleRad), y: cy + r * Math.sin(angleRad) }
+}
+
+function describeArc(cx: number, cy: number, r: number, startAngle: number, endAngle: number) {
+  if (endAngle - startAngle >= 360) {
+    const mid = polarToCartesian(cx, cy, r, startAngle + 180)
+    return `M ${cx} ${cy - r} A ${r} ${r} 0 1 1 ${mid.x} ${mid.y} A ${r} ${r} 0 1 1 ${cx} ${cy - r}`
+  }
+  const largeArc = endAngle - startAngle > 180 ? 1 : 0
+  const start = polarToCartesian(cx, cy, r, endAngle)
+  const end = polarToCartesian(cx, cy, r, startAngle)
+  return `M ${cx} ${cy} L ${start.x} ${start.y} A ${r} ${r} 0 ${largeArc} 0 ${end.x} ${end.y} Z`
+}
+
+const maxDimCount = computed(() => {
+  const dims = data.value?.summary?.top_dimensions || []
+  return Math.max(...dims.map(d => d[1]), 1)
+})
+
+function sentimentLabel(s: string): string {
+  return { positive: '正面', negative: '负面', neutral: '中立' }[s] || s
+}
+
+function intensityStars(n: number): string {
+  return '★'.repeat(Math.round(n)) + '☆'.repeat(5 - Math.round(n))
+}
+
+function viewPost(idx: number) {
+  const r = data.value?.results?.[idx]
+  const post = postsMap.value.get(idx)
+  detailPost.value = {
+    index: idx + 1,
+    username: post?.username || '',
+    content: post?.content || '',
+    translation: post?.translation || '',
+    sentiment: r || null,
+  }
+  showDetail.value = true
+}
+</script>
+
+<template>
+  <div>
+    <div class="flex items-center justify-between mb-4">
+      <h2 style="font-size: 18px; font-weight: 600;">📊 舆情分析</h2>
+      <div class="flex gap-2">
+        <button class="btn btn-outline btn-sm" @click="router.push(`/tasks/${taskId}/results`)">
+          ← 返回结果
+        </button>
+      </div>
+    </div>
+
+    <!-- 初始加载 -->
+    <div v-if="loading" class="card text-center" style="padding: 48px;">
+      <span class="spinner spinner-lg"></span>
+      <p class="mt-4 text-secondary">加载中...</p>
+    </div>
+
+    <!-- 分析进行中 -->
+    <div v-else-if="analyzing" class="card text-center" style="padding: 48px;">
+      <span class="spinner spinner-lg"></span>
+      <p style="font-size: 16px; font-weight: 600; margin-top: 16px;">🔍 舆情分析进行中...</p>
+      <p class="text-secondary mt-2">
+        正在使用 LLM 逐条分析帖子情感倾向<span v-if="pendingCount">，{{ pendingCount }} 条待分析</span>，预计需要 1-3 分钟。
+      </p>
+      <!-- 进度条 -->
+      <div v-if="progressPct > 0" style="margin: 24px auto 0; max-width: 400px;">
+        <div style="display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 13px;">
+          <span class="text-secondary">分析进度</span>
+          <span style="font-weight: 600;">{{ progressPct }}%</span>
+        </div>
+        <div style="background: var(--border-light); border-radius: 6px; height: 8px; overflow: hidden;">
+          <div
+            :style="{
+              width: progressPct + '%',
+              height: '100%',
+              background: 'linear-gradient(90deg, #3B82F6, #6366F1)',
+              borderRadius: '6px',
+              transition: 'width 0.5s',
+            }"
+          ></div>
+        </div>
+        <p v-if="progressMsg" class="text-sm text-secondary mt-2">{{ progressMsg }}</p>
+      </div>
+      <!-- 实时日志 -->
+      <div v-if="progressLogs.length" class="log-viewer mt-4" style="max-height: 200px; text-align: left;">
+        <div
+          v-for="(log, idx) in progressLogs"
+          :key="idx"
+          class="log-line info"
+        >{{ log }}</div>
+      </div>
+    </div>
+
+    <!-- 未分析 -->
+    <div v-else-if="error" class="card text-center" style="padding: 48px;">
+      <div style="font-size: 48px; margin-bottom: 12px;">📭</div>
+      <p class="text-secondary mb-4">{{ error }}</p>
+      <button class="btn btn-primary btn-lg" @click="startAnalysis" :disabled="analyzing">
+        <span v-if="analyzing" class="spinner"></span>
+        🔍 开始舆情分析
+      </button>
+    </div>
+
+    <!-- 分析结果 -->
+    <template v-else-if="data">
+      <!-- 概览卡片 -->
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-value">{{ data.total }}</div>
+          <div class="stat-label">分析帖子数</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" style="color: var(--success);">{{ data.summary.sentiment_distribution.positive }}</div>
+          <div class="stat-label">正面评价</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" style="color: var(--error);">{{ data.summary.sentiment_distribution.negative }}</div>
+          <div class="stat-label">负面评价</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" style="color: var(--text-secondary);">{{ data.summary.sentiment_distribution.neutral }}</div>
+          <div class="stat-label">中立评价</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value">{{ data.summary.avg_intensity }} / 5</div>
+          <div class="stat-label">平均情感强度</div>
+        </div>
+      </div>
+
+      <!-- 图表行 -->
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px;">
+        <!-- 饼图: 情感分布 -->
+        <div class="card">
+          <div class="card-header">🎯 情感分布</div>
+          <div style="display: flex; align-items: center; gap: 32px;">
+            <svg width="180" height="180" viewBox="0 0 180 180">
+              <g v-for="seg in pieSegments" :key="seg.label">
+                <path
+                  :d="describeArc(90, 90, 80, seg.start, seg.start + seg.angle)"
+                  :fill="seg.color"
+                  stroke="white"
+                  stroke-width="2"
+                />
+              </g>
+              <circle cx="90" cy="90" r="45" fill="white" />
+              <text x="90" y="86" text-anchor="middle" font-size="20" font-weight="700" fill="#1E293B">
+                {{ data.total }}
+              </text>
+              <text x="90" y="104" text-anchor="middle" font-size="11" fill="#64748B">总计</text>
+            </svg>
+            <div style="flex: 1;">
+              <div v-for="seg in pieData" :key="seg.label" style="display: flex; align-items: center; gap: 8px; margin-bottom: 12px;">
+                <div :style="{ width: '12px', height: '12px', borderRadius: '3px', background: seg.color, flexShrink: '0' }"></div>
+                <span style="font-size: 13px; font-weight: 500; width: 36px;">{{ seg.label }}</span>
+                <span style="font-size: 13px; color: var(--text-secondary); width: 36px;">{{ seg.value }}条</span>
+                <span style="font-size: 13px; font-weight: 600;">{{ seg.pct }}%</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 柱状图: 关注维度 Top 10 -->
+        <div class="card">
+          <div class="card-header">🔑 关注维度 Top 10</div>
+          <div v-if="data.summary.top_dimensions.length">
+            <div
+              v-for="[dim, count] in data.summary.top_dimensions"
+              :key="dim"
+              style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;"
+            >
+              <span style="font-size: 11px; width: 100px; text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0;" :title="dim">{{ dim }}</span>
+              <div style="flex: 1; background: var(--border-light); border-radius: 4px; height: 20px; overflow: hidden;">
+                <div
+                  :style="{
+                    width: (count / maxDimCount * 100) + '%',
+                    height: '100%',
+                    background: DIM_COLORS[dim] || '#6366F1',
+                    borderRadius: '4px',
+                    transition: 'width 0.5s',
+                  }"
+                ></div>
+              </div>
+              <span style="font-size: 12px; font-weight: 600; width: 24px; text-align: right;">{{ count }}</span>
+            </div>
+          </div>
+          <div v-else class="text-center text-secondary" style="padding: 24px;">暂无维度数据</div>
+        </div>
+      </div>
+
+      <!-- 帖子详情列表 -->
+      <div class="card" style="padding: 0; overflow-x: auto;">
+        <div style="padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; border-bottom: 1px solid var(--border-light);">
+          <div class="card-header" style="margin-bottom: 0; padding: 0;">📋 帖子情感详情</div>
+          <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+            <!-- 情感过滤 -->
+            <select v-model="filterSentiment" class="form-input" style="width: auto; padding: 4px 28px 4px 8px; font-size: 12px;">
+              <option value="">全部情感</option>
+              <option value="positive">正面</option>
+              <option value="negative">负面</option>
+              <option value="neutral">中立</option>
+            </select>
+            <!-- 维度过滤 -->
+            <select v-model="filterDimension" class="form-input" style="width: auto; max-width: 140px; padding: 4px 28px 4px 8px; font-size: 12px;">
+              <option value="">全部维度</option>
+              <option v-for="d in allDimensions" :key="d" :value="d">{{ d }}</option>
+            </select>
+            <!-- 关键词搜索 -->
+            <input
+              v-model="filterKeyword"
+              type="text"
+              class="form-input"
+              placeholder="搜索..."
+              style="width: 120px; padding: 4px 8px; font-size: 12px;"
+            />
+            <button
+              v-if="filterSentiment || filterDimension || filterKeyword"
+              class="btn btn-outline btn-sm"
+              @click="clearFilters"
+            >清除</button>
+            <span class="text-sm text-secondary" style="white-space: nowrap;">共 {{ filteredResults.length }} 条</span>
+          </div>
+        </div>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th style="width: 44px; text-align: center;">#</th>
+              <th style="width: 72px; text-align: center;">情感</th>
+              <th style="width: 100px; text-align: center;">强度</th>
+              <th>分析理由</th>
+              <th style="width: 220px;">涉及维度</th>
+              <th style="width: 64px; text-align: center;">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-if="!filteredResults.length">
+              <td colspan="6" class="text-center text-secondary" style="padding: 32px;">无匹配结果</td>
+            </tr>
+            <tr
+              v-for="r in filteredResults"
+              :key="r._idx"
+            >
+              <td style="text-align: center; font-size: 12px; color: var(--text-light);">{{ r._idx + 1 }}</td>
+              <td style="text-align: center;">
+                <span
+                  :style="{
+                    display: 'inline-block',
+                    padding: '2px 10px',
+                    borderRadius: '10px',
+                    fontSize: '12px',
+                    fontWeight: 600,
+                    background: r ? (COLORS as any)[r.sentiment] + '18' : '#F1F5F9',
+                    color: r ? (COLORS as any)[r.sentiment] : '#94A3B8',
+                  }"
+                >
+                  {{ r ? sentimentLabel(r.sentiment) : '-' }}
+                </span>
+              </td>
+              <td style="text-align: center;">
+                <span v-if="r" style="font-size: 13px; color: #F59E0B; letter-spacing: 1px;">{{ intensityStars(r.intensity) }}</span>
+                <span v-else class="text-secondary">-</span>
+              </td>
+              <td style="font-size: 13px; max-width: 360px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                {{ r?.reason_cn || '-' }}
+              </td>
+              <td>
+                <div v-if="r?.dimensions?.length" style="display: flex; gap: 3px; flex-wrap: wrap;">
+                  <span
+                    v-for="d in r.dimensions"
+                    :key="d"
+                    style="padding: 1px 6px; border-radius: 3px; font-size: 10px; white-space: nowrap;"
+                    :style="{ background: (DIM_COLORS[d] || '#E2E8F0') + '28', color: DIM_COLORS[d] || '#64748B' }"
+                  >{{ d }}</span>
+                </div>
+                <span v-else class="text-secondary" style="font-size: 11px;">-</span>
+              </td>
+              <td style="text-align: center;">
+                <button class="btn btn-outline btn-sm" @click="viewPost(r._idx)">查看</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </template>
+
+    <!-- 详情弹窗 -->
+    <div v-if="showDetail" class="modal-overlay" @click.self="showDetail = false">
+      <div class="modal-content" style="max-width: 1000px; max-height: 85vh;">
+        <div class="modal-header">
+          <h3>📝 帖子 #{{ detailPost?.index }} — {{ detailPost?.username }}</h3>
+          <button class="btn btn-sm btn-outline" @click="showDetail = false">✕</button>
+        </div>
+
+        <!-- 情感标签 -->
+        <div v-if="detailPost?.sentiment" class="flex items-center gap-4 mb-4">
+          <span
+            :style="{
+              padding: '4px 14px',
+              borderRadius: '16px',
+              fontSize: '14px',
+              fontWeight: 700,
+              background: (COLORS as any)[detailPost.sentiment.sentiment] + '18',
+              color: (COLORS as any)[detailPost.sentiment.sentiment],
+            }"
+          >{{ sentimentLabel(detailPost.sentiment.sentiment) }}</span>
+          <span class="text-secondary">强度:</span>
+          <span style="font-size: 14px; color: #F59E0B;">{{ intensityStars(detailPost.sentiment.intensity) }}</span>
+          <span class="text-secondary">{{ detailPost.sentiment.intensity }}/5</span>
+          <span v-if="detailPost.sentiment.dimensions.length" class="flex gap-1" style="flex-wrap: wrap;">
+            <span
+              v-for="d in detailPost.sentiment.dimensions"
+              :key="d"
+              style="padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500;"
+              :style="{ background: (DIM_COLORS[d] || '#E2E8F0') + '22', color: DIM_COLORS[d] || '#64748B' }"
+            >{{ d }}</span>
+          </span>
+        </div>
+
+        <!-- 分析理由 -->
+        <div v-if="detailPost?.sentiment?.reason_cn" style="margin-bottom: 16px; padding: 10px 14px; background: #F8FAFC; border-radius: 8px; border-left: 3px solid #6366F1;">
+          <span class="text-sm text-secondary">分析理由：</span>
+          <span style="font-size: 14px; line-height: 1.7;">{{ detailPost.sentiment.reason_cn }}</span>
+        </div>
+
+        <!-- 原文 + 翻译 双栏 -->
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+          <div>
+            <div class="form-label">📄 原文（荷兰语）</div>
+            <div style="white-space: pre-wrap; font-size: 13px; line-height: 1.7; max-height: 40vh; overflow-y: auto; padding: 12px; background: #F8FAFC; border-radius: 8px;">
+              {{ detailPost?.content || '(无内容)' }}
+            </div>
+          </div>
+          <div>
+            <div class="form-label">🌐 中文翻译</div>
+            <div style="white-space: pre-wrap; font-size: 13px; line-height: 1.7; max-height: 40vh; overflow-y: auto; padding: 12px; background: #F8FAFC; border-radius: 8px;">
+              {{ detailPost?.translation || '(无翻译)' }}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>

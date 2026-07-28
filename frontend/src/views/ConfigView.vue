@@ -1,0 +1,129 @@
+<script setup lang="ts">
+import { ref, onMounted } from 'vue'
+import { useConfigStore } from '@/stores/config'
+
+const configStore = useConfigStore()
+const apiKey = ref('')
+const saveSuccess = ref(false)
+
+onMounted(async () => {
+  await configStore.fetchConfig()
+})
+
+async function handleSave() {
+  const ok = await configStore.saveConfig(apiKey.value)
+  if (ok) {
+    saveSuccess.value = true
+    setTimeout(() => { saveSuccess.value = false }, 3000)
+  }
+}
+
+async function handleTest() {
+  await configStore.testConnection(apiKey.value)
+}
+
+async function handleReset() {
+  await configStore.resetConfig()
+  apiKey.value = ''
+}
+</script>
+
+<template>
+  <div style="max-width: 600px;">
+    <div class="card">
+      <div class="card-header">🔑 LLM API 配置</div>
+      <p class="text-secondary text-sm mb-4">
+        配置大模型 API 连接信息。支持 OpenAI 兼容接口（如 DeepSeek）。
+      </p>
+
+      <div class="form-group">
+        <label class="form-label">API Key</label>
+        <input
+          v-model="apiKey"
+          type="password"
+          class="form-input"
+          placeholder="sk-xxxxxxxxxxxxxxxx"
+          autocomplete="off"
+        />
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Base URL</label>
+        <input
+          v-model="configStore.baseUrl"
+          type="text"
+          class="form-input"
+          placeholder="https://api.deepseek.com"
+        />
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Model Name</label>
+        <input
+          v-model="configStore.modelName"
+          type="text"
+          class="form-input"
+          placeholder="deepseek-chat"
+        />
+      </div>
+
+      <!-- 测试结果 -->
+      <div
+        v-if="configStore.testResult"
+        class="mb-4"
+        :class="configStore.testResult === 'success' ? 'text-success' : 'text-error'"
+        style="padding: 10px 12px; border-radius: 8px; font-size: 13px;"
+        :style="{ background: configStore.testResult === 'success' ? '#D1FAE5' : '#FEE2E2' }"
+      >
+        {{ configStore.testResult === 'success' ? '✅' : '❌' }} {{ configStore.testMessage }}
+      </div>
+
+      <!-- 保存成功 -->
+      <div
+        v-if="saveSuccess"
+        class="mb-4 text-success"
+        style="padding: 10px 12px; border-radius: 8px; font-size: 13px; background: #D1FAE5;"
+      >
+        ✅ 配置保存成功！
+      </div>
+
+      <div class="flex gap-2">
+        <button
+          class="btn btn-outline"
+          :disabled="configStore.isTesting || !apiKey"
+          @click="handleTest"
+        >
+          <span v-if="configStore.isTesting" class="spinner"></span>
+          {{ configStore.isTesting ? '测试中...' : '🔍 测试连接' }}
+        </button>
+        <button
+          class="btn btn-primary"
+          :disabled="!apiKey"
+          @click="handleSave"
+        >
+          💾 保存配置
+        </button>
+        <button class="btn btn-outline" @click="handleReset">
+          重置
+        </button>
+      </div>
+    </div>
+
+    <div class="card" v-if="configStore.isConfigured">
+      <div class="card-header">📋 当前配置状态</div>
+      <div class="flex gap-4">
+        <div>
+          <span class="text-secondary text-sm">Base URL：</span>
+          <code>{{ configStore.baseUrl }}</code>
+        </div>
+        <div>
+          <span class="text-secondary text-sm">Model：</span>
+          <code>{{ configStore.modelName }}</code>
+        </div>
+        <div>
+          <span class="badge badge-completed">已配置</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>

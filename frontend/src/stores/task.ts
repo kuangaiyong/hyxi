@@ -17,6 +17,8 @@ export const useTaskStore = defineStore('task', () => {
   // 结果数据
   const posts = ref<PostData[]>([])
   const postsTotal = ref(0)
+  const currentPage = ref(1)
+  const pageSize = ref(50)
   const stats = ref<TaskStats | null>(null)
   const progressPct = ref(0)
   const progressMsg = ref('')
@@ -95,6 +97,23 @@ export const useTaskStore = defineStore('task', () => {
     }
   }
 
+  async function retryTask(taskId: string) {
+    try {
+      const newTask = await taskApi.retryTask(taskId)
+      currentTaskId.value = newTask.id
+      currentTask.value = newTask
+      timeline.value = []
+      logs.value = []
+      posts.value = []
+      stats.value = null
+      await fetchTasks()
+      return newTask
+    } catch (e) {
+      console.error('重试任务失败:', e)
+      return null
+    }
+  }
+
   function addTimelineEvent(event: TimelineEvent) {
     timeline.value.push(event)
     if (event.type === 'log' || event.type === 'error') {
@@ -106,15 +125,16 @@ export const useTaskStore = defineStore('task', () => {
     isConnected.value = val
   }
 
-  async function fetchResults() {
+  async function fetchResults(search = '', page = 1) {
     if (!currentTaskId.value) return
     try {
       const [postsData, statsData] = await Promise.all([
-        resultApi.fetchPosts(currentTaskId.value),
+        resultApi.fetchPosts(currentTaskId.value, page, pageSize.value, search),
         resultApi.fetchStats(currentTaskId.value),
       ])
       posts.value = postsData.posts
       postsTotal.value = postsData.total
+      currentPage.value = page
       stats.value = statsData
     } catch (e) {
       console.error('获取结果失败:', e)
@@ -135,6 +155,8 @@ export const useTaskStore = defineStore('task', () => {
     isConnected,
     posts,
     postsTotal,
+    currentPage,
+    pageSize,
     stats,
     progressPct,
     progressMsg,
@@ -148,6 +170,7 @@ export const useTaskStore = defineStore('task', () => {
     fetchTask,
     cancelCurrentTask,
     removeTask,
+    retryTask,
     addTimelineEvent,
     setConnected,
     fetchResults,

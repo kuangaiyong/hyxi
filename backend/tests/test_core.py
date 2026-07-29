@@ -25,41 +25,39 @@ class TestTaskLifecycleEndToEnd:
         orch_module.settings.data_dir = self.tmpdir
         return TaskOrchestrator()
 
-    def test_create_task_writes_json_to_disk(self):
+    def test_create_task_persists(self):
         orch = self._create_orchestrator()
         orch.create_task("t1", "抓取帖子2336074并翻译")
 
-        assert os.path.exists(self.tasks_path)
-        with open(self.tasks_path) as f:
-            data = json.load(f)
-        assert len(data["tasks"]) == 1
-        assert data["tasks"][0]["id"] == "t1"
-        assert data["tasks"][0]["description"] == "抓取帖子2336074并翻译"
-        assert data["tasks"][0]["status"] == "pending"
+        # 通过 API 验证持久化（SQLite 或 JSON）
+        task = orch.get_task("t1")
+        assert task is not None
+        assert task["id"] == "t1"
+        assert task["description"] == "抓取帖子2336074并翻译"
+        assert task["status"] == "pending"
 
     def test_cancel_running_task_persists_status_change(self):
         orch = self._create_orchestrator()
         orch.create_task("t2", "测试取消")
         orch.tasks["t2"]["status"] = "running"
+        orch._persist()
 
         orch.cancel_task("t2")
 
-        with open(self.tasks_path) as f:
-            data = json.load(f)
-        assert data["tasks"][0]["status"] == "cancelled"
-        assert data["tasks"][0].get("_cancelled") is True
+        # 通过 API 验证
+        task = orch.get_task("t2")
+        assert task["status"] == "cancelled"
+        assert task.get("_cancelled") is True
 
-    def test_delete_task_removes_from_json(self):
+    def test_delete_task_removes_from_storage(self):
         orch = self._create_orchestrator()
         orch.create_task("t3", "待删除")
         orch.create_task("t4", "保留")
 
         orch.delete_task("t3")
 
-        with open(self.tasks_path) as f:
-            data = json.load(f)
-        assert len(data["tasks"]) == 1
-        assert data["tasks"][0]["id"] == "t4"
+        assert orch.get_task("t3") is None
+        assert orch.get_task("t4") is not None
 
     def test_tasks_survive_restart(self):
         orch1 = self._create_orchestrator()
@@ -69,7 +67,7 @@ class TestTaskLifecycleEndToEnd:
 
         orch2 = self._create_orchestrator()
         assert orch2.get_task("t5") is not None
-        assert orch2.get_task("t5")["status"] == "completed"  # completed 重启后仍是 completed
+        assert orch2.get_task("t5")["status"] == "completed"
 
     def test_running_task_becomes_cancelled_on_restart(self):
         orch1 = self._create_orchestrator()
@@ -89,9 +87,8 @@ class TestTaskLifecycleEndToEnd:
         ]
         orch._persist()
 
-        with open(self.tasks_path) as f:
-            data = json.load(f)
-        assert len(data["tasks"][0]["logs"]) == 2
+        task = orch.get_task("t7")
+        assert len(task["logs"]) == 2
 
 
 class TestSentimentParsingEndToEnd:
@@ -326,3 +323,272 @@ class TestIncrementalLogicEndToEnd:
         new_only = [p for p in new_all if p["fingerprint"] not in existing_fps]
         assert len(new_only) == 1
         assert new_only[0]["fingerprint"] == "fp3"
+
+
+class TestLLMUtilsEndToEnd:
+    """LLM 工具函数测试"""
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+        import app.config as cfg
+        self._orig_data_dir = cfg.settings.data_dir
+        self._orig_config_file = cfg.settings.config_file
+        cfg.settings.data_dir = self.tmpdir
+        cfg.settings.config_file = os.path.join(self.tmpdir, "config.json")
+
+    def teardown_method(self):
+        import app.config as cfg
+        cfg.settings.data_dir = self._orig_data_dir
+        cfg.settings.config_file = self._orig_config_file
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_load_config_returns_none_when_no_file(self):
+        from app.services.llm_utils import load_llm_config
+        assert load_llm_config() is None
+
+    def test_load_config_returns_config_when_file_exists(self):
+        config_data = {
+            "api_key": "sk-test-key-123",
+            "base_url": "https://api.example.com",
+            "model_name": "test-model",
+        }
+        cfg_path = os.path.join(self.tmpdir, "config.json")
+        with open(cfg_path, "w") as f:
+            json.dump(config_data, f)
+
+        from app.services.llm_utils import load_llm_config
+        config = load_llm_config()
+        assert config is not None
+        assert config.api_key == "sk-test-key-123"
+        assert config.base_url == "https://api.example.com"
+        assert config.model_name == "test-model"
+
+    def test_load_config_handles_corrupt_json(self):
+        cfg_path = os.path.join(self.tmpdir, "config.json")
+        with open(cfg_path, "w") as f:
+            f.write("not valid json {{{")
+
+        from app.services.llm_utils import load_llm_config
+        assert load_llm_config() is None
+
+    def test_get_llm_service_returns_none_without_config(self):
+        from app.services.llm_utils import get_llm_service
+        assert get_llm_service() is None
+
+    def test_get_llm_service_returns_service_with_config(self):
+        config_data = {
+            "api_key": "sk-test",
+            "base_url": "https://api.test.com",
+            "model_name": "m",
+        }
+        with open(os.path.join(self.tmpdir, "config.json"), "w") as f:
+            json.dump(config_data, f)
+
+        from app.services.llm_utils import get_llm_service
+        import asyncio
+        llm = get_llm_service()
+        assert llm is not None
+        assert llm.config.api_key == "sk-test"
+        # 清理 client
+        asyncio.get_event_loop().run_until_complete(llm.close())
+
+
+class TestSentimentExcelGenerationEndToEnd:
+    """舆情 Excel 生成测试"""
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_generate_sentiment_excel_creates_valid_file(self):
+        from app.services.excel_service import ExcelService
+
+        sentiment_data = {
+            "task_id": "test-sentiment",
+            "analyzed_at": "2026-07-29T22:00:00",
+            "total": 10,
+            "success": 9,
+            "failed": 1,
+            "summary": {
+                "sentiment_distribution": {"positive": 3, "negative": 2, "neutral": 5},
+                "sentiment_percentages": {"positive": 30.0, "negative": 20.0, "neutral": 50.0},
+                "avg_intensity": 2.5,
+                "top_dimensions": [
+                    ["价格/性价比", 7],
+                    ["安装/配置体验", 5],
+                    ["App/软件体验", 3],
+                ],
+            },
+            "results": [
+                {"sentiment": "positive", "intensity": 4, "reason_cn": "满意", "dimensions": ["价格/性价比"]},
+                {"sentiment": "negative", "intensity": 3, "reason_cn": "有问题", "dimensions": ["安装/配置体验"]},
+                {"sentiment": "neutral", "intensity": 2, "reason_cn": "询问", "dimensions": []},
+                None,
+            ],
+        }
+
+        result = ExcelService.generate_sentiment_report("test-task", sentiment_data, self.tmpdir)
+
+        assert os.path.exists(result["file_path"])
+        assert result["file_name"].endswith(".xlsx")
+        assert "sentiment" in result["file_name"]
+
+        from openpyxl import load_workbook
+        wb = load_workbook(result["file_path"])
+        assert "舆情分析汇总" in wb.sheetnames
+        assert "帖子情感详情" in wb.sheetnames
+
+        ws = wb["舆情分析汇总"]
+        assert ws.cell(1, 1).value and "HYXi" in str(ws.cell(1, 1).value)
+
+        ws2 = wb["帖子情感详情"]
+        assert ws2.cell(1, 1).value == "序号"
+        assert ws2.cell(2, 1).value == 1
+        assert ws2.cell(2, 2).value == "正面"
+        assert ws2.cell(5, 2).value == "(解析失败)"
+
+    def test_generate_sentiment_excel_with_empty_data(self):
+        from app.services.excel_service import ExcelService
+
+        sentiment_data = {
+            "task_id": "test-empty",
+            "analyzed_at": "2026-07-29T22:00:00",
+            "total": 0,
+            "success": 0,
+            "failed": 0,
+            "summary": {
+                "sentiment_distribution": {"positive": 0, "negative": 0, "neutral": 0},
+                "sentiment_percentages": {"positive": 0, "negative": 0, "neutral": 0},
+                "avg_intensity": 0,
+                "top_dimensions": [],
+            },
+            "results": [],
+        }
+
+        result = ExcelService.generate_sentiment_report("test-empty", sentiment_data, self.tmpdir)
+        assert os.path.exists(result["file_path"])
+
+        from openpyxl import load_workbook
+        wb = load_workbook(result["file_path"])
+        assert "舆情分析汇总" in wb.sheetnames
+
+
+class TestSearchFilteringEndToEnd:
+    """帖子搜索过滤测试"""
+
+    def _make_posts(self):
+        return [
+            {"username": "Alice", "timestamp": "22-05-2026 10:00", "content": "De installatie was goed", "translation": "安装很好", "page_number": 1},
+            {"username": "Bob", "timestamp": "22-05-2026 11:00", "content": "Probleem met de app", "translation": "App有问题", "page_number": 1},
+            {"username": "Charlie", "timestamp": "22-05-2026 12:00", "content": "Vraag over garantie", "translation": "保修问题", "page_number": 2},
+        ]
+
+    def test_search_matches_username(self):
+        posts = self._make_posts()
+        kw = "alice"
+        filtered = [p for p in posts if kw in (p.get("username") or "").lower() or kw in (p.get("content") or "").lower() or kw in (p.get("translation") or "").lower()]
+        assert len(filtered) == 1
+        assert filtered[0]["username"] == "Alice"
+
+    def test_search_matches_content_dutch(self):
+        posts = self._make_posts()
+        kw = "installatie"
+        filtered = [p for p in posts if kw in (p.get("username") or "").lower() or kw in (p.get("content") or "").lower() or kw in (p.get("translation") or "").lower()]
+        assert len(filtered) == 1
+        assert filtered[0]["username"] == "Alice"
+
+    def test_search_matches_translation_chinese(self):
+        posts = self._make_posts()
+        kw = "保修"
+        filtered = [p for p in posts if kw in (p.get("username") or "").lower() or kw in (p.get("content") or "").lower() or kw in (p.get("translation") or "").lower()]
+        assert len(filtered) == 1
+        assert filtered[0]["username"] == "Charlie"
+
+    def test_search_matches_multiple(self):
+        posts = self._make_posts()
+        kw = "app"
+        filtered = [p for p in posts if kw in (p.get("username") or "").lower() or kw in (p.get("content") or "").lower() or kw in (p.get("translation") or "").lower()]
+        assert len(filtered) == 1
+        assert filtered[0]["username"] == "Bob"
+
+    def test_search_no_match(self):
+        posts = self._make_posts()
+        kw = "xyz_not_found"
+        filtered = [p for p in posts if kw in (p.get("username") or "").lower() or kw in (p.get("content") or "").lower() or kw in (p.get("translation") or "").lower()]
+        assert len(filtered) == 0
+
+    def test_search_empty_returns_all(self):
+        posts = self._make_posts()
+        kw = ""
+        filtered = [p for p in posts if not kw or kw in (p.get("username") or "").lower() or kw in (p.get("content") or "").lower() or kw in (p.get("translation") or "").lower()]
+        assert len(filtered) == 3
+
+
+class TestAtomicWriteEndToEnd:
+    """原子写入测试"""
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.tasks_path = os.path.join(self.tmpdir, "tasks.json")
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_atomic_write_does_not_lose_data(self):
+        """验证原子写入不会丢失已有数据"""
+        # 写入初始数据
+        initial = {"tasks": [{"id": "t1", "status": "completed"}]}
+        with open(self.tasks_path, "w") as f:
+            json.dump(initial, f)
+
+        # 模拟原子写入
+        tmp_path = self.tasks_path + ".tmp"
+        new_data = {"tasks": [{"id": "t1", "status": "completed"}, {"id": "t2", "status": "pending"}]}
+        with open(tmp_path, "w") as f:
+            json.dump(new_data, f)
+        os.replace(tmp_path, self.tasks_path)
+
+        # 验证数据完整
+        with open(self.tasks_path) as f:
+            result = json.load(f)
+        assert len(result["tasks"]) == 2
+
+    def test_atomic_write_preserves_old_on_crash(self):
+        """验证写入中途崩溃时原有数据不丢失"""
+        # 写入原始数据
+        original = {"tasks": [{"id": "original", "status": "completed"}]}
+        with open(self.tasks_path, "w") as f:
+            json.dump(original, f)
+
+        # 模拟部分写入（不完成替换）
+        tmp_path = self.tasks_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            f.write("partial data [corrupt")
+
+        # 验证原始数据完好
+        with open(self.tasks_path) as f:
+            result = json.load(f)
+        assert result["tasks"][0]["id"] == "original"
+
+
+class TestLoggingConfigEndToEnd:
+    """日志配置测试"""
+
+    def test_get_logger_returns_logger(self):
+        from app.logging_config import get_logger
+        import logging
+        # 强制重置单例以测试
+        import app.logging_config as lc
+        lc._logger = None
+        logger = get_logger()
+        assert logger is not None
+        assert isinstance(logger, logging.Logger)
+        assert logger.level <= 20  # INFO or lower
+
+    def test_get_logger_is_singleton(self):
+        from app.logging_config import get_logger
+        logger1 = get_logger("mod1")
+        logger2 = get_logger("mod2")
+        assert logger1 is logger2

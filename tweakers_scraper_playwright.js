@@ -48,12 +48,14 @@ async function handleConsent(page) {
     const url = page.url();
     if (url.includes('privacygate') || url.includes('myprivacy')) {
         log('  处理DPG隐私gate...');
-        await sleep(3000);
+        await page.waitForSelector('a[href*="accept"], button[title*="Akkoord"], #pg-accept-button', { timeout: 5000 }).catch(() => {});
+        await sleep(1500);
         const content = await page.content();
         const m = content.match(/callbackUrl\s*=\s*new\s+URL\(decodeURIComponent\('([^']+)'\)\)/);
         if (m) {
             await page.goto(decodeURIComponent(m[1]), { waitUntil: 'domcontentloaded', timeout: 20000 });
-            await sleep(3000);
+            await page.waitForSelector('.message, .pageIndex, .forum', { timeout: 10000 }).catch(() => {});
+            await sleep(1000);
         }
     }
 }
@@ -247,7 +249,8 @@ async function main() {
         // 访问首页
         log(`📄 访问: ${threadUrl(CONFIG.startPage)}`);
         await page.goto(threadUrl(CONFIG.startPage), { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await sleep(3000);
+        await page.waitForSelector('.message, .pageIndex, .forum', { timeout: 15000 }).catch(() => {});
+        await sleep(1500);
         await handleConsent(page);
         log(`  当前URL: ${page.url()}`);
 

@@ -1,9 +1,47 @@
-"""LLM API 客户端服务"""
+"""LLM API 客户端服务 — 支持 DeepSeek / OpenAI 兼容 API，含重试"""
 
 import json
-from typing import List, Dict, Any
+import asyncio
+import logging
+from typing import List, Dict, Any, Optional
 import httpx
 from app.models import LLMConfig
+
+logger = logging.getLogger("hyxi.llm")
+
+# 重试配置
+MAX_RETRIES = 3
+BASE_DELAY = 1.0  # 秒
+RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+
+async def _retry_with_backoff(
+    fn,
+    max_retries: int = MAX_RETRIES,
+    base_delay: float = BASE_DELAY,
+    label: str = "LLM call",
+) -> httpx.Response:
+    """指数退避重试包装器"""
+    last_exception = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = await fn()
+            if resp.status_code < 500 or attempt >= max_retries:
+                return resp
+            # 5xx 错误，重试
+            if resp.status_code in RETRYABLE_STATUSES:
+                raise Exception(f"HTTP {resp.status_code}")
+            return resp  # 非可重试状态码，直接返回
+        except Exception as e:
+            last_exception = e
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(
+                    "%s 第 %d/%d 次失败: %s，%0.1f 秒后重试...",
+                    label, attempt + 1, max_retries, str(e)[:120], delay,
+                )
+                await asyncio.sleep(delay)
+    raise last_exception  # type: ignore
 
 
 class LLMService:
@@ -17,17 +55,15 @@ class LLMService:
                 "Authorization": f"Bearer {config.api_key}",
                 "Content-Type": "application/json",
             },
-            timeout=60.0,
+            timeout=httpx.Timeout(60.0, connect=10.0),
         )
 
     async def test_connection(self) -> bool:
         """测试 API 连接"""
         try:
-            # 尝试列出模型 或发送简单请求
             resp = await self.client.get("/models")
             if resp.status_code == 200:
                 return True
-            # 如果 /models 不可用，尝试 chat completion
             resp = await self.client.post(
                 "/chat/completions",
                 json={
@@ -40,8 +76,8 @@ class LLMService:
         except Exception:
             return False
 
-    async def parse_intent(self, user_description: str) -> List[Dict]:
-        """调用 LLM 解析用户意图，返回执行计划"""
+    async def parse_intent(self, user_description: str) -> dict:  # 返回 {"plan": [...]}
+        """调用 LLM 解析用户意图，返回执行计划（含自动重试）"""
         system_prompt = """你是一个 Tweakers.net 论坛数据抓取工具的智能调度器。
 你可以执行以下操作：
 1. scrape - 抓取帖子（参数：thread_id 帖子ID, start_page 起始页默认1, headless 是否无头模式默认true）
@@ -67,21 +103,24 @@ class LLMService:
 - 翻译使用 LLM 大模型进行专业翻译
 - 输出纯JSON，不要包含markdown代码块标记"""
 
-        resp = await self.client.post(
-            "/chat/completions",
-            json={
-                "model": self.config.model_name,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_description},
-                ],
-                "temperature": 0.1,
-                "max_tokens": 2000,
-            },
-        )
+        async def _call():
+            return await self.client.post(
+                "/chat/completions",
+                json={
+                    "model": self.config.model_name,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_description},
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 2000,
+                },
+            )
+
+        resp = await _retry_with_backoff(_call, label="意图解析")
 
         if resp.status_code != 200:
-            raise Exception(f"LLM API 返回错误: {resp.status_code} - {resp.text}")
+            raise Exception(f"LLM API 返回错误: {resp.status_code} - {resp.text[:300]}")
 
         data = resp.json()
         content = data["choices"][0]["message"]["content"]
@@ -95,17 +134,55 @@ class LLMService:
         return json.loads(content)
 
     async def chat(self, messages: List[Dict], **kwargs) -> str:
-        """通用聊天接口"""
-        resp = await self.client.post(
-            "/chat/completions",
-            json={
-                "model": self.config.model_name,
-                "messages": messages,
-                **kwargs,
-            },
-        )
+        """通用聊天接口（含自动重试）"""
+
+        async def _call():
+            return await self.client.post(
+                "/chat/completions",
+                json={
+                    "model": self.config.model_name,
+                    "messages": messages,
+                    **kwargs,
+                },
+            )
+
+        resp = await _retry_with_backoff(_call, label="LLM chat")
+
         if resp.status_code != 200:
-            raise Exception(f"LLM API 错误: {resp.status_code} - {resp.text}")
+            raise Exception(f"LLM API 错误: {resp.status_code} - {resp.text[:300]}")
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+
+    async def chat_with_retry(
+        self,
+        system_prompt: Optional[str],
+        user_message: str,
+        temperature: float = 0.3,
+        max_tokens: int = 4096,
+        max_retries: int = MAX_RETRIES,
+        label: str = "LLM call",
+    ) -> str:
+        """带重试的聊天接口（convenience method，支持自定义重试次数）"""
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_message})
+
+        async def _call():
+            return await self.client.post(
+                "/chat/completions",
+                json={
+                    "model": self.config.model_name,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                },
+            )
+
+        resp = await _retry_with_backoff(_call, max_retries=max_retries, label=label)
+
+        if resp.status_code != 200:
+            raise Exception(f"LLM API 错误: {resp.status_code} - {resp.text[:300]}")
         data = resp.json()
         return data["choices"][0]["message"]["content"]
 

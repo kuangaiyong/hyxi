@@ -4,11 +4,16 @@ import json
 import re
 import os
 import asyncio
+import logging
 from typing import Optional
 from app.services.progress_manager import ProgressManager
 from app.services.llm_service import LLMService
+from app.services.llm_utils import get_llm_service
+from app.services.storage import save_sentiment as db_save_sentiment
 from app.models import LLMConfig
 from app.config import settings
+
+logger = logging.getLogger("hyxi.sentiment")
 
 BATCH_SIZE = 3  # 详细分析每次发送的帖子数
 
@@ -83,14 +88,10 @@ class SentimentService:
             "message": f"开始舆情分析，共 {total} 条帖子，{total_non_empty} 条有内容",
         })
 
-        # 加载 LLM
-        config_path = settings.config_file
-        if not os.path.exists(config_path):
+        # 加载 LLM 配置（使用统一工具函数）
+        llm = get_llm_service()
+        if not llm:
             raise Exception("请先配置 LLM API")
-        with open(config_path, "r") as f:
-            cfg_data = json.load(f)
-        llm_config = LLMConfig(**cfg_data)
-        llm = LLMService(llm_config)
 
         results = [None] * total
         success_count = 0
@@ -108,24 +109,13 @@ class SentimentService:
                     user_message += f"帖子{orig_idx + 1}:\n{truncated}\n\n"
 
                 try:
-                    resp = await llm.client.post(
-                        "/chat/completions",
-                        json={
-                            "model": llm.config.model_name,
-                            "messages": [
-                                {"role": "system", "content": SENTIMENT_SYSTEM_PROMPT},
-                                {"role": "user", "content": user_message},
-                            ],
-                            "temperature": 0.2,
-                            "max_tokens": 4096,
-                        },
+                    result_text = await llm.chat_with_retry(
+                        system_prompt=SENTIMENT_SYSTEM_PROMPT,
+                        user_message=user_message,
+                        temperature=0.2,
+                        max_tokens=4096,
+                        label=f"舆情分析 [{batch_start+1}-{min(batch_start+BATCH_SIZE, total_non_empty)}]",
                     )
-
-                    if resp.status_code != 200:
-                        raise Exception(f"LLM API 错误: {resp.status_code}")
-
-                    data = resp.json()
-                    result_text = data["choices"][0]["message"]["content"]
 
                     # 解析批量结果
                     parts = result_text.split("---SENTIMENT_SEPARATOR---")
@@ -231,6 +221,12 @@ class SentimentService:
         os.makedirs(os.path.dirname(sentiment_path), exist_ok=True)
         with open(sentiment_path, "w", encoding="utf-8") as f:
             json.dump(output, f, ensure_ascii=False, indent=2)
+
+        # 同时保存到 SQLite
+        try:
+            db_save_sentiment(task_id, output)
+        except Exception:
+            pass
 
         # 保存帖子的 _processed 标记回 JSON（按指纹匹配，更新所有 JSON 文件）
         import glob as _g

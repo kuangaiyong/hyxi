@@ -7,6 +7,8 @@ backend/data/tasks.json
 backend/data/scheduled_tasks.json
 backend/data/sentiment_*.json
 backend/data/exports/
+backend/data/hyxi.db*
+backend/data/logs/
 
 # 依赖
 node_modules/

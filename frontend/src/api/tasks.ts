@@ -23,3 +23,8 @@ export async function cancelTask(taskId: string): Promise<void> {
 export async function deleteTask(taskId: string): Promise<void> {
   await apiClient.delete(`/tasks/${taskId}?force=true`)
 }
+
+export async function retryTask(taskId: string): Promise<TaskResponse> {
+  const { data } = await apiClient.post(`/tasks/${taskId}/retry`)
+  return data
+}

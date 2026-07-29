@@ -4,6 +4,7 @@ import os
 import json
 import uuid
 import asyncio
+import logging
 from typing import Optional
 from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -13,6 +14,8 @@ from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from app.config import settings
 from app.services.orchestrator import orchestrator
 from app.services.progress_manager import progress_manager
+
+logger = logging.getLogger("hyxi.scheduler")
 
 
 # 预设调度选项
@@ -28,31 +31,42 @@ async def _job_callback(scheduled_id: str):
     """APScheduler 回调（模块级函数，避免序列化 scheduler 实例）"""
     task_id = str(uuid.uuid4())
     svc = scheduler_service
-    cfg = svc.get_one(scheduled_id)
-    if not cfg:
-        return
-    # 创建任务时打上 scheduled_by 标记
-    desc = cfg["description"]
-    orchestrator.create_task(task_id, desc)
-    task = orchestrator.get_task(task_id)
-    if task:
-        task["scheduled_by"] = scheduled_id
-        orchestrator._persist()
-    orchestrator.run_task_async(task_id)
-    # 更新执行历史
-    configs = svc._load_configs()
-    for c in configs:
-        if c["id"] == scheduled_id:
-            c["last_run"] = datetime.now().isoformat()
-            c.setdefault("history", []).append({
-                "task_id": task_id,
-                "time": datetime.now().isoformat(),
-                "status": "started",
-            })
-            # 只保留最近 20 条
-            c["history"] = c["history"][-20:]
-            break
-    svc._save_configs(configs)
+    callback_ok = False
+    try:
+        cfg = svc.get_one(scheduled_id)
+        if not cfg:
+            logger.warning("定时任务 %s 配置不存在，跳过执行", scheduled_id)
+            return
+        # 创建任务时打上 scheduled_by 标记
+        desc = cfg["description"]
+        orchestrator.create_task(task_id, desc)
+        task = orchestrator.get_task(task_id)
+        if task:
+            task["scheduled_by"] = scheduled_id
+            orchestrator._persist()
+        orchestrator.run_task_async(task_id)
+        logger.info("定时任务 %s 触发，创建任务 %s", scheduled_id, task_id)
+        callback_ok = True
+    except Exception as e:
+        logger.error("定时任务 %s 回调失败: %s", scheduled_id, str(e), exc_info=True)
+
+    # 更新执行历史（即使创建失败也记录）
+    try:
+        configs = svc._load_configs()
+        for c in configs:
+            if c["id"] == scheduled_id:
+                c["last_run"] = datetime.now().isoformat()
+                c.setdefault("history", []).append({
+                    "task_id": task_id,
+                    "time": datetime.now().isoformat(),
+                    "status": "started" if callback_ok else "failed",
+                })
+                # 只保留最近 20 条
+                c["history"] = c["history"][-20:]
+                break
+        svc._save_configs(configs)
+    except Exception as e:
+        logger.error("更新定时任务 %s 执行历史失败: %s", scheduled_id, str(e))
 
 
 class SchedulerService:

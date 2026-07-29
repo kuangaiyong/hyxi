@@ -43,9 +43,6 @@ class ProgressManager:
         """SSE 事件生成器 (async generator)"""
         queue = self.subscribe(task_id)
         try:
-            # 每隔一段时间发送 keepalive
-            keepalive_task = asyncio.create_task(self._keepalive(queue, task_id))
-
             while True:
                 try:
                     message = await asyncio.wait_for(queue.get(), timeout=30.0)
@@ -56,22 +53,11 @@ class ProgressManager:
                     if event_type == "task_complete":
                         break
                 except asyncio.TimeoutError:
-                    # 发送心跳
+                    # 发送心跳（SSE 注释，防止代理断开连接）
                     yield f": keepalive\n\n"
-
-            keepalive_task.cancel()
-            try:
-                await keepalive_task
-            except asyncio.CancelledError:
-                pass
 
         finally:
             self.unsubscribe(task_id, queue)
-
-    async def _keepalive(self, queue: asyncio.Queue, task_id: str):
-        """定期发送心跳"""
-        while True:
-            await asyncio.sleep(15)
 
 
 # 全局单例

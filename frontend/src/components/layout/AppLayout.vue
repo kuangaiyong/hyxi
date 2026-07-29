@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 
 const route = useRoute()
@@ -15,6 +15,22 @@ const pageTitle = computed(() => {
     case 'Sentiment': return '舆情详情'
     case 'Schedules': return '定时任务'
     default: return 'HYXi 舆情分析'
+  }
+})
+
+const isDark = ref(false)
+
+function toggleTheme() {
+  isDark.value = !isDark.value
+  document.documentElement.setAttribute('data-theme', isDark.value ? 'dark' : '')
+  localStorage.setItem('theme', isDark.value ? 'dark' : 'light')
+}
+
+onMounted(() => {
+  const saved = localStorage.getItem('theme')
+  if (saved === 'dark' || (!saved && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+    isDark.value = true
+    document.documentElement.setAttribute('data-theme', 'dark')
   }
 })
 </script>
@@ -44,7 +60,12 @@ const pageTitle = computed(() => {
     <div class="app-main">
       <header class="app-header">
         <h2>{{ pageTitle }}</h2>
-        <slot name="header-actions" />
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <slot name="header-actions" />
+          <button class="theme-toggle" @click="toggleTheme" :title="isDark ? '切换亮色' : '切换暗色'">
+            {{ isDark ? '☀️' : '🌙' }}
+          </button>
+        </div>
       </header>
       <div class="app-content">
         <slot />

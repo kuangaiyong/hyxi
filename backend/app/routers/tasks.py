@@ -54,6 +54,24 @@ async def cancel_or_delete_task(task_id: str, force: bool = False):
     raise HTTPException(status_code=400, detail="任务无法操作（可能不存在或正在运行中不可删除）")
 
 
+@router.post("/{task_id}/retry", response_model=TaskResponse, status_code=201)
+async def retry_task(task_id: str):
+    """重试失败/已完成的任务（复用原描述创建新任务）"""
+    task = orchestrator.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    # 仅允许重试终态任务
+    if task["status"] not in (TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.COMPLETED):
+        raise HTTPException(status_code=400, detail="只能重试已完成、失败或取消的任务")
+
+    new_id = str(uuid.uuid4())
+    orchestrator.create_task(new_id, task["description"])
+    orchestrator.run_task_async(new_id)
+    new_task = orchestrator.get_task(new_id)
+    return TaskResponse(**new_task)
+
+
 @router.get("/{task_id}/events")
 async def task_events(task_id: str):
     """SSE 实时进度流"""

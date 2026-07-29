@@ -1,9 +1,12 @@
-"""Excel 生成服务 - 复用 openpyxl 样式"""
+"""Excel 生成服务 - 复用 openpyxl 样式，含舆情报告导出"""
 
 import os
+import json
+from typing import Optional
 from collections import Counter
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.chart import PieChart, Reference
 from app.config import settings
 from app.services.progress_manager import ProgressManager
 
@@ -161,6 +164,166 @@ class ExcelService:
             "progress": 1.0,
             "message": f"Excel 已保存: {output_name}",
         })
+
+        return {
+            "file_path": output_path,
+            "file_name": output_name,
+        }
+
+    @staticmethod
+    def generate_sentiment_report(
+        task_id: str,
+        sentiment_data: dict,
+        output_dir: Optional[str] = None,
+    ) -> dict:
+        """生成舆情分析 Excel 报告"""
+        if output_dir is None:
+            output_dir = settings.exports_dir
+
+        summary = sentiment_data.get("summary", {})
+        results = sentiment_data.get("results", [])
+        total = sentiment_data.get("total", 0)
+
+        wb = Workbook()
+
+        # ===== Sheet 1: 舆情分析汇总 =====
+        ws = wb.active
+        ws.title = "舆情分析汇总"
+
+        # 样式
+        SECTION_FONT = Font(name="Arial", size=13, bold=True, color="2F5496")
+        LABEL_FONT = Font(name="Arial", size=11, bold=True)
+        VALUE_FONT = Font(name="Arial", size=11)
+
+        row = 1
+        # 标题
+        cell = ws.cell(row=row, column=1, value="HYXi Halo 舆情分析报告")
+        cell.font = Font(name="Arial", size=16, bold=True, color="1E293B")
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+        row += 2
+
+        # 基本信息
+        ws.cell(row=row, column=1, value="基本信息").font = SECTION_FONT
+        row += 1
+        info_rows = [
+            ("分析帖子总数", total),
+            ("分析成功数", sentiment_data.get("success", 0)),
+            ("分析失败数", sentiment_data.get("failed", 0)),
+            ("分析时间", sentiment_data.get("analyzed_at", "")),
+        ]
+        for label, value in info_rows:
+            ws.cell(row=row, column=1, value=label).font = LABEL_FONT
+            ws.cell(row=row, column=2, value=str(value)).font = VALUE_FONT
+            row += 1
+
+        row += 1
+        # 情感分布
+        ws.cell(row=row, column=1, value="情感分布").font = SECTION_FONT
+        row += 1
+        dist = summary.get("sentiment_distribution", {})
+        pcts = summary.get("sentiment_percentages", {})
+
+        headers = ["情感", "数量", "占比", "平均强度"]
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(row=row, column=col, value=h)
+            cell.font = HEADER_FONT
+            cell.fill = HEADER_FILL
+            cell.alignment = HEADER_ALIGN
+            cell.border = THIN_BORDER
+        row += 1
+
+        sentiment_labels = {"positive": "正面", "negative": "负面", "neutral": "中立"}
+        sentiment_colors = {"positive": "10B981", "negative": "EF4444", "neutral": "6B7280"}
+        for s_key, s_label in sentiment_labels.items():
+            count = dist.get(s_key, 0)
+            pct = pcts.get(s_key, 0)
+            ws.cell(row=row, column=1, value=s_label).border = THIN_BORDER
+            ws.cell(row=row, column=2, value=count).border = THIN_BORDER
+            ws.cell(row=row, column=3, value=f"{pct}%").border = THIN_BORDER
+            avg_intensity_label = summary.get("avg_intensity", 0)
+            ws.cell(row=row, column=4, value=round(avg_intensity_label, 2) if isinstance(avg_intensity_label, (int, float)) else "").border = THIN_BORDER
+            for c in range(1, 5):
+                ws.cell(row=row, column=c).alignment = CENTER_ALIGN
+            row += 1
+
+        row += 1
+        # Top 10 维度
+        ws.cell(row=row, column=1, value="TOP 10 关注维度").font = SECTION_FONT
+        row += 1
+        dim_headers = ["排名", "维度", "提及次数"]
+        for col, h in enumerate(dim_headers, 1):
+            cell = ws.cell(row=row, column=col, value=h)
+            cell.font = HEADER_FONT
+            cell.fill = HEADER_FILL
+            cell.alignment = HEADER_ALIGN
+            cell.border = THIN_BORDER
+        row += 1
+
+        top_dims = summary.get("top_dimensions", [])
+        for rank, (dim, count) in enumerate(top_dims[:10], 1):
+            ws.cell(row=row, column=1, value=rank).border = THIN_BORDER
+            ws.cell(row=row, column=2, value=dim).border = THIN_BORDER
+            ws.cell(row=row, column=3, value=count).border = THIN_BORDER
+            for c in (1, 3):
+                ws.cell(row=row, column=c).alignment = CENTER_ALIGN
+            row += 1
+
+        # 设置列宽
+        ws.column_dimensions['A'].width = 18
+        ws.column_dimensions['B'].width = 30
+        ws.column_dimensions['C'].width = 14
+        ws.column_dimensions['D'].width = 14
+        ws.freeze_panes = "A2"
+
+        # ===== Sheet 2: 帖子情感详情 =====
+        ws2 = wb.create_sheet("帖子情感详情")
+
+        detail_headers = ["序号", "情感", "强度", "分析理由", "涉及维度"]
+        col_widths = [8, 10, 8, 50, 40]
+        for col, (h, w) in enumerate(zip(detail_headers, col_widths), 1):
+            cell = ws2.cell(row=1, column=col, value=h)
+            cell.font = HEADER_FONT
+            cell.fill = HEADER_FILL
+            cell.alignment = HEADER_ALIGN
+            cell.border = THIN_BORDER
+            ws2.column_dimensions[chr(64 + col)].width = w
+
+        ws2.freeze_panes = "A2"
+
+        for idx, r in enumerate(results):
+            row = idx + 2
+            if not r:
+                ws2.cell(row=row, column=1, value=idx + 1).border = THIN_BORDER
+                ws2.cell(row=row, column=2, value="(解析失败)").border = THIN_BORDER
+                for c in range(1, 6):
+                    ws2.cell(row=row, column=c).alignment = CONTENT_ALIGN
+                continue
+
+            sentiment_cn = sentiment_labels.get(r.get("sentiment", ""), r.get("sentiment", ""))
+            intensity = r.get("intensity", 0)
+            reason = r.get("reason_cn", "")
+            dimensions = ", ".join(r.get("dimensions", []))
+
+            values = [idx + 1, sentiment_cn, f"{'★' * round(intensity)}{'☆' * (5 - round(intensity))} ({intensity})", reason, dimensions]
+            for col, val in enumerate(values, 1):
+                cell = ws2.cell(row=row, column=col, value=val)
+                cell.border = THIN_BORDER
+                cell.font = Font(name="Arial", size=10)
+                if col in (1, 2, 3):
+                    cell.alignment = CENTER_ALIGN
+                else:
+                    cell.alignment = CONTENT_ALIGN
+
+            # 交替行颜色
+            if idx % 2 == 1:
+                for c in range(1, 6):
+                    ws2.cell(row=row, column=c).fill = ALT_FILL
+
+        # 保存
+        output_name = f"sentiment_report_{task_id[:8]}.xlsx"
+        output_path = os.path.join(output_dir, output_name)
+        os.makedirs(output_dir, exist_ok=True)
+        wb.save(output_path)
 
         return {
             "file_path": output_path,

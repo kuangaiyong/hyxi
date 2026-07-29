@@ -3,8 +3,11 @@ import { ref, computed, watch, nextTick, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useTaskStore } from '@/stores/task'
 import { useSSE } from '@/composables/useSSE'
+import { useToast } from '@/composables/useToast'
 import type { TimelineEvent } from '@/types/result'
 import type { TaskLog } from '@/types/task'
+
+const toast = useToast()
 
 const route = useRoute()
 const router = useRouter()
@@ -84,6 +87,17 @@ async function handleCancel() {
   showCancelConfirm.value = false
   await taskStore.cancelCurrentTask()
 }
+
+async function handleRetry() {
+  if (!taskStore.currentTaskId) return
+  const newTask = await taskStore.retryTask(taskStore.currentTaskId)
+  if (newTask) {
+    toast.success('任务已重新提交')
+    router.push(`/tasks/${newTask.id}/progress`)
+  } else {
+    toast.error('重试失败')
+  }
+}
 </script>
 
 <template>
@@ -113,6 +127,13 @@ async function handleCancel() {
             @click="showCancelConfirm = true"
           >
             取消
+          </button>
+          <button
+            v-if="taskStore.isFailed"
+            class="btn btn-primary btn-sm"
+            @click="handleRetry"
+          >
+            🔄 重试
           </button>
           <button
             v-if="taskStore.isCompleted"

@@ -82,14 +82,25 @@ async def get_posts(
     task_id: str,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
+    search: str = Query("", description="搜索关键词（匹配用户名、原文、翻译）"),
 ):
-    """获取分页帖子结果"""
+    """获取分页帖子结果，支持全文搜索"""
     task = _get_task_or_404(task_id)
 
     # 优先从内存，fallback 到 JSON 文件
     posts = task.get("result", {}).get("posts") or []
     if not posts:
         posts = _load_posts_from_json(task)
+
+    # 全文搜索过滤
+    if search and search.strip():
+        kw = search.strip().lower()
+        posts = [
+            p for p in posts
+            if kw in (p.get("username", "") or "").lower()
+            or kw in (p.get("content", "") or "").lower()
+            or kw in (p.get("translation", "") or "").lower()
+        ]
 
     total = len(posts)
     start = (page - 1) * page_size
@@ -180,6 +191,57 @@ async def download_excel(task_id: str):
     )
 
 
+@router.get("/export/csv")
+async def export_csv(task_id: str):
+    """导出帖子数据为 CSV"""
+    task = _get_task_or_404(task_id)
+    posts = task.get("result", {}).get("posts") or []
+    if not posts:
+        posts = _load_posts_from_json(task)
+    if not posts:
+        raise HTTPException(status_code=404, detail="无帖子数据")
+
+    import csv
+    from io import StringIO
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["序号", "用户名", "时间", "原文", "中文翻译", "页码"])
+    for i, p in enumerate(posts, 1):
+        writer.writerow([
+            i,
+            p.get("username", ""),
+            _normalize_timestamp(p.get("timestamp", "")),
+            p.get("content", ""),
+            p.get("translation", ""),
+            p.get("page_number", ""),
+        ])
+    from fastapi.responses import Response
+    return Response(
+        content=output.getvalue().encode("utf-8-sig"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename=posts_{task_id[:8]}.csv"},
+    )
+
+
+@router.get("/export/json")
+async def export_json(task_id: str):
+    """导出帖子数据为 JSON"""
+    task = _get_task_or_404(task_id)
+    posts = task.get("result", {}).get("posts") or []
+    if not posts:
+        posts = _load_posts_from_json(task)
+    if not posts:
+        raise HTTPException(status_code=404, detail="无帖子数据")
+
+    import json as _json
+    from fastapi.responses import Response
+    return Response(
+        content=_json.dumps(posts, ensure_ascii=False, indent=2),
+        media_type="application/json; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename=posts_{task_id[:8]}.json"},
+    )
+
+
 # ===== 舆情分析 =====
 
 def _find_sentiment_file(thread_id: int):
@@ -225,9 +287,15 @@ async def trigger_sentiment_analysis(task_id: str):
     # 增量：优先根据 _processed.sentiment_at 过滤已分析的帖子
     already_analyzed = [p for p in posts if p.get("_processed", {}).get("sentiment_at")]
     pending = [p for p in posts if not p.get("_processed", {}).get("sentiment_at")]
+    # 区分有内容和空内容（空内容帖子不会被 LLM 分析）
+    pending_with_content = [p for p in pending if (p.get("content") or "").strip()]
+    pending_empty = len(pending) - len(pending_with_content)
 
-    if not pending:
-        return {"message": "所有帖子已完成舆情分析", "task_id": task_id, "status": "completed"}
+    if not pending_with_content:
+        msg = "所有帖子已完成舆情分析"
+        if pending_empty > 0:
+            msg = f"所有有内容的帖子已完成舆情分析（{pending_empty} 条空内容帖子已跳过）"
+        return {"message": msg, "task_id": task_id, "status": "completed"}
 
     # 查找已有的舆情文件（在所有 sentiment 文件中找最新的）
     existing_results = {}
@@ -244,8 +312,13 @@ async def trigger_sentiment_analysis(task_id: str):
 
     # 后台启动分析（仅分析增量帖子，合并已有结果）
     orchestrator.run_sentiment_async(task_id, posts, pending, existing_results)
+    msg = f"增量舆情分析: {len(already_analyzed)} 条已跳过, {len(pending_with_content)} 条待分析"
+    if pending_empty > 0:
+        msg += f"（{pending_empty} 条空内容帖子跳过）"
     return {
-        "message": f"增量舆情分析: {len(already_analyzed)} 条已跳过, {len(pending)} 条待分析",
+        "message": msg,
+        "pending_count": len(pending_with_content),
+        "total_pending": len(pending),
         "task_id": task_id,
         "status": "started",
     }
@@ -253,7 +326,14 @@ async def trigger_sentiment_analysis(task_id: str):
 
 @router.get("/sentiment")
 async def get_sentiment_result(task_id: str):
-    """获取舆情分析结果"""
+    """获取舆情分析结果（优先 SQLite，含跨任务 fallback）"""
+    # 优先从 SQLite 获取
+    from app.services.storage import get_sentiment
+    result = get_sentiment(task_id)
+    if result:
+        return result
+
+    # Fallback: JSON 文件
     sentiment_path = os.path.join(settings.data_dir, f"sentiment_{task_id}.json")
     if os.path.exists(sentiment_path):
         with open(sentiment_path, "r", encoding="utf-8") as f:
@@ -263,7 +343,34 @@ async def get_sentiment_result(task_id: str):
     if orchestrator.is_sentiment_running(task_id):
         return {"status": "running", "message": "分析进行中..."}
 
-    raise HTTPException(status_code=404, detail="舆情分析结果不存在，请先触发分析")
+    # fallback：查找其他任务的舆情文件
+    alt_file = _find_sentiment_file(0)
+    if alt_file and os.path.exists(alt_file):
+        with open(alt_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    # 返回 200 + not_found 状态
+    return {"status": "not_found", "message": "舆情分析结果不存在，请先触发分析"}
+
+
+@router.get("/sentiment/download")
+async def download_sentiment_excel(task_id: str):
+    """下载舆情分析 Excel 报告"""
+    sentiment_path = os.path.join(settings.data_dir, f"sentiment_{task_id}.json")
+    if not os.path.exists(sentiment_path):
+        raise HTTPException(status_code=404, detail="舆情分析结果不存在，请先触发分析")
+
+    with open(sentiment_path, "r", encoding="utf-8") as f:
+        sentiment_data = json.load(f)
+
+    from app.services.excel_service import ExcelService
+    result = ExcelService.generate_sentiment_report(task_id, sentiment_data)
+
+    return FileResponse(
+        path=result["file_path"],
+        filename=result["file_name"],
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 @router.get("/sentiment/events")

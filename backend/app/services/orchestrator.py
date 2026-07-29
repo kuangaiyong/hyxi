@@ -4,15 +4,20 @@ import json
 import os
 import asyncio
 import traceback
+import logging
 from typing import Dict, List, Optional
 from datetime import datetime
 from app.models import LLMConfig, TaskStatus, PlanStep
 from app.config import settings
+from app.logging_config import get_logger
 from app.services.llm_service import LLMService
 from app.services.scraper_service import ScraperService
 from app.services.translator_service import TranslatorService
 from app.services.excel_service import ExcelService
 from app.services.progress_manager import progress_manager
+from app.services.storage import init_db, migrate_from_json, save_task, load_all_tasks, delete_task as db_delete_task
+
+logger = get_logger(__name__)
 
 
 class TaskOrchestrator:
@@ -22,24 +27,49 @@ class TaskOrchestrator:
         self.tasks: Dict[str, dict] = {}
         self._running_tasks: set = set()
         self._sentiment_running: set = set()
+        self._task_queue: asyncio.Queue = asyncio.Queue()  # 任务等待队列
         self._persist_path = os.path.join(settings.data_dir, "tasks.json")
+        self._db_ready = False
+        try:
+            init_db()
+            migrate_from_json()
+            self._db_ready = True
+        except Exception as e:
+            logger.warning("SQLite 不可用，回退到 JSON 存储: %s", str(e))
         self._load_tasks()
 
     # ===== 持久化 =====
 
     def _load_tasks(self):
         """从磁盘加载历史任务，并清理异常终止的任务"""
+        # 优先使用 SQLite
+        if self._db_ready:
+            task_list = load_all_tasks()
+            for task_data in task_list:
+                tid = task_data["id"]
+                if task_data["status"] in ("pending", "parsing", "running"):
+                    task_data["status"] = TaskStatus.CANCELLED
+                    task_data["completed_at"] = datetime.now()
+                    task_data.setdefault("logs", []).append({
+                        "time": datetime.now().isoformat(),
+                        "level": "warning",
+                        "message": "服务重启，未完成的任务已自动取消。",
+                    })
+                self.tasks[tid] = task_data
+            if any(t["status"] == TaskStatus.CANCELLED for t in task_list):
+                self._persist()
+            return
+
+        # Fallback: JSON 文件
         if os.path.exists(self._persist_path):
             try:
                 with open(self._persist_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 for task_data in data.get("tasks", []):
                     tid = task_data["id"]
-                    # 反序列化 datetime
                     for field in ("created_at", "started_at", "completed_at"):
                         if task_data.get(field):
                             task_data[field] = datetime.fromisoformat(task_data[field])
-                    # 清理异常终止的非终态任务（如进程被kill）
                     if task_data["status"] in ("pending", "parsing", "running"):
                         task_data["status"] = TaskStatus.CANCELLED
                         task_data["completed_at"] = datetime.now()
@@ -49,30 +79,45 @@ class TaskOrchestrator:
                             "message": "服务重启，未完成的任务已自动取消。",
                         })
                     self.tasks[tid] = task_data
-                self._save_tasks()  # 保存清理后的状态
-            except Exception:
-                pass
+                self._save_tasks()
+            except json.JSONDecodeError as e:
+                logger.error("tasks.json 格式损坏 (%s)，任务历史将丢失。备份文件: %s.bak",
+                             str(e), self._persist_path)
+                try:
+                    import shutil
+                    shutil.copy2(self._persist_path, self._persist_path + ".bak")
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.error("加载任务列表失败 (%s): %s", type(e).__name__, str(e))
 
     def _save_tasks(self):
         """保存所有任务到磁盘"""
+        if self._db_ready:
+            for t in self.tasks.values():
+                save_task(t)
+            return
+
+        # Fallback: JSON 文件
         os.makedirs(os.path.dirname(self._persist_path), exist_ok=True)
+        tmp_path = self._persist_path + ".tmp"
         data = {"tasks": []}
         for t in self.tasks.values():
             item = dict(t)
-            # 序列化 datetime
             for field in ("created_at", "started_at", "completed_at"):
                 if item.get(field) and isinstance(item[field], datetime):
                     item[field] = item[field].isoformat()
             data["tasks"].append(item)
-        with open(self._persist_path, "w", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, self._persist_path)
 
     def _persist(self):
         """保存（同步到磁盘）"""
         try:
             self._save_tasks()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("持久化任务列表失败: %s", str(e))
 
     def create_task(self, task_id: str, description: str):
         """注册新任务"""
@@ -117,14 +162,17 @@ class TaskOrchestrator:
         if not task:
             return
 
-        # 检查并发限制
+        # 检查并发限制 — 超出限制时加入队列等待
         if len(self._running_tasks) >= settings.max_concurrent_tasks:
-            await progress_manager.emit(task_id, "error", {
-                "message": "已有任务正在运行，请等待完成后再提交。",
-            })
-            task["status"] = TaskStatus.FAILED
-            task["error_message"] = "并发限制"
+            task["status"] = TaskStatus.PENDING
+            task["current_step"] = "排队等待中..."
             self._persist()
+            await progress_manager.emit(task_id, "log", {
+                "level": "info",
+                "message": "已有任务正在执行，当前任务已加入等待队列...",
+            })
+            await self._task_queue.put(task_id)
+            # 等待队列被消费（run_task_async 在 _process_queue 中重新调用 execute_task）
             return
 
         self._running_tasks.add(task_id)
@@ -134,16 +182,11 @@ class TaskOrchestrator:
 
         llm_service = None
         try:
-            # 加载 LLM 配置
-            config_path = settings.config_file
-            if not os.path.exists(config_path):
+            # 加载 LLM 配置（使用统一工具函数）
+            from app.services.llm_utils import get_llm_service
+            llm_service = get_llm_service()
+            if not llm_service:
                 raise Exception("请先配置 LLM API")
-
-            with open(config_path, "r") as f:
-                cfg_data = json.load(f)
-
-            llm_config = LLMConfig(**cfg_data)
-            llm_service = LLMService(llm_config)
 
             # ===== Step 0: 意图解析 =====
             task["current_step"] = "解析任务意图"
@@ -357,7 +400,34 @@ class TaskOrchestrator:
 
     def run_task_async(self, task_id: str):
         """在后台运行任务"""
-        asyncio.create_task(self.execute_task(task_id))
+        asyncio.create_task(self._run_with_queue(task_id))
+
+    async def _run_with_queue(self, task_id: str):
+        """运行任务并在完成后处理队列"""
+        await self.execute_task(task_id)
+        # 任务完成后，检查队列
+        await self._process_queue()
+
+    async def _process_queue(self):
+        """处理等待队列中的下一个任务"""
+        while not self._task_queue.empty():
+            if len(self._running_tasks) >= settings.max_concurrent_tasks:
+                break
+            try:
+                next_id = self._task_queue.get_nowait()
+                task = self.tasks.get(next_id)
+                if task and task["status"] == TaskStatus.PENDING and not task.get("_cancelled"):
+                    logger.info("从队列中启动任务 %s", next_id)
+                    await progress_manager.emit(next_id, "log", {
+                        "level": "info",
+                        "message": "等待结束，开始执行...",
+                    })
+                    asyncio.create_task(self._run_with_queue(next_id))
+                else:
+                    # 任务已被取消，跳过
+                    logger.info("跳过已取消的队列任务 %s", next_id)
+            except asyncio.QueueEmpty:
+                break
 
     # ===== 清理 =====
 

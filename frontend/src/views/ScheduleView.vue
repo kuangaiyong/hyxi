@@ -3,8 +3,11 @@ import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useConfigStore } from '@/stores/config'
 import { useTaskStore } from '@/stores/task'
+import { useToast } from '@/composables/useToast'
 import * as schedulesApi from '@/api/schedules'
 import type { ScheduleTask, SchedulePreset } from '@/types/schedule'
+
+const toast = useToast()
 
 const router = useRouter()
 const configStore = useConfigStore()
@@ -96,19 +99,25 @@ async function handleToggle(item: ScheduleTask) {
 
 async function handleDelete(id: string) {
   if (!confirm('确定删除此定时任务？')) return
-  await schedulesApi.deleteSchedule(id)
-  expandedId.value = null
-  await loadData()
+  try {
+    await schedulesApi.deleteSchedule(id)
+    expandedId.value = null
+    await loadData()
+    toast.success('定时任务已删除')
+  } catch (e: any) {
+    toast.error('删除失败: ' + (e.response?.data?.detail || e.message))
+  }
 }
 
 async function handleRunNow(id: string) {
   try {
     const result = await schedulesApi.runScheduleNow(id)
+    toast.success('已触发执行')
     if (result.task_id) {
       router.push(`/tasks/${result.task_id}/progress`)
     }
   } catch (e: any) {
-    alert('触发失败: ' + (e.response?.data?.detail || e.message))
+    toast.error('触发失败: ' + (e.response?.data?.detail || e.message))
   }
 }
 

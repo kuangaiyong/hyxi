@@ -4,11 +4,12 @@ import type { PostsResponse, PostData, TaskStats } from '@/types/result'
 export async function fetchPosts(
   taskId: string,
   page = 1,
-  pageSize = 50
+  pageSize = 50,
+  search = ''
 ): Promise<PostsResponse> {
-  const { data } = await apiClient.get(`/tasks/${taskId}/posts`, {
-    params: { page, page_size: pageSize },
-  })
+  const params: Record<string, string | number> = { page, page_size: pageSize }
+  if (search) params.search = search
+  const { data } = await apiClient.get(`/tasks/${taskId}/posts`, { params })
   return data
 }
 

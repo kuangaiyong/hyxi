@@ -3,10 +3,14 @@
 import json
 import re
 import asyncio
+import logging
 from app.services.progress_manager import ProgressManager
 from app.services.llm_service import LLMService
+from app.services.llm_utils import get_llm_service
 from app.models import LLMConfig
 from app.config import settings
+
+logger = logging.getLogger("hyxi.translator")
 
 
 # 批量翻译时每次 LLM 调用处理的帖子数量
@@ -64,16 +68,10 @@ class TranslatorService:
             "message": f"正在使用 LLM 翻译 {total} 条帖子 ({source_lang} → {target_lang})...",
         })
 
-        # 加载 LLM 配置，创建 LLM 客户端
-        config_path = settings.config_file
-        if not __import__('os').path.exists(config_path):
+        # 加载 LLM 配置，创建 LLM 客户端（使用统一工具函数）
+        llm = get_llm_service()
+        if not llm:
             raise Exception("请先配置 LLM API")
-
-        with open(config_path, "r") as f:
-            cfg_data = json.load(f)
-
-        llm_config = LLMConfig(**cfg_data)
-        llm = LLMService(llm_config)
 
         translations = []
         success_count = 0
@@ -86,7 +84,7 @@ class TranslatorService:
 
             await progress.emit(task_id, "log", {
                 "level": "info",
-                "message": f"共 {total} 条帖子，其中 {total_non_empty} 条需要翻译，使用 {llm_config.model_name} 模型",
+                "message": f"共 {total} 条帖子，其中 {total_non_empty} 条需要翻译，使用 {llm.config.model_name} 模型",
             })
 
             # 初始化所有翻译为待翻译状态
@@ -108,24 +106,13 @@ class TranslatorService:
                     user_message += f"[{i + 1}]\n{text}\n\n"
 
                 try:
-                    resp = await llm.client.post(
-                        "/chat/completions",
-                        json={
-                            "model": llm.config.model_name,
-                            "messages": [
-                                {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
-                                {"role": "user", "content": user_message},
-                            ],
-                            "temperature": 0.3,
-                            "max_tokens": 4096,
-                        },
+                    result_text = await llm.chat_with_retry(
+                        system_prompt=TRANSLATION_SYSTEM_PROMPT,
+                        user_message=user_message,
+                        temperature=0.3,
+                        max_tokens=4096,
+                        label=f"批量翻译 [{batch_start+1}-{min(batch_start+BATCH_SIZE, total_non_empty)}]",
                     )
-
-                    if resp.status_code != 200:
-                        raise Exception(f"LLM API 错误: {resp.status_code}")
-
-                    data = resp.json()
-                    result_text = data["choices"][0]["message"]["content"]
 
                     # 解析批量翻译结果
                     batch_translations = result_text.split("---POST_SEPARATOR---")
@@ -186,51 +173,38 @@ class TranslatorService:
                     "message": f"开始重试 {len(failed_indices)} 条失败的翻译...",
                 })
 
-                for retry_round in range(2):  # 最多重试2轮
-                    if not failed_indices:
-                        break
+                still_failed = []
+                for idx in failed_indices:
+                    content = posts[idx].get("content", "")
+                    truncated = content[:2500] if len(content) > 2500 else content
 
-                    still_failed = []
-                    for idx in failed_indices:
-                        content = posts[idx].get("content", "")
-                        truncated = content[:2500] if len(content) > 2500 else content
-
-                        try:
-                            resp = await llm.client.post(
-                                "/chat/completions",
-                                json={
-                                    "model": llm.config.model_name,
-                                    "messages": [
-                                        {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
-                                        {"role": "user", "content": f"请将以下荷兰语翻译成中文（直接输出翻译，不要额外说明）：\n{truncated}"},
-                                    ],
-                                    "temperature": 0.2,
-                                    "max_tokens": 2048,
-                                },
-                            )
-                            if resp.status_code == 200:
-                                data = resp.json()
-                                trans = data["choices"][0]["message"]["content"].strip()
-                                if trans and len(trans) > 2:
-                                    translations[idx] = trans
-                                    success_count += 1
-                                    fail_count -= 1
-                                else:
-                                    still_failed.append(idx)
-                            else:
-                                still_failed.append(idx)
-                        except Exception:
+                    try:
+                        trans = await llm.chat_with_retry(
+                            system_prompt=TRANSLATION_SYSTEM_PROMPT,
+                            user_message=f"请将以下荷兰语翻译成中文（直接输出翻译，不要额外说明）：\n{truncated}",
+                            temperature=0.2,
+                            max_tokens=2048,
+                            max_retries=2,
+                            label=f"重译单条 #{idx}",
+                        )
+                        if trans and len(trans.strip()) > 2:
+                            translations[idx] = trans.strip()
+                            success_count += 1
+                            fail_count -= 1
+                        else:
                             still_failed.append(idx)
+                    except Exception:
+                        still_failed.append(idx)
 
-                        await asyncio.sleep(1.0)
+                    await asyncio.sleep(1.0)
 
-                    failed_indices = still_failed
+                failed_indices = still_failed
 
-                    if still_failed:
-                        await progress.emit(task_id, "log", {
-                            "level": "info",
-                            "message": f"重试第 {retry_round + 1} 轮完成，仍有 {len(still_failed)} 条失败",
-                        })
+                if still_failed:
+                    await progress.emit(task_id, "log", {
+                        "level": "warning",
+                        "message": f"重试完成，仍有 {len(still_failed)} 条翻译失败",
+                    })
 
             await progress.emit(task_id, "log", {
                 "level": "info",
@@ -247,12 +221,12 @@ class TranslatorService:
         await progress.emit(task_id, "step_progress", {
             "step": 1,
             "progress": 1.0,
-            "message": f"LLM 翻译完成: {success_count}/{total} 成功 ({llm_config.model_name})",
+            "message": f"LLM 翻译完成: {success_count}/{total} 成功 ({llm.config.model_name})",
         })
 
         await progress.emit(task_id, "log", {
             "level": "success",
-            "message": f"翻译结果: {success_count} 条成功, {fail_count} 条失败, 使用模型 {llm_config.model_name}",
+            "message": f"翻译结果: {success_count} 条成功, {fail_count} 条失败, 使用模型 {llm.config.model_name}",
         })
 
         return {"posts": posts, "translated_count": success_count}

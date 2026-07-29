@@ -1,0 +1,280 @@
+"""SQLite 存储层 — 替代 JSON 文件实现持久化"""
+
+import os
+import json
+import sqlite3
+import logging
+from datetime import datetime
+from typing import Optional, List
+from app.config import settings
+
+logger = logging.getLogger("hyxi.storage")
+
+DB_PATH = os.path.join(settings.data_dir, "hyxi.db")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'pending',
+    description TEXT NOT NULL DEFAULT '',
+    plan_json TEXT NOT NULL DEFAULT '[]',
+    progress REAL NOT NULL DEFAULT 0.0,
+    current_step TEXT,
+    result_json TEXT,
+    error_message TEXT,
+    logs_json TEXT NOT NULL DEFAULT '[]',
+    scheduled_by TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sentiment (
+    task_id TEXT PRIMARY KEY,
+    data_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sentiment_created ON sentiment(created_at DESC);
+"""
+
+
+def _get_conn() -> sqlite3.Connection:
+    """获取数据库连接"""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def init_db():
+    """初始化数据库（创建表结构）"""
+    try:
+        conn = _get_conn()
+        conn.executescript(SCHEMA)
+        conn.commit()
+        conn.close()
+        logger.info("SQLite 数据库初始化完成: %s", DB_PATH)
+    except Exception as e:
+        logger.error("数据库初始化失败: %s", str(e))
+
+
+def migrate_from_json():
+    """从 JSON 文件迁移数据到 SQLite（如果 DB 为空且有 JSON 文件）"""
+    tasks_path = os.path.join(settings.data_dir, "tasks.json")
+    if not os.path.exists(tasks_path):
+        return
+
+    conn = _get_conn()
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        if count > 0:
+            return  # 已有数据，跳过迁移
+
+        with open(tasks_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        migrated = 0
+        for task in data.get("tasks", []):
+            conn.execute(
+                """INSERT OR REPLACE INTO tasks
+                   (id, status, description, plan_json, progress, current_step,
+                    result_json, error_message, logs_json, scheduled_by,
+                    created_at, started_at, completed_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    task.get("id", ""),
+                    task.get("status", "pending"),
+                    task.get("description", ""),
+                    json.dumps(task.get("plan", []), ensure_ascii=False),
+                    task.get("progress", 0.0),
+                    task.get("current_step"),
+                    json.dumps(task.get("result"), ensure_ascii=False) if task.get("result") else None,
+                    task.get("error_message"),
+                    json.dumps(task.get("logs", []), ensure_ascii=False),
+                    task.get("scheduled_by"),
+                    _to_iso(task.get("created_at")),
+                    _to_iso(task.get("started_at")),
+                    _to_iso(task.get("completed_at")),
+                ),
+            )
+            migrated += 1
+
+        conn.commit()
+        logger.info("从 %s 迁移 %d 条任务到 SQLite", tasks_path, migrated)
+
+        # 迁移 sentiment 文件
+        import glob as _g
+        sentiment_dir = settings.data_dir
+        for sf in _g.glob(os.path.join(sentiment_dir, "sentiment_*.json")):
+            try:
+                with open(sf, "r", encoding="utf-8") as f:
+                    sdata = json.load(f)
+                tid = sdata.get("task_id", os.path.basename(sf))
+                conn.execute(
+                    "INSERT OR REPLACE INTO sentiment (task_id, data_json, created_at) VALUES (?,?,?)",
+                    (tid, json.dumps(sdata, ensure_ascii=False), sdata.get("analyzed_at", datetime.now().isoformat())),
+                )
+            except Exception:
+                pass
+        conn.commit()
+        logger.info("Sentiment 数据迁移完成")
+    except Exception as e:
+        logger.error("数据迁移失败: %s", str(e))
+    finally:
+        conn.close()
+
+
+# ===== Task CRUD =====
+
+def save_task(task: dict):
+    """保存/更新单个任务"""
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """INSERT OR REPLACE INTO tasks
+               (id, status, description, plan_json, progress, current_step,
+                result_json, error_message, logs_json, scheduled_by,
+                created_at, started_at, completed_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                task.get("id", ""),
+                task.get("status", "pending"),
+                task.get("description", ""),
+                json.dumps(task.get("plan", []), ensure_ascii=False),
+                task.get("progress", 0.0),
+                task.get("current_step"),
+                json.dumps(task.get("result"), ensure_ascii=False) if task.get("result") else None,
+                task.get("error_message"),
+                json.dumps(task.get("logs", []), ensure_ascii=False),
+                task.get("scheduled_by"),
+                _to_iso(task.get("created_at")),
+                _to_iso(task.get("started_at")),
+                _to_iso(task.get("completed_at")),
+            ),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.error("保存任务失败: %s", str(e))
+    finally:
+        conn.close()
+
+
+def load_all_tasks() -> list:
+    """加载所有任务"""
+    conn = _get_conn()
+    try:
+        rows = conn.execute("SELECT * FROM tasks ORDER BY created_at DESC").fetchall()
+        return [_row_to_task(r) for r in rows]
+    except Exception as e:
+        logger.error("加载任务失败: %s", str(e))
+        return []
+    finally:
+        conn.close()
+
+
+def get_task(task_id: str) -> Optional[dict]:
+    """获取单个任务"""
+    conn = _get_conn()
+    try:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return _row_to_task(row) if row else None
+    except Exception as e:
+        logger.error("获取任务 %s 失败: %s", task_id, str(e))
+        return None
+    finally:
+        conn.close()
+
+
+def delete_task(task_id: str) -> bool:
+    """删除任务"""
+    conn = _get_conn()
+    try:
+        conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error("删除任务 %s 失败: %s", task_id, str(e))
+        return False
+    finally:
+        conn.close()
+
+
+# ===== Sentiment CRUD =====
+
+def save_sentiment(task_id: str, data: dict):
+    """保存舆情分析结果"""
+    conn = _get_conn()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO sentiment (task_id, data_json, created_at) VALUES (?,?,?)",
+            (task_id, json.dumps(data, ensure_ascii=False), data.get("analyzed_at", datetime.now().isoformat())),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.error("保存舆情结果失败: %s", str(e))
+    finally:
+        conn.close()
+
+
+def get_sentiment(task_id: str) -> Optional[dict]:
+    """获取舆情分析结果（含 fallback 到其他任务的匹配数据）"""
+    conn = _get_conn()
+    try:
+        row = conn.execute("SELECT * FROM sentiment WHERE task_id = ?", (task_id,)).fetchone()
+        if row:
+            return json.loads(row["data_json"])
+        # fallback：返回最新的舆情数据
+        row = conn.execute("SELECT * FROM sentiment ORDER BY created_at DESC LIMIT 1").fetchone()
+        if row:
+            return json.loads(row["data_json"])
+        return None
+    except Exception as e:
+        logger.error("获取舆情结果失败: %s", str(e))
+        return None
+    finally:
+        conn.close()
+
+
+# ===== Helpers =====
+
+def _row_to_task(row) -> dict:
+    """将 SQLite row 转为任务 dict"""
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "description": row["description"],
+        "plan": json.loads(row["plan_json"] or "[]"),
+        "progress": row["progress"] or 0.0,
+        "current_step": row["current_step"],
+        "result": json.loads(row["result_json"]) if row["result_json"] else None,
+        "error_message": row["error_message"],
+        "logs": json.loads(row["logs_json"] or "[]"),
+        "scheduled_by": row["scheduled_by"],
+        "created_at": _from_iso(row["created_at"]),
+        "started_at": _from_iso(row["started_at"]) if row["started_at"] else None,
+        "completed_at": _from_iso(row["completed_at"]) if row["completed_at"] else None,
+    }
+
+
+def _to_iso(val) -> Optional[str]:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.isoformat()
+    return str(val)
+
+
+def _from_iso(val: Optional[str]) -> Optional[datetime]:
+    if val is None:
+        return None
+    try:
+        return datetime.fromisoformat(val)
+    except (ValueError, TypeError):
+        return None

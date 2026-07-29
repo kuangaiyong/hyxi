@@ -3,6 +3,7 @@ import { onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useConfigStore } from '@/stores/config'
 import AppLayout from '@/components/layout/AppLayout.vue'
+import ToastContainer from '@/components/common/ToastContainer.vue'
 
 const router = useRouter()
 const configStore = useConfigStore()
@@ -16,4 +17,5 @@ onMounted(async () => {
   <AppLayout>
     <router-view />
   </AppLayout>
+  <ToastContainer />
 </template>

@@ -3,11 +3,13 @@ import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useConfigStore } from '@/stores/config'
 import { useTaskStore } from '@/stores/task'
+import { useToast } from '@/composables/useToast'
 import type { TaskStatus } from '@/types/task'
 
 const router = useRouter()
 const configStore = useConfigStore()
 const taskStore = useTaskStore()
+const toast = useToast()
 
 // 新建任务
 const description = ref('')
@@ -108,6 +110,16 @@ function viewTask(taskId: string, status: string) {
 async function deleteTask(taskId: string) {
   await taskStore.removeTask(taskId)
   confirmDelete.value = null
+}
+
+async function retryTask(taskId: string) {
+  const newTask = await taskStore.retryTask(taskId)
+  if (newTask) {
+    toast.success('任务已重新提交')
+    router.push(`/tasks/${newTask.id}/progress`)
+  } else {
+    toast.error('重试失败')
+  }
 }
 </script>
 
@@ -241,6 +253,12 @@ async function deleteTask(taskId: string) {
             <td style="text-align: center;">
               <div class="flex gap-1" style="justify-content: center;">
                 <button class="btn btn-outline btn-sm" @click="viewTask(task.id, task.status)">查看</button>
+                <button
+                  v-if="task.status === 'failed' || task.status === 'cancelled'"
+                  class="btn btn-outline btn-sm"
+                  style="color: var(--primary); border-color: transparent;"
+                  @click="retryTask(task.id)"
+                >重试</button>
                 <button
                   v-if="task.status !== 'running' && task.status !== 'pending' && task.status !== 'parsing'"
                   class="btn btn-outline btn-sm"

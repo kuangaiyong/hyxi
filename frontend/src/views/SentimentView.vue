@@ -123,6 +123,11 @@ function connectSSE() {
     const msg = d.message || ''
     // 过滤掉重复的进度计数日志（进度条已展示）
     if (/已分析\s*\d+\/\d+\s*条/.test(msg)) return
+    // 从初始日志中提取实际待分析条数，动态更新 pendingCount
+    const contentMatch = msg.match(/(\d+)\s*条有内容/)
+    if (contentMatch && pendingCount.value === 0) {
+      pendingCount.value = parseInt(contentMatch[1])
+    }
     progressLogs.value.push(msg)
     if (progressLogs.value.length > 20) progressLogs.value.shift()
   })
@@ -170,10 +175,19 @@ async function loadResults() {
       data.value = result
       analyzing.value = false
       await loadPosts()
+    } else if (result.status === 'running') {
+      analyzing.value = true
+      connectSSE()
+    } else if (result.status === 'not_found') {
+      analyzing.value = false
+      error.value = '尚未进行舆情分析'
+    } else {
+      analyzing.value = false
+      error.value = '分析结果异常，请重试'
     }
   } catch (e: any) {
     analyzing.value = false
-    error.value = '加载结果失败'
+    error.value = '加载结果失败: ' + (e?.response?.data?.detail || e?.message || '网络错误')
   }
 }
 
@@ -188,6 +202,10 @@ async function checkStatus() {
       connectSSE()
       return
     }
+    if (result.status === 'not_found') {
+      error.value = '尚未进行舆情分析'
+      return
+    }
     if (result.task_id) {
       data.value = result
       await loadPosts()
@@ -195,11 +213,7 @@ async function checkStatus() {
       error.value = '尚未进行舆情分析'
     }
   } catch (e: any) {
-    if (e.response?.status === 404) {
-      error.value = '尚未进行舆情分析'
-    } else {
-      error.value = '加载失败: ' + (e.response?.data?.detail || e.message)
-    }
+    error.value = '加载失败: ' + (e?.response?.data?.detail || e?.message || '网络错误')
   } finally {
     loading.value = false
   }
@@ -214,14 +228,19 @@ async function startAnalysis() {
   pendingCount.value = 0
   try {
     const result = await sentimentApi.triggerSentiment(taskId.value)
-    // 从返回消息中提取待分析数量，如 "增量舆情分析: 132 条已跳过, 4 条待分析"
-    const match = result.message?.match(/(\d+)\s*条待分析/)
-    if (match) pendingCount.value = parseInt(match[1])
+    // 优先使用 API 返回的 pending_count 字段，fallback 到正则匹配消息文本
+    if (typeof result.pending_count === 'number') {
+      pendingCount.value = result.pending_count
+    } else {
+      const match = result.message?.match(/(\d+)\s*条待分析/)
+      if (match) pendingCount.value = parseInt(match[1])
+    }
     if (result.status === 'started' || result.status === 'running') {
       await new Promise(r => setTimeout(r, 500))
       connectSSE()
     } else if (result.status === 'completed') {
-      loadResults()
+      // 所有帖子已完成分析，直接加载已有结果
+      await loadResults()
     }
   } catch (e: any) {
     analyzing.value = false
@@ -275,6 +294,36 @@ const maxDimCount = computed(() => {
   return Math.max(...dims.map(d => d[1]), 1)
 })
 
+// ===== 趋势图数据 =====
+
+const trendData = computed(() => {
+  if (!data.value?.results || !postsMap.value.size) return []
+  const results = data.value.results
+  // 收集每篇帖子的日期和情感
+  const daily: Record<string, { positive: number; negative: number; neutral: number }> = {}
+  for (let i = 0; i < results.length; i++) {
+    const post = postsMap.value.get(i)
+    if (!post?.timestamp) continue
+    const r = results[i]
+    if (!r?.sentiment) continue
+    // 提取日期部分 (yyyy-mm-dd)
+    const dateStr = post.timestamp.slice(0, 10)
+    if (!daily[dateStr]) daily[dateStr] = { positive: 0, negative: 0, neutral: 0 }
+    daily[dateStr][r.sentiment as keyof typeof daily[string]]++
+  }
+  return Object.entries(daily)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, counts]) => ({ date, ...counts }))
+})
+
+const trendMax = computed(() => {
+  let max = 1
+  for (const d of trendData.value) {
+    max = Math.max(max, d.positive + d.negative + d.neutral)
+  }
+  return max
+})
+
 function sentimentLabel(s: string): string {
   return { positive: '正面', negative: '负面', neutral: '中立' }[s] || s
 }
@@ -302,6 +351,14 @@ function viewPost(idx: number) {
     <div class="flex items-center justify-between mb-4">
       <h2 style="font-size: 18px; font-weight: 600;">📊 舆情分析</h2>
       <div class="flex gap-2">
+        <a
+          v-if="data"
+          :href="sentimentApi.getSentimentDownloadUrl(taskId)"
+          class="btn btn-success btn-sm"
+          download
+        >
+          📥 下载舆情报告
+        </a>
         <button class="btn btn-outline btn-sm" @click="router.push(`/tasks/${taskId}/results`)">
           ← 返回结果
         </button>
@@ -446,6 +503,52 @@ function viewPost(idx: number) {
         </div>
       </div>
 
+      <!-- 趋势图: 情感随时间变化 -->
+      <div v-if="trendData.length > 1" class="card">
+        <div class="card-header">📈 情感趋势</div>
+        <div class="trend-chart">
+          <svg :viewBox="`0 0 700 220`" style="width: 100%;" role="img" aria-label="情感趋势图">
+            <!-- Y轴标注 -->
+            <text x="30" y="20" font-size="11" fill="#64748B">{{ trendMax }}</text>
+            <text x="30" y="115" font-size="11" fill="#64748B">{{ Math.round(trendMax / 2) }}</text>
+            <text x="30" y="210" font-size="11" fill="#64748B">0</text>
+            <!-- 网格线 -->
+            <line v-for="y in [40, 120, 200]" :key="y" x1="40" :y1="y" x2="680" :y2="y" stroke="#E2E8F0" stroke-width="1" />
+            <!-- X轴标注 -->
+            <text
+              v-for="(d, i) in trendData"
+              :key="d.date"
+              :x="40 + (i / Math.max(trendData.length - 1, 1)) * 640"
+              y="215"
+              font-size="9"
+              fill="#94A3B8"
+              text-anchor="middle"
+              :transform="`rotate(-30, ${40 + (i / Math.max(trendData.length - 1, 1)) * 640}, 215)`"
+            >{{ d.date.slice(5) }}</text>
+            <!-- 折线: 正面 -->
+            <polyline
+              :points="trendData.map((d, i) => `${40 + (i / Math.max(trendData.length - 1, 1)) * 640},${200 - (d.positive / trendMax) * 160}`).join(' ')"
+              fill="none" stroke="#10B981" stroke-width="2"
+            />
+            <!-- 折线: 负面 -->
+            <polyline
+              :points="trendData.map((d, i) => `${40 + (i / Math.max(trendData.length - 1, 1)) * 640},${200 - (d.negative / trendMax) * 160}`).join(' ')"
+              fill="none" stroke="#EF4444" stroke-width="2"
+            />
+            <!-- 折线: 中立 -->
+            <polyline
+              :points="trendData.map((d, i) => `${40 + (i / Math.max(trendData.length - 1, 1)) * 640},${200 - (d.neutral / trendMax) * 160}`).join(' ')"
+              fill="none" stroke="#6B7280" stroke-width="2" stroke-dasharray="4,3"
+            />
+          </svg>
+          <div style="display: flex; gap: 16px; justify-content: center; margin-top: 8px;">
+            <span style="font-size: 12px;"><span style="color:#10B981;">━━</span> 正面</span>
+            <span style="font-size: 12px;"><span style="color:#EF4444;">━━</span> 负面</span>
+            <span style="font-size: 12px;"><span style="color:#6B7280;">╌╌</span> 中立</span>
+          </div>
+        </div>
+      </div>
+
       <!-- 帖子详情列表 -->
       <div class="card" style="padding: 0; overflow-x: auto;">
         <div style="padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; border-bottom: 1px solid var(--border-light);">
@@ -543,9 +646,9 @@ function viewPost(idx: number) {
 
     <!-- 详情弹窗 -->
     <div v-if="showDetail" class="modal-overlay" @click.self="showDetail = false">
-      <div class="modal-content" style="max-width: 1000px; max-height: 85vh;">
+      <div class="modal-content" style="max-width: 1000px; max-height: 85vh;" role="dialog" aria-modal="true" aria-labelledby="sentiment-post-title">
         <div class="modal-header">
-          <h3>📝 帖子 #{{ detailPost?.index }} — {{ detailPost?.username }}</h3>
+          <h3 id="sentiment-post-title">📝 帖子 #{{ detailPost?.index }} — {{ detailPost?.username }}</h3>
           <button class="btn btn-sm btn-outline" @click="showDetail = false">✕</button>
         </div>
 

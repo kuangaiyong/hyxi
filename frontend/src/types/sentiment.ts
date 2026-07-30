@@ -1,5 +1,6 @@
 export interface SentimentResult {
-  sentiment: 'positive' | 'negative' | 'neutral'
+  // LLM 解析失败的条目后端会回填 sentiment: null，前端必须能渲染成「未分析」
+  sentiment: 'positive' | 'negative' | 'neutral' | null
   intensity: number
   reason_cn: string
   dimensions: string[]

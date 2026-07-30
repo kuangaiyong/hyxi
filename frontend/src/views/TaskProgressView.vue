@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, nextTick, onMounted } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useTaskStore } from '@/stores/task'
 import { useSSE } from '@/composables/useSSE'
@@ -27,12 +27,20 @@ watch(() => taskStore.logs.length, async () => {
 })
 
 // 任务完成时跳转到结果页
+let redirectTimer: number | null = null
+
 watch(() => taskStore.isCompleted, (completed) => {
   if (completed && taskStore.currentTaskId) {
-    setTimeout(() => {
+    redirectTimer = window.setTimeout(() => {
+      redirectTimer = null
       router.push(`/tasks/${taskStore.currentTaskId}/results`)
     }, 1500)
   }
+})
+
+onUnmounted(() => {
+  // 用户在这 1.5 秒内手动离开的话，定时器会把他强行拽回结果页
+  if (redirectTimer !== null) clearTimeout(redirectTimer)
 })
 
 onMounted(async () => {

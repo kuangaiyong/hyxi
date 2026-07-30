@@ -15,6 +15,7 @@ const taskStore = useTaskStore()
 const schedules = ref<ScheduleTask[]>([])
 const presets = ref<Record<string, SchedulePreset>>({})
 const loading = ref(true)
+const loadError = ref('')
 
 // 过滤
 const filterEnabled = ref('')
@@ -48,6 +49,7 @@ onMounted(async () => {
 
 async function loadData() {
   loading.value = true
+  loadError.value = ''
   try {
     const [sData, pData] = await Promise.all([
       schedulesApi.fetchSchedules(),
@@ -57,7 +59,10 @@ async function loadData() {
     presets.value = pData.presets
     // 加载任务列表以便解析执行历史的状态
     await taskStore.fetchTasks()
-  } catch { /* */ }
+  } catch (e: any) {
+    // 后端不可达时渲染空状态会诱导用户「创建第一个」，从而建出重复的定时任务
+    loadError.value = '加载失败: ' + (e.response?.data?.detail || e.message || '网络错误')
+  }
   finally { loading.value = false }
 }
 
@@ -93,8 +98,12 @@ async function handleCreate() {
 }
 
 async function handleToggle(item: ScheduleTask) {
-  await schedulesApi.toggleSchedule(item.id)
-  await loadData()
+  try {
+    await schedulesApi.toggleSchedule(item.id)
+    await loadData()
+  } catch (e: any) {
+    toast.error('切换启用状态失败: ' + (e.response?.data?.detail || e.message))
+  }
 }
 
 async function handleDelete(id: string) {
@@ -190,6 +199,13 @@ function formatTime(iso: string): string {
 
     <!-- 加载中 -->
     <div v-if="loading" class="card text-center" style="padding: 48px;"><span class="spinner spinner-lg"></span></div>
+
+    <!-- 加载失败 -->
+    <div v-else-if="loadError" class="card text-center" style="padding: 48px;">
+      <div style="font-size: 48px; margin-bottom: 12px;">⚠️</div>
+      <p class="text-secondary mb-4">{{ loadError }}</p>
+      <button class="btn btn-primary" @click="loadData">重试</button>
+    </div>
 
     <!-- 空状态 -->
     <div v-else-if="!schedules.length" class="card text-center" style="padding: 48px;">

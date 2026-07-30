@@ -435,6 +435,9 @@ class TaskOrchestrator:
         """删除任务记录"""
         if task_id in self.tasks:
             del self.tasks[task_id]
+            # _persist() 对 SQLite 只 upsert 剩余任务，不会删行，必须显式 DELETE
+            if self._db_ready:
+                db_delete_task(task_id)
             self._persist()
             return True
         return False

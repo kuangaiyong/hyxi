@@ -22,7 +22,11 @@ class TestTaskLifecycleEndToEnd:
     def _create_orchestrator(self):
         from app.services.orchestrator import TaskOrchestrator
         import app.services.orchestrator as orch_module
+        import app.services.storage as storage_module
         orch_module.settings.data_dir = self.tmpdir
+        # storage.DB_PATH 是 import 时算好的常量，改 settings.data_dir 不影响它，
+        # 必须一并重定向，否则本类的测试会写进真实的 backend/data/hyxi.db
+        storage_module.DB_PATH = os.path.join(self.tmpdir, "hyxi.db")
         return TaskOrchestrator()
 
     def test_create_task_persists(self):
@@ -58,6 +62,19 @@ class TestTaskLifecycleEndToEnd:
 
         assert orch.get_task("t3") is None
         assert orch.get_task("t4") is not None
+
+    def test_deleted_task_does_not_reappear_after_restart(self):
+        orch1 = self._create_orchestrator()
+        orch1.create_task("t8", "删除后不应复活")
+        orch1.create_task("t9", "应当保留")
+
+        assert orch1.delete_task("t8") is True
+        assert orch1.get_task("t8") is None
+
+        # 重建 orchestrator 模拟服务重启：删除必须落到存储层
+        orch2 = self._create_orchestrator()
+        assert orch2.get_task("t8") is None, "已删除的任务在重启后复活了"
+        assert orch2.get_task("t9") is not None
 
     def test_tasks_survive_restart(self):
         orch1 = self._create_orchestrator()

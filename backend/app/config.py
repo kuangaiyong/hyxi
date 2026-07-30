@@ -17,9 +17,12 @@ class Settings(BaseSettings):
     exports_dir: str = os.path.join(data_dir, "exports")
 
     # 服务配置
-    host: str = "0.0.0.0"
+    # 注意：host/port 目前无任何代码引用（项目不调 uvicorn.run），
+    # 实际监听地址取决于启动命令的 --host。此处默认值仅表达「无鉴权应只绑本机」的意图。
+    host: str = "127.0.0.1"
     port: int = 8000
     cors_origins: List[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
+    enable_docs: bool = True  # 对外暴露时设 TWEAKERS_ENABLE_DOCS=false 关闭 /docs
 
     # 任务限制
     max_concurrent_tasks: int = 1

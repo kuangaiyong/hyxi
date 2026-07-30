@@ -25,8 +25,12 @@ cd frontend; npm install
 启动后端（`main:app` 的 import 依赖 cwd，必须先进 `backend`）：
 
 ```powershell
-cd backend; .\.venv\Scripts\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000
+cd backend; .\.venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8000
 ```
+
+**接口无鉴权**，所以只绑本机。确需局域网访问时才改成 `--host 0.0.0.0`，并同时设 `TWEAKERS_ENABLE_DOCS=false` 关闭 `/docs`、`/redoc`、`/openapi.json`。
+
+注意 `settings.host` / `settings.port` **是死配置**——项目不调 `uvicorn.run()`，实际监听地址只由命令行 `--host` 决定，改环境变量 `TWEAKERS_HOST` 不会生效。`enable_docs` 则是真实生效的（`main.py` 用它决定 `docs_url`）。
 
 启动前端（localhost:5173，Vite 把 `/api` 代理到 localhost:8000）：
 

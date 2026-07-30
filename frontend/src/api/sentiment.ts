@@ -1,4 +1,4 @@
-import apiClient from './client'
+import apiClient, { withApiKey } from './client'
 import type { SentimentData } from '@/types/sentiment'
 
 export async function triggerSentiment(
@@ -18,5 +18,5 @@ export function getSentimentDownloadUrl(taskId: string): string {
 }
 
 export function getSentimentEventsUrl(taskId: string): string {
-  return `/api/v1/tasks/${taskId}/sentiment/events`
+  return withApiKey(`/api/v1/tasks/${taskId}/sentiment/events`)
 }

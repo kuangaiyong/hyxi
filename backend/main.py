@@ -3,9 +3,11 @@
 import os
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.auth import require_api_key
 from app.config import settings
+from app.logging_config import get_logger
 from app.routers import config as config_router
 from app.routers import tasks as tasks_router
 from app.routers import results as results_router
@@ -19,6 +21,13 @@ async def lifespan(app: FastAPI):
     os.makedirs(settings.data_dir, exist_ok=True)
     os.makedirs(settings.tasks_dir, exist_ok=True)
     os.makedirs(settings.exports_dir, exist_ok=True)
+    if not settings.api_key:
+        # 用全局 logger 而非 hyxi.* 命名空间：后者拿不到 file handler，
+        # 服务在后台运行时这条安全告警会随控制台输出一起丢掉
+        get_logger().warning(
+            "未设置 TWEAKERS_API_KEY，/api/v1/* 处于无鉴权状态；"
+            "任何能访问本端口的人都可覆写 LLM 密钥、导出全部数据，请勿绑定 0.0.0.0"
+        )
     # 启动定时任务调度器：调度是附属能力，起不来也不该让整个 API 服务不可用
     try:
         scheduler_service.start()
@@ -47,10 +56,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(config_router.router)
-app.include_router(tasks_router.router)
-app.include_router(results_router.router)
-app.include_router(schedules_router.router)
+_protected = [Depends(require_api_key)]
+app.include_router(config_router.router, dependencies=_protected)
+app.include_router(tasks_router.router, dependencies=_protected)
+app.include_router(results_router.router, dependencies=_protected)
+app.include_router(schedules_router.router, dependencies=_protected)
 
 
 @app.get("/")

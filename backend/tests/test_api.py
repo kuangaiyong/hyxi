@@ -18,6 +18,9 @@ class TestAPIEndpointsEndToEnd:
         cls.tmpdir = tempfile.mkdtemp()
         # 设置数据目录到临时位置
         import app.config as cfg
+        # 本机根目录若有 .env，api_key 会在 import 期被读入，这批用例就会全部 401
+        cls._old_key = cfg.settings.api_key
+        cfg.settings.api_key = ""
         cfg.settings.data_dir = cls.tmpdir
         cfg.settings.config_file = os.path.join(cls.tmpdir, "config.json")
         cfg.settings.tasks_dir = os.path.join(cls.tmpdir, "tasks")
@@ -34,6 +37,8 @@ class TestAPIEndpointsEndToEnd:
 
     @classmethod
     def teardown_class(cls):
+        import app.config as cfg
+        cfg.settings.api_key = cls._old_key
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 
     def test_health_check(self):
@@ -217,3 +222,72 @@ class TestAPIEndpointsEndToEnd:
         r = self.client.get(f"/api/v1/tasks/{traversal}/sentiment")
         assert r.status_code == 404
         assert "tweakers-scraper-frontend" not in r.text
+
+
+class TestApiKeyAuthEndToEnd:
+    """共享密钥认证 — 未配置时放行，配置后拦截"""
+
+    @classmethod
+    def setup_class(cls):
+        cls.tmpdir = tempfile.mkdtemp()
+        import app.config as cfg
+        cls.cfg = cfg
+        cls._old_key = cfg.settings.api_key
+
+        from main import app
+        cls.client = TestClient(app)
+
+    @classmethod
+    def teardown_class(cls):
+        cls.cfg.settings.api_key = cls._old_key
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def test_open_when_key_not_configured(self):
+        """漏配环境变量不该让既有部署整个不可用"""
+        self.cfg.settings.api_key = ""
+        assert self.client.get("/api/v1/tasks").status_code == 200
+
+    def test_rejected_without_key(self):
+        self.cfg.settings.api_key = "s3cr3t"
+        try:
+            resp = self.client.get("/api/v1/tasks")
+            assert resp.status_code == 401
+            resp = self.client.get("/api/v1/tasks", headers={"X-API-Key": "wrong"})
+            assert resp.status_code == 401
+        finally:
+            self.cfg.settings.api_key = ""
+
+    def test_accepted_with_key(self):
+        self.cfg.settings.api_key = "s3cr3t"
+        try:
+            resp = self.client.get("/api/v1/tasks", headers={"X-API-Key": "s3cr3t"})
+            assert resp.status_code == 200
+            # 浏览器 EventSource 无法自定义请求头，只能走 query
+            resp = self.client.get("/api/v1/tasks?api_key=s3cr3t")
+            assert resp.status_code == 200
+        finally:
+            self.cfg.settings.api_key = ""
+
+    def test_health_and_root_stay_public(self):
+        """健康检查被监控系统调用，不能要求密钥"""
+        self.cfg.settings.api_key = "s3cr3t"
+        try:
+            assert self.client.get("/api/health").status_code == 200
+            assert self.client.get("/").status_code == 200
+        finally:
+            self.cfg.settings.api_key = ""
+
+    def test_write_endpoints_also_protected(self):
+        """覆写 LLM 密钥、植入定时任务这类写操作必须一并挡住"""
+        self.cfg.settings.api_key = "s3cr3t"
+        try:
+            resp = self.client.post("/api/v1/config", json={
+                "api_key": "sk-hijack", "base_url": "https://evil.test", "model_name": "x",
+            })
+            assert resp.status_code == 401
+            resp = self.client.post("/api/v1/schedules", json={
+                "description": "植入的定时任务", "interval": "daily", "time": "09:00",
+            })
+            assert resp.status_code == 401
+        finally:
+            self.cfg.settings.api_key = ""

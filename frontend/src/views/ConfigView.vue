@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
+import { getApiKey, setApiKey } from '@/api/client'
 import { useConfigStore } from '@/stores/config'
 import { useToast } from '@/composables/useToast'
 
@@ -7,6 +8,7 @@ const configStore = useConfigStore()
 const toast = useToast()
 const apiKey = ref('')
 const saveSuccess = ref(false)
+const accessKey = ref(getApiKey())
 
 onMounted(async () => {
   await configStore.fetchConfig()
@@ -24,6 +26,11 @@ async function handleSave() {
 
 async function handleTest() {
   await configStore.testConnection(apiKey.value)
+}
+
+function handleSaveAccessKey() {
+  setApiKey(accessKey.value.trim())
+  toast.success(accessKey.value.trim() ? '访问密钥已保存' : '访问密钥已清除')
 }
 
 async function handleReset() {
@@ -116,6 +123,29 @@ async function handleReset() {
           重置
         </button>
       </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">🔐 服务访问密钥</div>
+      <p class="text-secondary text-sm mb-4">
+        后端设置了 <code>TWEAKERS_API_KEY</code> 时必须在此填入相同的值，否则所有接口返回 401。
+        后端未设置则留空即可。
+      </p>
+
+      <div class="form-group">
+        <label class="form-label">Access Key</label>
+        <input
+          v-model="accessKey"
+          type="password"
+          class="form-input"
+          placeholder="与后端 TWEAKERS_API_KEY 一致"
+          autocomplete="off"
+        />
+      </div>
+
+      <button class="btn btn-primary" @click="handleSaveAccessKey">
+        💾 保存到本机
+      </button>
     </div>
 
     <div class="card" v-if="configStore.isConfigured">

@@ -38,8 +38,11 @@ def _sync_processed_flags(json_path: str, posts: list) -> int:
 
     if updated > 0:
         jdata["posts"] = jposts
-        with open(json_path, "w", encoding="utf-8") as f:
+        # 源数据文件写坏就再也拿不回来了，先写临时文件再原子替换
+        tmp_path = json_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(jdata, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, json_path)
     return updated
 
 SENTIMENT_SYSTEM_PROMPT = """你是一位精通荷兰语和中文的市场舆情分析专家。你的任务是分析荷兰语论坛帖子对产品 HYXi Halo 家用储能电池的情感倾向。
@@ -253,10 +256,16 @@ class SentimentService:
         except Exception:
             pass
 
-        # 保存帖子的 _processed 标记回 JSON（按指纹匹配，更新所有 JSON 文件）
+        # 保存帖子的 _processed 标记回源 JSON（按指纹匹配）
+        # 一条帖子只属于一个 thread 文件，全部匹配上就说明找到了目标文件，无需再重写其余文件
         import glob as _g
         for jf in _g.glob(os.path.join(settings.project_root, "tweakers_thread_*.json")):
-            _sync_processed_flags(jf, posts)
+            try:
+                if _sync_processed_flags(jf, posts) >= len(posts):
+                    break
+            except Exception as e:
+                # 单个文件损坏不该让整轮分析结果丢失
+                logger.warning("回写 _processed 标记失败 %s: %s", jf, e)
 
         await progress.emit(task_id, "log", {
             "level": "success",

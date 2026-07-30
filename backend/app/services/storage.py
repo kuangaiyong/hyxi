@@ -222,14 +222,15 @@ def save_sentiment(task_id: str, data: dict):
 
 
 def get_sentiment(task_id: str) -> Optional[dict]:
-    """获取舆情分析结果（含 fallback 到其他任务的匹配数据）"""
+    """获取舆情分析结果
+
+    只按 task_id 精确匹配。曾经在查不到时回退返回最新一条，但结果里的 index 是按各自
+    任务的帖子列表编号的，跨任务取来会与当前帖子完全对不上；更糟的是增量分析会把它
+    当作 existing_results 合并后持久化，直接污染目标任务。
+    """
     conn = _get_conn()
     try:
         row = conn.execute("SELECT * FROM sentiment WHERE task_id = ?", (task_id,)).fetchone()
-        if row:
-            return json.loads(row["data_json"])
-        # fallback：返回最新的舆情数据
-        row = conn.execute("SELECT * FROM sentiment ORDER BY created_at DESC LIMIT 1").fetchone()
         if row:
             return json.loads(row["data_json"])
         return None

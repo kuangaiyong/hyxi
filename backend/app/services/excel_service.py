@@ -8,6 +8,7 @@ from collections import Counter
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.chart import PieChart, Reference
+from openpyxl.utils import get_column_letter
 from app.config import settings
 from app.services.progress_manager import ProgressManager
 
@@ -40,6 +41,18 @@ def _parse_dutch_timestamp(ts: str):
         return datetime.strptime(ts, "%d-%m-%Y %H:%M")
     except (ValueError, TypeError):
         return None
+
+
+def _save_workbook(wb, output_path: str) -> None:
+    """保存工作簿。
+
+    Windows 上用户若正用 Excel 打开同名文件，save 会抛 PermissionError，
+    未捕获时前端只看到一个 500，无从判断该做什么。
+    """
+    try:
+        wb.save(output_path)
+    except PermissionError:
+        raise Exception(f"无法写入 {os.path.basename(output_path)}，请先关闭已在 Excel 中打开的同名文件")
 
 
 class ExcelService:
@@ -77,7 +90,7 @@ class ExcelService:
             cell.fill = HEADER_FILL
             cell.alignment = HEADER_ALIGN
             cell.border = THIN_BORDER
-            ws.column_dimensions[chr(64 + col)].width = width
+            ws.column_dimensions[get_column_letter(col)].width = width
 
         ws.freeze_panes = "A2"
 
@@ -128,7 +141,7 @@ class ExcelService:
                 cell.fill = HEADER_FILL
                 cell.alignment = HEADER_ALIGN
                 cell.border = THIN_BORDER
-                ws2.column_dimensions[chr(64 + col)].width = width
+                ws2.column_dimensions[get_column_letter(col)].width = width
 
             usernames = [p.get("username", "") for p in posts]
             user_counter = Counter(usernames)
@@ -173,9 +186,10 @@ class ExcelService:
             ws2.freeze_panes = "A2"
 
         # 保存
-        output_name = f"tweakers_report_{task_id[:8]}.xlsx"
+        # 带时间戳，避免同一任务重跑时把上一次的导出直接盖掉
+        output_name = f"tweakers_report_{task_id[:8]}_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
         output_path = os.path.join(settings.exports_dir, output_name)
-        wb.save(output_path)
+        _save_workbook(wb, output_path)
 
         await progress.emit(task_id, "step_progress", {
             "step": 2,
@@ -304,7 +318,7 @@ class ExcelService:
             cell.fill = HEADER_FILL
             cell.alignment = HEADER_ALIGN
             cell.border = THIN_BORDER
-            ws2.column_dimensions[chr(64 + col)].width = w
+            ws2.column_dimensions[get_column_letter(col)].width = w
 
         ws2.freeze_panes = "A2"
 
@@ -342,7 +356,7 @@ class ExcelService:
         output_name = f"sentiment_report_{task_id[:8]}.xlsx"
         output_path = os.path.join(output_dir, output_name)
         os.makedirs(output_dir, exist_ok=True)
-        wb.save(output_path)
+        _save_workbook(wb, output_path)
 
         return {
             "file_path": output_path,

@@ -870,3 +870,195 @@ class TestExcelRobustnessEndToEnd:
         rows = {ws.cell(r, 1).value: ws.cell(r, 2).value for r in range(2, 7)}
         assert rows["时间范围开始"] == "03-03-2026 08:00"
         assert rows["时间范围结束"] == "05-01-2027 09:00"
+
+    def test_export_name_is_timestamped_so_reruns_do_not_overwrite(self):
+        from app.services.excel_service import ExcelService
+        from app.services.progress_manager import ProgressManager
+        import asyncio, time
+
+        posts = [{"username": "u", "timestamp": "22-05-2026 17:06", "content": "c",
+                  "translation": "t", "page_number": 1}]
+        pm = ProgressManager()
+        loop = asyncio.get_event_loop()
+        first = loop.run_until_complete(ExcelService.execute("dup-task", posts, {}, pm))
+        time.sleep(1.1)
+        second = loop.run_until_complete(ExcelService.execute("dup-task", posts, {}, pm))
+
+        assert first["file_name"] != second["file_name"], "同一任务重跑会盖掉上一次导出"
+        assert os.path.exists(first["file_path"]) and os.path.exists(second["file_path"])
+
+
+class TestSentimentIsolationEndToEnd:
+    """舆情结果不得跨任务串台"""
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+        import app.services.storage as storage_module
+        self.storage = storage_module
+        self._old_db = storage_module.DB_PATH
+        storage_module.DB_PATH = os.path.join(self.tmpdir, "hyxi.db")
+        storage_module.init_db()
+
+    def teardown_method(self):
+        self.storage.DB_PATH = self._old_db
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_missing_task_does_not_fall_back_to_another_task(self):
+        self.storage.save_sentiment("task-a", {
+            "task_id": "task-a", "total": 2, "analyzed_at": "2026-07-30T10:00:00",
+            "results": [{"sentiment": "positive"}, {"sentiment": "negative"}],
+        })
+        assert self.storage.get_sentiment("task-a")["task_id"] == "task-a"
+        # 曾经在这里回退返回最新一条，索引与本任务帖子对不上还会被合并写回
+        assert self.storage.get_sentiment("task-b") is None
+
+
+class TestProgressManagerResourceEndToEnd:
+    """SSE 订阅队列的资源边界"""
+
+    def test_full_queue_drops_oldest_instead_of_blocking(self):
+        import asyncio
+        from app.services.progress_manager import ProgressManager, QUEUE_MAXSIZE
+
+        pm = ProgressManager()
+
+        async def run():
+            q = pm.subscribe("t1")
+            for i in range(QUEUE_MAXSIZE + 5):
+                await pm.emit("t1", "log", {"i": i})
+            assert q.qsize() == QUEUE_MAXSIZE
+            first = await q.get()
+            # 最旧的 5 条被丢弃，而不是让 emit 无界堆积或阻塞抓取主流程
+            assert first["data"]["i"] == 5
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_unsubscribe_removes_empty_key(self):
+        from app.services.progress_manager import ProgressManager
+
+        pm = ProgressManager()
+        q = pm.subscribe("t2")
+        assert "t2" in pm.subscribers
+        pm.unsubscribe("t2", q)
+        assert "t2" not in pm.subscribers, "订阅字典会随任务数单调增长"
+
+    def test_sentiment_complete_terminates_stream(self):
+        import asyncio
+        from app.services.progress_manager import ProgressManager
+
+        pm = ProgressManager()
+
+        async def run():
+            gen = pm.event_generator("t3")
+            asyncio.ensure_future(_emit_later(pm))
+            frames = [frame async for frame in gen]
+            return frames
+
+        async def _emit_later(manager):
+            await asyncio.sleep(0.05)
+            await manager.emit("t3", "log", {"message": "x"})
+            await manager.emit("t3", "sentiment_complete", {"status": "completed"})
+
+        loop = asyncio.new_event_loop()
+        frames = loop.run_until_complete(asyncio.wait_for(run(), timeout=10))
+        assert any("sentiment_complete" in f for f in frames)
+        assert not pm.subscribers
+
+
+class TestUpstreamErrorRedactionEndToEnd:
+    """上游错误体会落库并被展示，不能原样存"""
+
+    def _resp(self, status: int, body: str):
+        import httpx
+        return httpx.Response(status, text=body, request=httpx.Request("POST", "https://x/y"))
+
+    def test_extracts_message_and_masks_secrets(self):
+        from app.services.llm_service import _safe_error_detail
+        body = json.dumps({"error": {
+            "message": "Invalid key sk-abcdef1234567890 for org-acme-42",
+            "type": "authentication_error",
+        }})
+        detail = _safe_error_detail(self._resp(401, body))
+        assert "sk-abcdef1234567890" not in detail
+        assert "org-acme-42" not in detail
+        assert "Invalid key" in detail
+
+    def test_unparseable_body_is_not_echoed(self):
+        from app.services.llm_service import _safe_error_detail
+        detail = _safe_error_detail(self._resp(500, "<html>account 12345 quota exhausted</html>"))
+        assert "12345" not in detail
+        assert "日志" in detail
+
+
+# 真实拉起 node 子进程，没有 node 就跳过而不是伪造
+_HAS_NODE = shutil.which("node") is not None
+
+STALL_SCRIPT = """
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+const beat = path.join(__dirname, 'heartbeat.txt');
+
+if (process.argv.includes('--child')) {
+  setInterval(() => fs.writeFileSync(beat, String(Date.now())), 100);
+} else {
+  console.log('第 1/9 页');
+  spawn(process.execPath, [__filename, '--child'], { stdio: 'ignore' });
+  setInterval(() => {}, 1000);
+}
+"""
+
+
+class TestScraperStallTimeoutEndToEnd:
+    """抓取子进程 stall 时必须超时并连同后代一起清理"""
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+        with open(os.path.join(self.tmpdir, "tweakers_scraper_playwright.js"), "w", encoding="utf-8") as f:
+            f.write(STALL_SCRIPT)
+        import app.services.scraper_service as scraper_mod
+        self.mod = scraper_mod
+        self._old_root = scraper_mod.settings.project_root
+        self._old_timeout = scraper_mod.SUBPROCESS_TIMEOUT
+        scraper_mod.settings.project_root = self.tmpdir
+        scraper_mod.SUBPROCESS_TIMEOUT = 3
+
+    def teardown_method(self):
+        self.mod.settings.project_root = self._old_root
+        self.mod.SUBPROCESS_TIMEOUT = self._old_timeout
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_stalled_stdout_times_out_and_kills_whole_tree(self):
+        if not _HAS_NODE:
+            import pytest
+            pytest.skip("未安装 node")
+
+        import asyncio, time
+        from app.services.progress_manager import ProgressManager
+
+        async def run():
+            # 外层再套一层超时：回归时读流循环永不结束，测试应快速失败而不是挂死
+            with_timeout = asyncio.wait_for(
+                self.mod.ScraperService.execute("stall", {"thread_id": 123}, ProgressManager()),
+                timeout=30,
+            )
+            try:
+                await with_timeout
+            except Exception as e:
+                return str(e)
+            return ""
+
+        loop = asyncio.new_event_loop()
+        try:
+            message = loop.run_until_complete(run())
+        finally:
+            loop.close()
+
+        assert "超时" in message, f"stall 的子进程没有触发超时: {message!r}"
+
+        # 心跳文件由孙进程写：只 terminate 父进程的话它会继续跳（Playwright 的 Chromium 同理）
+        beat = os.path.join(self.tmpdir, "heartbeat.txt")
+        assert os.path.exists(beat), "孙进程没起来，本用例失去意义"
+        before = os.path.getmtime(beat)
+        time.sleep(2)
+        assert os.path.getmtime(beat) == before, "子进程树没被清理干净，孙进程仍在运行"

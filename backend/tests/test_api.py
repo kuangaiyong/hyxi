@@ -139,3 +139,31 @@ class TestAPIEndpointsEndToEnd:
     def test_404_for_nonexistent_task(self):
         resp = self.client.get("/api/v1/tasks/nonexistent-id")
         assert resp.status_code == 404
+
+    def test_result_endpoints_do_not_500_when_result_is_none(self):
+        """未成功完成的任务 result 为 None，结果类端点不得抛 AttributeError"""
+        resp = self.client.post("/api/v1/tasks", json={"description": "result 为 None 的任务"})
+        task_id = resp.json()["id"]
+        assert self.client.get(f"/api/v1/tasks/{task_id}").json()["result"] is None
+
+        for path, allowed in (
+            ("posts", (200,)),
+            ("stats", (200,)),
+            ("export/csv", (404,)),
+            ("export/json", (404,)),
+        ):
+            r = self.client.get(f"/api/v1/tasks/{task_id}/{path}")
+            assert r.status_code in allowed, f"{path} 返回 {r.status_code}，期望 {allowed}"
+
+    def test_sentiment_endpoints_reject_unknown_task(self):
+        """task_id 会被拼进文件路径，不存在的任务必须 404 而不是去读文件"""
+        for path in ("sentiment", "sentiment/download"):
+            r = self.client.get(f"/api/v1/tasks/no-such-task/{path}")
+            assert r.status_code == 404, f"{path} 返回 {r.status_code}，期望 404"
+
+    def test_sentiment_path_traversal_blocked(self):
+        """%5C 在 Windows 上是路径分隔符，不得借此读到 data 目录之外的文件"""
+        traversal = "..%5C..%5C..%5C..%5Cfrontend%5Cpackage"
+        r = self.client.get(f"/api/v1/tasks/{traversal}/sentiment")
+        assert r.status_code == 404
+        assert "tweakers-scraper-frontend" not in r.text

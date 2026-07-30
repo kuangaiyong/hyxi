@@ -58,6 +58,7 @@ async def save_config(config: LLMConfig):
 @router.post("/test", response_model=ConfigTestResult)
 async def test_connection(config: LLMConfig):
     """测试 LLM 连接"""
+    service = None
     try:
         service = LLMService(config)
         ok = await service.test_connection()
@@ -67,6 +68,9 @@ async def test_connection(config: LLMConfig):
             return ConfigTestResult(success=False, message="连接失败，请检查 API Key 和 Base URL。")
     except Exception as e:
         return ConfigTestResult(success=False, message=f"连接异常: {str(e)}")
+    finally:
+        if service:
+            await service.close()
 
 
 @router.delete("", response_model=LLMConfigPublic)

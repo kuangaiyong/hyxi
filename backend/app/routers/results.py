@@ -88,7 +88,7 @@ async def get_posts(
     task = _get_task_or_404(task_id)
 
     # 优先从内存，fallback 到 JSON 文件
-    posts = task.get("result", {}).get("posts") or []
+    posts = (task.get("result") or {}).get("posts") or []
     if not posts:
         posts = _load_posts_from_json(task)
 
@@ -149,7 +149,7 @@ async def get_post_detail(task_id: str, post_index: int):
 async def get_stats(task_id: str):
     """获取统计信息"""
     task = _get_task_or_404(task_id)
-    posts = task.get("result", {}).get("posts") or []
+    posts = (task.get("result") or {}).get("posts") or []
     if not posts:
         posts = _load_posts_from_json(task)
 
@@ -195,7 +195,7 @@ async def download_excel(task_id: str):
 async def export_csv(task_id: str):
     """导出帖子数据为 CSV"""
     task = _get_task_or_404(task_id)
-    posts = task.get("result", {}).get("posts") or []
+    posts = (task.get("result") or {}).get("posts") or []
     if not posts:
         posts = _load_posts_from_json(task)
     if not posts:
@@ -227,7 +227,7 @@ async def export_csv(task_id: str):
 async def export_json(task_id: str):
     """导出帖子数据为 JSON"""
     task = _get_task_or_404(task_id)
-    posts = task.get("result", {}).get("posts") or []
+    posts = (task.get("result") or {}).get("posts") or []
     if not posts:
         posts = _load_posts_from_json(task)
     if not posts:
@@ -327,6 +327,9 @@ async def trigger_sentiment_analysis(task_id: str):
 @router.get("/sentiment")
 async def get_sentiment_result(task_id: str):
     """获取舆情分析结果（优先 SQLite，含跨任务 fallback）"""
+    # 校验任务存在：task_id 会被拼进文件路径，未校验则可构造穿越路径读取任意文件
+    _get_task_or_404(task_id)
+
     # 优先从 SQLite 获取
     from app.services.storage import get_sentiment
     result = get_sentiment(task_id)
@@ -356,6 +359,9 @@ async def get_sentiment_result(task_id: str):
 @router.get("/sentiment/download")
 async def download_sentiment_excel(task_id: str):
     """下载舆情分析 Excel 报告"""
+    # 同 get_sentiment_result：task_id 参与拼路径，必须先校验其为真实任务
+    _get_task_or_404(task_id)
+
     sentiment_path = os.path.join(settings.data_dir, f"sentiment_{task_id}.json")
     if not os.path.exists(sentiment_path):
         raise HTTPException(status_code=404, detail="舆情分析结果不存在，请先触发分析")

@@ -164,16 +164,45 @@ class TestBuildSummaryEndToEnd:
         assert s["top_dimensions"][0][0] == "价格/性价比"
         assert s["top_dimensions"][0][1] == 2
 
-    def test_null_items_treated_as_neutral(self):
+    def test_null_items_are_not_counted_as_neutral(self):
         from app.services.sentiment_service import SentimentService
         results = [None, {"sentiment": "positive", "intensity": 2, "reason_cn": "", "dimensions": []}]
         s = SentimentService._build_summary(results)
-        assert s["sentiment_distribution"]["neutral"] == 1
+        assert s["sentiment_distribution"]["neutral"] == 0
+        assert s["not_analyzed"] == 1
+        assert s["analyzed"] == 1
+        # 分母是实际分析成功的条数，未分析的不该稀释占比
+        assert s["sentiment_percentages"]["positive"] == 100.0
+
+    def test_parse_failure_placeholder_is_not_counted_as_neutral(self):
+        from app.services.sentiment_service import SentimentService
+        # LLM 解析失败时写入的兜底条目，不能冒充成一条真实的中性评价
+        results = [
+            {"sentiment": None, "intensity": 0, "reason_cn": "解析失败", "dimensions": []},
+            {"sentiment": "negative", "intensity": 4, "reason_cn": "", "dimensions": []},
+        ]
+        s = SentimentService._build_summary(results)
+        assert s["sentiment_distribution"]["neutral"] == 0
+        assert s["not_analyzed"] == 1
+        assert s["sentiment_percentages"]["negative"] == 100.0
+        # 失败条目的 intensity 不该拉低均值
+        assert s["avg_intensity"] == 4
+
+    def test_unknown_sentiment_value_goes_to_not_analyzed(self):
+        from app.services.sentiment_service import SentimentService
+        results = [
+            {"sentiment": "很正面", "intensity": 4, "reason_cn": "", "dimensions": []},
+            {"sentiment": "positive", "intensity": 4, "reason_cn": "", "dimensions": []},
+        ]
+        s = SentimentService._build_summary(results)
+        assert s["sentiment_distribution"] == {"positive": 1, "negative": 0, "neutral": 0}
+        assert s["not_analyzed"] == 1
 
     def test_empty_results(self):
         from app.services.sentiment_service import SentimentService
         s = SentimentService._build_summary([])
         assert s["avg_intensity"] == 0
+        assert s["sentiment_percentages"]["positive"] == 0
 
 
 class TestTimestampNormalizationEndToEnd:
@@ -609,3 +638,152 @@ class TestLoggingConfigEndToEnd:
         logger1 = get_logger("mod1")
         logger2 = get_logger("mod2")
         assert logger1 is logger2
+
+
+class TestTranslationNumberingStripEndToEnd:
+    """翻译结果的编号前缀剥离：不得吞掉正文里的真实数值"""
+
+    def test_leading_value_preserved(self):
+        from app.services.translator_service import _strip_numbering
+        assert _strip_numbering("5 kWh 就够了") == "5 kWh 就够了"
+
+    def test_leading_year_preserved(self):
+        from app.services.translator_service import _strip_numbering
+        assert _strip_numbering("2026 年才会上市") == "2026 年才会上市"
+
+    def test_real_numbering_prefix_removed(self):
+        from app.services.translator_service import _strip_numbering
+        assert _strip_numbering("1. 这块电池不错") == "这块电池不错"
+        assert _strip_numbering("[2]. 这块电池不错") == "这块电池不错"
+        assert _strip_numbering("3) 这块电池不错") == "这块电池不错"
+        assert _strip_numbering("4、这块电池不错") == "这块电池不错"
+
+
+class TestIncrementalMergeOrderEndToEnd:
+    """增量翻译合并：顺序必须与源 JSON 一致"""
+
+    def _post(self, fp, translated=False):
+        p = {"fingerprint": fp, "username": "u", "content": f"c{fp}", "page_number": 1}
+        if translated:
+            p["translation"] = f"t{fp}"
+            p["_processed"] = {"translated": True}
+        return p
+
+    def test_merge_keeps_source_order(self):
+        from app.services.orchestrator import _merge_by_fingerprint
+        # 源顺序 a,b,c,d，其中 b、d 已翻译，a、c 本轮才翻译
+        source = [self._post("a"), self._post("b", True), self._post("c"), self._post("d", True)]
+        pending = [source[0], source[2]]
+        for p in pending:
+            p["translation"] = f"new-{p['fingerprint']}"
+
+        merged = _merge_by_fingerprint(source, pending)
+        assert [p["fingerprint"] for p in merged] == ["a", "b", "c", "d"]
+        assert merged[0]["translation"] == "new-a"
+        assert merged[1]["translation"] == "tb"
+
+    def test_posts_without_fingerprint_survive(self):
+        from app.services.orchestrator import _merge_by_fingerprint
+        source = [{"content": "无指纹"}, self._post("z")]
+        merged = _merge_by_fingerprint(source, [{"content": "无指纹", "translation": "x"}])
+        assert len(merged) == 2
+        assert merged[1]["fingerprint"] == "z"
+
+
+class TestProcessedFlagSyncEndToEnd:
+    """舆情分析写回 _processed：必须合并，不能覆盖掉 translated 标记"""
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.json_path = os.path.join(self.tmpdir, "tweakers_thread_123.json")
+        with open(self.json_path, "w", encoding="utf-8") as f:
+            json.dump({"posts": [
+                {"fingerprint": "aaa", "content": "c1", "translation": "t1",
+                 "_processed": {"translated": True}},
+                {"fingerprint": "bbb", "content": "c2", "translation": "t2",
+                 "_processed": {"translated": True}},
+            ]}, f, ensure_ascii=False)
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_sentiment_flag_does_not_wipe_translated(self):
+        from app.services.sentiment_service import _sync_processed_flags
+
+        analyzed = [{"fingerprint": "aaa", "_processed": {"sentiment_at": "2026-07-30T12:00:00"}}]
+        assert _sync_processed_flags(self.json_path, analyzed) == 1
+
+        with open(self.json_path, encoding="utf-8") as f:
+            posts = json.load(f)["posts"]
+        assert posts[0]["_processed"]["translated"] is True, "translated 标记被舆情写回抹掉了"
+        assert posts[0]["_processed"]["sentiment_at"] == "2026-07-30T12:00:00"
+        assert posts[1]["_processed"] == {"translated": True}
+
+    def test_no_match_leaves_file_untouched(self):
+        from app.services.sentiment_service import _sync_processed_flags
+        before = open(self.json_path, encoding="utf-8").read()
+        assert _sync_processed_flags(self.json_path, [{"fingerprint": "zzz", "_processed": {}}]) == 0
+        assert open(self.json_path, encoding="utf-8").read() == before
+
+
+class TestExcelRobustnessEndToEnd:
+    """Excel 渲染对脏数据的容忍度"""
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+        import app.services.excel_service as excel_mod
+        excel_mod.settings.exports_dir = self.tmpdir
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_star_level_normalizes_dirty_intensity(self):
+        from app.services.excel_service import _star_level
+        assert _star_level("很强") == 0
+        assert _star_level(None) == 0
+        assert _star_level(-3) == 0
+        assert _star_level(99) == 5
+        assert _star_level(3.4) == 3
+
+    def test_sentiment_excel_survives_dirty_intensity(self):
+        from app.services.excel_service import ExcelService
+        sentiment_data = {
+            "task_id": "dirty", "analyzed_at": "2026-07-30T10:00:00",
+            "total": 3, "success": 3, "failed": 0,
+            "summary": {
+                "sentiment_distribution": {"positive": 3, "negative": 0, "neutral": 0},
+                "sentiment_percentages": {"positive": 100.0, "negative": 0, "neutral": 0},
+                "avg_intensity": 0, "top_dimensions": [],
+            },
+            "results": [
+                {"sentiment": "positive", "intensity": "高", "reason_cn": "", "dimensions": []},
+                {"sentiment": "positive", "intensity": None, "reason_cn": "", "dimensions": []},
+                {"sentiment": "positive", "intensity": 12, "reason_cn": "", "dimensions": []},
+            ],
+        }
+        result = ExcelService.generate_sentiment_report("dirty", sentiment_data, self.tmpdir)
+        from openpyxl import load_workbook
+        ws = load_workbook(result["file_path"])["帖子情感详情"]
+        assert ws.cell(2, 3).value.startswith("☆☆☆☆☆")
+        assert ws.cell(4, 3).value.startswith("★★★★★")
+
+    def test_time_range_uses_extremes_not_first_last(self):
+        from app.services.excel_service import ExcelService
+        from app.services.progress_manager import ProgressManager
+        import asyncio
+
+        # 乱序 + 跨年，字典序会把 "05-01-2027" 排在 "22-05-2026" 前面
+        posts = [
+            {"username": "u", "timestamp": "22-05-2026 17:06", "content": "c", "translation": "t", "page_number": 1},
+            {"username": "u", "timestamp": "05-01-2027 09:00", "content": "c", "translation": "t", "page_number": 1},
+            {"username": "u", "timestamp": "03-03-2026 08:00", "content": "c", "translation": "t", "page_number": 1},
+        ]
+        pm = ProgressManager()
+        result = asyncio.get_event_loop().run_until_complete(
+            ExcelService.execute("time-range", posts, {"include_stats": True}, pm)
+        )
+        from openpyxl import load_workbook
+        ws = load_workbook(result["file_path"])["统计信息"]
+        rows = {ws.cell(r, 1).value: ws.cell(r, 2).value for r in range(2, 7)}
+        assert rows["时间范围开始"] == "03-03-2026 08:00"
+        assert rows["时间范围结束"] == "05-01-2027 09:00"

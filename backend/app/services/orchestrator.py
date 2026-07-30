@@ -275,12 +275,7 @@ class TaskOrchestrator:
                             )
                             for p in result.get("posts", []):
                                 p.setdefault("_processed", {})["translated"] = True
-                            # 合并并恢复原始顺序：用已翻译帖子的指纹定位
-                            fp_to_post = {p.get("fingerprint"): p for p in already}
-                            for p in result.get("posts", []):
-                                fp_to_post[p.get("fingerprint")] = p
-                            all_ordered = [fp_to_post.get(p.get("fingerprint"), p) for p in (already + pending)]
-                            context["posts"] = all_ordered
+                            context["posts"] = _merge_by_fingerprint(posts, result.get("posts", []))
                         else:
                             context["posts"] = already
                             await self._task_log(task_id, "info", "所有帖子已翻译，跳过")
@@ -480,6 +475,16 @@ class TaskOrchestrator:
 
 # 全局单例
 orchestrator = TaskOrchestrator()
+
+
+def _merge_by_fingerprint(source_posts: list, translated: list) -> list:
+    """把翻译结果按指纹合回源列表。
+
+    顺序必须以源 JSON 为准：合并结果会被写回源文件，一旦按「已翻译+待翻译」的
+    分区序落盘，原始楼层顺序就再也还原不回来了。
+    """
+    fp_to_post = {p.get("fingerprint"): p for p in translated if p.get("fingerprint")}
+    return [fp_to_post.get(p.get("fingerprint"), p) for p in source_posts]
 
 
 def _extract_thread_id(task: dict) -> int:

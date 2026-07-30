@@ -47,6 +47,14 @@ TRANSLATION_SYSTEM_PROMPT = """你是一位精通荷兰语和中文的新能源�
 4. 输入是一段荷兰语文本，直接输出对应的中文翻译，不要添加任何解释或前缀"""
 
 
+def _strip_numbering(text: str) -> str:
+    """剥掉 LLM 可能带上的「1. 」「[2] 」「3) 」编号前缀。
+
+    必须带分隔符才算编号，否则会吞掉正文开头的真实数值（如「5 kWh 就够了」）。
+    """
+    return re.sub(r'^\[?\d+\]?[\.\)、]\s*', '', text)
+
+
 class TranslatorService:
     """使用 LLM 翻译帖子内容"""
 
@@ -125,10 +133,7 @@ class TranslatorService:
 
                     for j, idx in enumerate(batch_indices):
                         if j < len(batch_translations):
-                            trans = batch_translations[j].strip()
-                            # 去掉可能的编号前缀
-                            trans = re.sub(r'^\[?\d+\]?[\.\)、]\s*', '', trans)
-                            trans = re.sub(r'^\d+\s*', '', trans)
+                            trans = _strip_numbering(batch_translations[j].strip())
                             if trans:
                                 translations[idx] = trans
                                 success_count += 1

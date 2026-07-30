@@ -17,6 +17,31 @@ logger = logging.getLogger("hyxi.sentiment")
 
 BATCH_SIZE = 3  # 详细分析每次发送的帖子数
 
+
+def _sync_processed_flags(json_path: str, posts: list) -> int:
+    """把帖子的 _processed 标记按指纹合并回源 JSON。
+
+    必须是合并而非替换：舆情分析只带 sentiment_at，整体覆盖会抹掉 translated
+    标记，导致几百条已翻译的帖子下次重新走一遍付费翻译。
+    """
+    with open(json_path, "r", encoding="utf-8") as f:
+        jdata = json.load(f)
+    jposts = jdata.get("posts", [])
+    by_fp = {jp.get("fingerprint"): jp for jp in jposts if jp.get("fingerprint")}
+
+    updated = 0
+    for p in posts:
+        jp = by_fp.get(p.get("fingerprint"))
+        if jp is not None:
+            jp.setdefault("_processed", {}).update(p.get("_processed", {}))
+            updated += 1
+
+    if updated > 0:
+        jdata["posts"] = jposts
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(jdata, f, ensure_ascii=False, indent=2)
+    return updated
+
 SENTIMENT_SYSTEM_PROMPT = """你是一位精通荷兰语和中文的市场舆情分析专家。你的任务是分析荷兰语论坛帖子对产品 HYXi Halo 家用储能电池的情感倾向。
 
 请对每一条帖子输出以下 JSON：
@@ -128,8 +153,8 @@ class SentimentService:
                                 success_count += 1
                             else:
                                 results[orig_idx] = {
-                                    "sentiment": "neutral",
-                                    "intensity": 1,
+                                    "sentiment": None,
+                                    "intensity": 0,
                                     "reason_cn": "解析失败",
                                     "dimensions": [],
                                 }
@@ -146,8 +171,8 @@ class SentimentService:
                 except Exception as e:
                     for orig_idx, _p in batch:
                         results[orig_idx] = {
-                            "sentiment": "neutral",
-                            "intensity": 1,
+                            "sentiment": None,
+                            "intensity": 0,
                             "reason_cn": f"分析异常: {str(e)[:50]}",
                             "dimensions": [],
                         }
@@ -231,22 +256,7 @@ class SentimentService:
         # 保存帖子的 _processed 标记回 JSON（按指纹匹配，更新所有 JSON 文件）
         import glob as _g
         for jf in _g.glob(os.path.join(settings.project_root, "tweakers_thread_*.json")):
-            with open(jf, "r", encoding="utf-8") as f:
-                jdata = json.load(f)
-            jposts = jdata.get("posts", [])
-            updated = 0
-            for p in posts:
-                fp = p.get("fingerprint")
-                if fp:
-                    for jp in jposts:
-                        if jp.get("fingerprint") == fp:
-                            jp["_processed"] = p.get("_processed", {})
-                            updated += 1
-                            break
-            if updated > 0:
-                jdata["posts"] = jposts
-                with open(jf, "w", encoding="utf-8") as f:
-                    json.dump(jdata, f, ensure_ascii=False, indent=2)
+            _sync_processed_flags(jf, posts)
 
         await progress.emit(task_id, "log", {
             "level": "success",
@@ -276,6 +286,7 @@ class SentimentService:
     def _build_summary(results: list) -> dict:
         """构建汇总统计"""
         sentiments = {"positive": 0, "negative": 0, "neutral": 0}
+        not_analyzed = 0
         dimension_counter = {}
         intensity_sum = 0
         intensity_count = 0
@@ -283,10 +294,15 @@ class SentimentService:
 
         for r in results:
             if not r:
-                sentiments["neutral"] += 1
+                not_analyzed += 1
                 continue
-            s = r.get("sentiment", "neutral")
-            sentiments[s] = sentiments.get(s, 0) + 1
+            s = r.get("sentiment")
+            if s not in sentiments:
+                not_analyzed += 1
+                if s is not None:
+                    logger.warning("舆情分析返回了未知的 sentiment 值: %r", s)
+                continue
+            sentiments[s] += 1
 
             i = r.get("intensity", 1)
             if isinstance(i, (int, float)):
@@ -296,11 +312,14 @@ class SentimentService:
             for dim in r.get("dimensions", []):
                 dimension_counter[dim] = dimension_counter.get(dim, 0) + 1
 
-        total = len(results) or 1
+        analyzed = sum(sentiments.values())
+        denominator = analyzed or 1
         return {
             "sentiment_distribution": sentiments,
+            "analyzed": analyzed,
+            "not_analyzed": not_analyzed,
             "sentiment_percentages": {
-                k: round(v / total * 100, 1) for k, v in sentiments.items()
+                k: round(v / denominator * 100, 1) for k, v in sentiments.items()
             },
             "avg_intensity": round(intensity_sum / intensity_count, 2) if intensity_count > 0 else 0,
             "top_dimensions": sorted(dimension_counter.items(), key=lambda x: x[1], reverse=True)[:10],

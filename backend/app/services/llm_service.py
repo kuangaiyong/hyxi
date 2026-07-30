@@ -1,5 +1,6 @@
 """LLM API 客户端服务 — 支持 DeepSeek / OpenAI 兼容 API，含重试"""
 
+import re
 import json
 import asyncio
 import logging
@@ -13,6 +14,31 @@ logger = logging.getLogger("hyxi.llm")
 MAX_RETRIES = 3
 BASE_DELAY = 1.0  # 秒
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+_SECRET_RE = re.compile(r"(sk-[A-Za-z0-9_\-]{4,}|Bearer\s+\S+|org-[A-Za-z0-9_\-]+)", re.I)
+
+
+def _safe_error_detail(resp: httpx.Response, limit: int = 120) -> str:
+    """提取上游错误原因用于对外展示。
+
+    这段文字会进 task["error_message"] 并被持久化、被前端展示，而供应商的错误体
+    常带组织 ID、账号标识和配额明细，原样存下来等于把这些信息一起留在库里。
+    完整响应只记服务端日志。
+    """
+    logger.warning("上游 API 返回 %s: %s", resp.status_code, resp.text[:1000])
+    detail = ""
+    try:
+        body = resp.json()
+        err = body.get("error") if isinstance(body, dict) else None
+        if isinstance(err, dict):
+            detail = str(err.get("message") or err.get("type") or "")
+        elif isinstance(err, str):
+            detail = err
+    except Exception:
+        pass
+    if not detail:
+        return "上游未返回可解析的错误信息，详见服务端日志"
+    return _SECRET_RE.sub("***", detail)[:limit]
 
 
 async def _retry_with_backoff(
@@ -120,7 +146,7 @@ class LLMService:
         resp = await _retry_with_backoff(_call, label="意图解析")
 
         if resp.status_code != 200:
-            raise Exception(f"LLM API 返回错误: {resp.status_code} - {resp.text[:300]}")
+            raise Exception(f"LLM API 返回错误: {resp.status_code} - {_safe_error_detail(resp)}")
 
         data = resp.json()
         content = data["choices"][0]["message"]["content"]
@@ -149,7 +175,7 @@ class LLMService:
         resp = await _retry_with_backoff(_call, label="LLM chat")
 
         if resp.status_code != 200:
-            raise Exception(f"LLM API 错误: {resp.status_code} - {resp.text[:300]}")
+            raise Exception(f"LLM API 错误: {resp.status_code} - {_safe_error_detail(resp)}")
         data = resp.json()
         return data["choices"][0]["message"]["content"]
 
@@ -182,7 +208,7 @@ class LLMService:
         resp = await _retry_with_backoff(_call, max_retries=max_retries, label=label)
 
         if resp.status_code != 200:
-            raise Exception(f"LLM API 错误: {resp.status_code} - {resp.text[:300]}")
+            raise Exception(f"LLM API 错误: {resp.status_code} - {_safe_error_detail(resp)}")
         data = resp.json()
         return data["choices"][0]["message"]["content"]
 

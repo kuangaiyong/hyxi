@@ -108,13 +108,15 @@ class SchedulerService:
 
     def _load_configs(self) -> list:
         if os.path.exists(self._config_path):
-            with open(self._config_path, "r") as f:
+            with open(self._config_path, "r", encoding="utf-8") as f:
                 return json.load(f)
         return []
 
     def _save_configs(self, configs: list):
         os.makedirs(os.path.dirname(self._config_path), exist_ok=True)
-        with open(self._config_path, "w") as f:
+        # ensure_ascii=False 写的是中文描述，不显式指定编码则依赖系统 locale，
+        # 换到 GBK 环境会 UnicodeEncodeError 并摧毁整个定时任务配置文件
+        with open(self._config_path, "w", encoding="utf-8") as f:
             json.dump(configs, f, ensure_ascii=False, indent=2)
 
     def _add_job(self, cfg: dict):

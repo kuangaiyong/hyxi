@@ -14,7 +14,7 @@ router = APIRouter(prefix="/api/v1/config", tags=["配置"])
 def _load_config() -> Optional[dict]:
     """从文件加载配置"""
     if os.path.exists(settings.config_file):
-        with open(settings.config_file, "r") as f:
+        with open(settings.config_file, "r", encoding="utf-8") as f:
             return json.load(f)
     return None
 
@@ -22,7 +22,7 @@ def _load_config() -> Optional[dict]:
 def _save_config(config: dict) -> None:
     """保存配置到文件"""
     os.makedirs(os.path.dirname(settings.config_file), exist_ok=True)
-    with open(settings.config_file, "w") as f:
+    with open(settings.config_file, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
 

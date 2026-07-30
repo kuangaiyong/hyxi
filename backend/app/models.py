@@ -59,7 +59,8 @@ class PlanStep(BaseModel):
 
 class TaskCreate(BaseModel):
     """创建任务请求"""
-    description: str = Field(..., description="自然语言任务描述", min_length=1)
+    # 描述会随每条日志、每个步骤被 _persist() 全量 upsert 一遍，无上限时写放大随文本二次增长
+    description: str = Field(..., description="自然语言任务描述", min_length=1, max_length=2000)
 
     class Config:
         json_schema_extra = {

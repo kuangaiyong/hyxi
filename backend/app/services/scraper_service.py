@@ -13,6 +13,38 @@ logger = logging.getLogger("hyxi.scraper")
 # 子进程超时（秒）
 SUBPROCESS_TIMEOUT = getattr(settings, "task_timeout_minutes", 30) * 60
 
+# StreamReader 默认上限 64KiB，超长行会抛 LimitOverrunError 打断正常抓取
+STREAM_LIMIT = 4 * 1024 * 1024
+
+
+async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
+    """终止子进程及其后代。
+
+    Windows 上 terminate() 只杀 node 本身，Playwright 拉起的 Chromium 不在同一 job object
+    内，会变成孤儿进程一直驻留；必须按进程树清理。
+    """
+    if proc.returncode is not None:
+        return
+    try:
+        if os.name == "nt":
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill", "/PID", str(proc.pid), "/T", "/F",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await killer.wait()
+        else:
+            proc.terminate()
+        await asyncio.wait_for(proc.wait(), timeout=10)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
 
 class ScraperService:
     """调用 tweakers_scraper_playwright.js 抓取帖子"""
@@ -59,21 +91,20 @@ class ScraperService:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=settings.project_root,
+            limit=STREAM_LIMIT,
         )
 
-        try:
-            # 并发读取 stdout 和 stderr，避免管道死锁
-            async def read_stderr():
-                stderr_lines = []
-                try:
-                    async for line in proc.stderr:
-                        stderr_lines.append(line.decode("utf-8", errors="replace"))
-                except Exception:
-                    pass
-                return "".join(stderr_lines)
+        # 并发读取 stdout 和 stderr，避免管道死锁
+        async def read_stderr():
+            stderr_lines = []
+            try:
+                async for line in proc.stderr:
+                    stderr_lines.append(line.decode("utf-8", errors="replace"))
+            except Exception:
+                pass
+            return "".join(stderr_lines)
 
-            stderr_task = asyncio.create_task(read_stderr())
-
+        async def pump_stdout_and_wait():
             async for line in proc.stdout:
                 line_str = line.decode("utf-8", errors="replace").strip()
                 if not line_str:
@@ -102,20 +133,20 @@ class ScraperService:
                         "message": "抓取完成，正在保存数据...",
                     })
 
-            # 等待子进程结束（含超时控制）
+            await proc.wait()
+
+        stderr_task = asyncio.create_task(read_stderr())
+
+        try:
+            # 超时必须罩住「读流 + 等待」整体：目标站 stall 住连接时读流循环永远不结束，
+            # 只给 proc.wait() 设超时的话根本执行不到那一行，协程会永久占住并发槽
             try:
-                await asyncio.wait_for(proc.wait(), timeout=SUBPROCESS_TIMEOUT)
+                await asyncio.wait_for(pump_stdout_and_wait(), timeout=SUBPROCESS_TIMEOUT)
             except asyncio.TimeoutError:
                 logger.error("子进程超时 (%ds)，正在终止... task=%s", SUBPROCESS_TIMEOUT, task_id)
-                try:
-                    proc.terminate()
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=10)
-                    except asyncio.TimeoutError:
-                        proc.kill()
-                        await proc.wait()
-                except Exception:
-                    pass
+                stderr_task.cancel()
+                await asyncio.gather(stderr_task, return_exceptions=True)
+                await _kill_process_tree(proc)
                 raise Exception(f"抓取任务超时（超过 {settings.task_timeout_minutes} 分钟），已终止子进程")
 
             stderr_text = await stderr_task
@@ -147,27 +178,14 @@ class ScraperService:
         except asyncio.CancelledError:
             # 任务被取消时清理子进程
             logger.info("抓取任务被取消，正在终止子进程... task=%s", task_id)
-            try:
-                proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=10)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.wait()
-            except Exception:
-                pass
+            stderr_task.cancel()
+            await asyncio.gather(stderr_task, return_exceptions=True)
+            await _kill_process_tree(proc)
             raise
 
         except Exception:
             # 其他异常时也确保清理子进程
-            if proc.returncode is None:
-                try:
-                    proc.terminate()
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=10)
-                    except asyncio.TimeoutError:
-                        proc.kill()
-                        await proc.wait()
-                except Exception:
-                    pass
+            stderr_task.cancel()
+            await asyncio.gather(stderr_task, return_exceptions=True)
+            await _kill_process_tree(proc)
             raise

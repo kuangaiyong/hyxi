@@ -244,29 +244,6 @@ async def export_json(task_id: str):
 
 # ===== 舆情分析 =====
 
-def _find_sentiment_file(thread_id: int):
-    """查找已有的舆情分析文件，首选匹配当前帖子数量的"""
-    import glob as _glob
-    files = sorted(_glob.glob(os.path.join(settings.data_dir, "sentiment_*.json")),
-                   key=os.path.getmtime, reverse=True)
-    # 尝试匹配 result count 与当前 JSON 帖子数一致的文件
-    expected = 0
-    json_path = os.path.join(settings.project_root, f"tweakers_thread_{thread_id}.json")
-    if os.path.exists(json_path):
-        with open(json_path, "r") as f:
-            expected = len(json.load(f).get("posts", []))
-    for f in files:
-        try:
-            with open(f, "r") as fp:
-                d = json.load(fp)
-            if d.get("total") == expected and expected > 0:
-                return f
-        except Exception:
-            pass
-    # fallback: 返回最新文件
-    return files[0] if files else None
-
-
 @router.post("/sentiment")
 async def trigger_sentiment_analysis(task_id: str):
     """触发舆情分析（增量：自动跳过已分析的帖子）"""
@@ -297,14 +274,9 @@ async def trigger_sentiment_analysis(task_id: str):
             msg = f"所有有内容的帖子已完成舆情分析（{pending_empty} 条空内容帖子已跳过）"
         return {"message": msg, "task_id": task_id, "status": "completed"}
 
-    # 查找已有的舆情文件（在所有 sentiment 文件中找最新的）
+    # 只读本任务自己的舆情文件：猜来的文件会被当作 existing_results 合并后写回目标任务
     existing_results = {}
     sentiment_path = os.path.join(settings.data_dir, f"sentiment_{task_id}.json")
-    if not os.path.exists(sentiment_path):
-        alt = _find_sentiment_file(0)
-        if alt:
-            sentiment_path = alt
-
     if os.path.exists(sentiment_path):
         with open(sentiment_path, "r", encoding="utf-8") as f:
             existing_data = json.load(f)
@@ -326,7 +298,7 @@ async def trigger_sentiment_analysis(task_id: str):
 
 @router.get("/sentiment")
 async def get_sentiment_result(task_id: str):
-    """获取舆情分析结果（优先 SQLite，含跨任务 fallback）"""
+    """获取舆情分析结果（优先 SQLite，其次本任务的 JSON 文件）"""
     # 校验任务存在：task_id 会被拼进文件路径，未校验则可构造穿越路径读取任意文件
     _get_task_or_404(task_id)
 
@@ -345,12 +317,6 @@ async def get_sentiment_result(task_id: str):
     # 检查是否正在分析
     if orchestrator.is_sentiment_running(task_id):
         return {"status": "running", "message": "分析进行中..."}
-
-    # fallback：查找其他任务的舆情文件
-    alt_file = _find_sentiment_file(0)
-    if alt_file and os.path.exists(alt_file):
-        with open(alt_file, "r", encoding="utf-8") as f:
-            return json.load(f)
 
     # 返回 200 + not_found 状态
     return {"status": "not_found", "message": "舆情分析结果不存在，请先触发分析"}
@@ -382,6 +348,9 @@ async def download_sentiment_excel(task_id: str):
 @router.get("/sentiment/events")
 async def sentiment_events(task_id: str):
     """舆情分析 SSE 进度流"""
+    # 不校验的话任意 id 都能开一条长连接，无限占用订阅槽位
+    _get_task_or_404(task_id)
+
     from fastapi.responses import StreamingResponse
     from app.services.progress_manager import progress_manager
 

@@ -87,14 +87,22 @@ class SchedulerService:
         """启动调度器并加载持久化任务"""
         self.scheduler.start()
 
-        # 恢复自定义任务配置
-        configs = self._load_configs()
-        for cfg in configs:
-            if cfg.get("enabled", True):
+        # 恢复自定义任务配置。单条坏配置只跳过自己——否则一个畸形的 time
+        # 就能让整个调度器加载中断，服务再也起不来。
+        for cfg in self._load_configs():
+            if not cfg.get("enabled", True):
+                continue
+            try:
                 self._add_job(cfg)
+            except Exception as e:
+                logger.error("定时任务 %s 配置无效，已跳过: %s", cfg.get("id"), e)
 
     def shutdown(self):
-        self.scheduler.shutdown(wait=False)
+        try:
+            self.scheduler.shutdown(wait=False)
+        except Exception as e:
+            # start() 失败时调度器从未运行，shutdown 会抛 SchedulerNotRunningError
+            logger.warning("调度器关闭异常: %s", e)
 
     # ===== 任务配置持久化 =====
 
@@ -162,11 +170,13 @@ class SchedulerService:
             "enabled": True,
             "created_at": datetime.now().isoformat(),
         }
+        # 先建 job 再落盘：反过来的话，一条建不起 job 的脏配置会被持久化，
+        # 下次启动读回来又炸一次
+        self._add_job(cfg)
+
         configs = self._load_configs()
         configs.append(cfg)
         self._save_configs(configs)
-
-        self._add_job(cfg)
         return cfg
 
     def update(self, scheduled_id: str, updates: dict) -> Optional[dict]:
@@ -174,11 +184,15 @@ class SchedulerService:
         for cfg in configs:
             if cfg["id"] == scheduled_id:
                 cfg.update(updates)
-                self._save_configs(configs)
-                # 重新注册 job
-                self.scheduler.remove_job(scheduled_id)
+                # 重新注册 job。暂停中的任务本就没有 job，remove 会抛 JobLookupError
+                try:
+                    self.scheduler.remove_job(scheduled_id)
+                except Exception:
+                    pass
                 if cfg.get("enabled", True):
+                    # 与 create() 同理，建不起 job 就不落盘
                     self._add_job(cfg)
+                self._save_configs(configs)
                 return cfg
         return None
 

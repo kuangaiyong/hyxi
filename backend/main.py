@@ -1,6 +1,7 @@
 """FastAPI 应用入口"""
 
 import os
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,8 +19,11 @@ async def lifespan(app: FastAPI):
     os.makedirs(settings.data_dir, exist_ok=True)
     os.makedirs(settings.tasks_dir, exist_ok=True)
     os.makedirs(settings.exports_dir, exist_ok=True)
-    # 启动定时任务调度器
-    scheduler_service.start()
+    # 启动定时任务调度器：调度是附属能力，起不来也不该让整个 API 服务不可用
+    try:
+        scheduler_service.start()
+    except Exception:
+        logging.getLogger("hyxi.scheduler").exception("定时任务调度器启动失败，服务继续运行")
     yield
     # 关闭调度器
     scheduler_service.shutdown()

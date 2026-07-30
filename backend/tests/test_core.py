@@ -690,6 +690,89 @@ class TestIncrementalMergeOrderEndToEnd:
         assert merged[1]["fingerprint"] == "z"
 
 
+class TestSchedulerStartupResilienceEndToEnd:
+    """调度器启动：单条坏配置不得砖化整个服务"""
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+        import app.services.scheduler_service as sched_mod
+        self._orig_data_dir = sched_mod.settings.data_dir
+        sched_mod.settings.data_dir = self.tmpdir
+
+    def teardown_method(self):
+        import asyncio
+        import app.services.scheduler_service as sched_mod
+        sched_mod.settings.data_dir = self._orig_data_dir
+        # asyncio.run 结束时会把当前事件循环置空，其余用 get_event_loop 的测试会跟着挂
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_malformed_config_is_skipped_not_fatal(self):
+        import asyncio
+        import app.services.scheduler_service as sched_mod
+
+        svc = sched_mod.SchedulerService()
+        # 坏配置排在前面：修复前它会中断整个加载循环，后面的好配置永远注册不上
+        with open(svc._config_path, "w", encoding="utf-8") as f:
+            json.dump([
+                {"id": "bad", "description": "畸形时间", "interval": "daily",
+                 "time": "9", "enabled": True},
+                {"id": "good", "description": "正常配置", "interval": "hourly",
+                 "enabled": True},
+            ], f, ensure_ascii=False)
+
+        async def run():
+            svc.start()
+            try:
+                return svc.scheduler.get_job("bad"), svc.scheduler.get_job("good")
+            finally:
+                svc.shutdown()
+
+        bad, good = asyncio.run(run())
+        assert bad is None, "畸形配置被注册成了 job"
+        assert good is not None, "坏配置把后面的好配置一起带崩了"
+
+    def test_create_does_not_persist_unbuildable_config(self):
+        import asyncio
+        import app.services.scheduler_service as sched_mod
+
+        svc = sched_mod.SchedulerService()
+
+        async def run():
+            svc.start()
+            try:
+                svc.create("时间畸形", "daily", "9")
+            except Exception:
+                pass
+            finally:
+                svc.shutdown()
+
+        asyncio.run(run())
+        assert svc._load_configs() == [], "建不起 job 的脏配置被落盘了"
+
+    def test_update_does_not_persist_unbuildable_config(self):
+        import asyncio
+        import app.services.scheduler_service as sched_mod
+
+        svc = sched_mod.SchedulerService()
+        # 模拟旧版本遗留的脏数据：time 畸形，但 hourly 不读 time 所以 job 建得起来
+        with open(svc._config_path, "w", encoding="utf-8") as f:
+            json.dump([{"id": "legacy", "description": "遗留脏配置", "interval": "hourly",
+                        "time": "9", "enabled": True}], f, ensure_ascii=False)
+
+        async def run():
+            svc.start()
+            try:
+                svc.update("legacy", {"interval": "daily"})
+            except Exception:
+                pass
+            finally:
+                svc.shutdown()
+
+        asyncio.run(run())
+        assert svc._load_configs()[0]["interval"] == "hourly", "改不成的 interval 被落盘了"
+
+
 class TestProcessedFlagSyncEndToEnd:
     """舆情分析写回 _processed：必须合并，不能覆盖掉 translated 标记"""
 

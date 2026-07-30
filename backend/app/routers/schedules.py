@@ -7,17 +7,20 @@ from app.services.scheduler_service import scheduler_service, PRESETS
 
 router = APIRouter(prefix="/api/v1/schedules", tags=["定时任务"])
 
+# 畸形的 time 会让 CronTrigger 构造抛异常，进而在下次启动时中断整个调度器加载
+TIME_PATTERN = r"^([01]?\d|2[0-3]):[0-5]\d$"
+
 
 class ScheduleCreate(BaseModel):
     description: str = Field(..., description="任务描述", min_length=1)
     interval: str = Field(..., description="调度间隔: hourly/6h/12h/daily")
-    time: str = Field("09:00", description="daily 模式的时间，如 09:00")
+    time: str = Field("09:00", pattern=TIME_PATTERN, description="daily 模式的时间，如 09:00")
 
 
 class ScheduleUpdate(BaseModel):
     description: Optional[str] = None
     interval: Optional[str] = None
-    time: Optional[str] = None
+    time: Optional[str] = Field(None, pattern=TIME_PATTERN)
 
 
 @router.get("/presets")
@@ -51,6 +54,8 @@ async def get_schedule(schedule_id: str):
 @router.patch("/{schedule_id}")
 async def update_schedule(schedule_id: str, body: ScheduleUpdate):
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    if "interval" in updates and updates["interval"] not in PRESETS:
+        raise HTTPException(status_code=400, detail=f"无效的调度间隔: {updates['interval']}")
     result = scheduler_service.update(schedule_id, updates)
     if not result:
         raise HTTPException(status_code=404, detail="定时任务不存在")

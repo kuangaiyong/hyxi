@@ -136,6 +136,56 @@ class TestAPIEndpointsEndToEnd:
         resp = self.client.delete(f"/api/v1/schedules/{sched_id}")
         assert resp.status_code == 200
 
+    def _schedules_on_disk(self):
+        import app.config as cfg
+        path = os.path.join(cfg.settings.data_dir, "scheduled_tasks.json")
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_malformed_time_rejected_and_not_persisted(self):
+        before = len(self._schedules_on_disk())
+        for bad_time in ("9", "25:00", "09:70", "abc", ""):
+            resp = self.client.post("/api/v1/schedules", json={
+                "description": "畸形时间",
+                "interval": "daily",
+                "time": bad_time,
+            })
+            assert resp.status_code == 422, f"{bad_time!r} 被接受了"
+        # 脏配置不得落盘，否则下次启动加载时会砖化调度器
+        assert len(self._schedules_on_disk()) == before
+
+    def test_patch_rejects_unknown_interval(self):
+        resp = self.client.post("/api/v1/schedules", json={
+            "description": "待更新任务", "interval": "daily", "time": "09:00",
+        })
+        sched_id = resp.json()["id"]
+
+        resp = self.client.patch(f"/api/v1/schedules/{sched_id}", json={"interval": "weekly"})
+        assert resp.status_code == 400
+
+        resp = self.client.patch(f"/api/v1/schedules/{sched_id}", json={"time": "99:99"})
+        assert resp.status_code == 422
+
+        # 合法更新仍然可用
+        resp = self.client.patch(f"/api/v1/schedules/{sched_id}", json={"interval": "hourly"})
+        assert resp.status_code == 200
+        self.client.delete(f"/api/v1/schedules/{sched_id}")
+
+    def test_patch_paused_schedule_does_not_500(self):
+        resp = self.client.post("/api/v1/schedules", json={
+            "description": "暂停后再编辑", "interval": "daily", "time": "09:00",
+        })
+        sched_id = resp.json()["id"]
+        assert self.client.post(f"/api/v1/schedules/{sched_id}/toggle").json()["enabled"] is False
+
+        # 暂停中的任务没有注册 job，remove_job 会抛 JobLookupError
+        resp = self.client.patch(f"/api/v1/schedules/{sched_id}", json={"description": "改个描述"})
+        assert resp.status_code == 200
+        assert resp.json()["description"] == "改个描述"
+        self.client.delete(f"/api/v1/schedules/{sched_id}")
+
     def test_404_for_nonexistent_task(self):
         resp = self.client.get("/api/v1/tasks/nonexistent-id")
         assert resp.status_code == 404

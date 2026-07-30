@@ -2,11 +2,15 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useTaskStore } from '@/stores/task'
+import { useToast } from '@/composables/useToast'
+import { downloadFile } from '@/utils/download'
 
 const route = useRoute()
 const router = useRouter()
 const taskStore = useTaskStore()
+const toast = useToast()
 const taskId = computed(() => route.params.id as string)
+const downloading = ref('')
 
 const currentPage = ref(1)
 const pageSize = 50
@@ -42,6 +46,22 @@ function handleSearchClear() {
 function goToPage(p: number) {
   if (p < 1 || p > totalPages.value) return
   taskStore.fetchResults(searchText.value, p)
+}
+
+async function handleDownload(kind: 'excel' | 'csv' | 'json') {
+  const targets = {
+    excel: { url: taskStore.getDownloadUrl(), name: `任务结果_${taskId.value}.xlsx` },
+    csv: { url: `/api/v1/tasks/${taskId.value}/export/csv`, name: `任务结果_${taskId.value}.csv` },
+    json: { url: `/api/v1/tasks/${taskId.value}/export/json`, name: `任务结果_${taskId.value}.json` },
+  }
+  downloading.value = kind
+  try {
+    await downloadFile(targets[kind].url, targets[kind].name)
+  } catch (e: any) {
+    toast.error('下载失败: ' + (e?.message || '网络错误'))
+  } finally {
+    downloading.value = ''
+  }
 }
 
 function viewDetail(post: any) {
@@ -93,32 +113,39 @@ function getStatusText(): string {
           >
             📊 舆情分析
           </button>
-          <a
+          <button
             v-if="taskStore.isCompleted"
-            :href="taskStore.getDownloadUrl()"
             class="btn btn-success"
-            download
+            :disabled="!!downloading"
+            @click="handleDownload('excel')"
           >
-            📥 Excel
-          </a>
-          <a
+            {{ downloading === 'excel' ? '下载中...' : '📥 Excel' }}
+          </button>
+          <button
             v-if="taskStore.isCompleted"
-            :href="`/api/v1/tasks/${taskId}/export/csv`"
             class="btn btn-outline btn-sm"
-            download
+            :disabled="!!downloading"
+            @click="handleDownload('csv')"
           >
-            CSV
-          </a>
-          <a
+            {{ downloading === 'csv' ? '...' : 'CSV' }}
+          </button>
+          <button
             v-if="taskStore.isCompleted"
-            :href="`/api/v1/tasks/${taskId}/export/json`"
             class="btn btn-outline btn-sm"
-            download
+            :disabled="!!downloading"
+            @click="handleDownload('json')"
           >
-            JSON
-          </a>
+            {{ downloading === 'json' ? '...' : 'JSON' }}
+          </button>
         </div>
       </div>
+    </div>
+
+    <!-- 加载失败：帖子拿到了就不该再报错，否则 allSettled 保住的数据又被红卡盖掉 -->
+    <div v-if="taskStore.resultsError && !taskStore.posts.length" class="card text-center" style="padding: 32px;">
+      <div style="font-size: 40px; margin-bottom: 12px;">⚠️</div>
+      <p class="text-secondary mb-4">{{ taskStore.resultsError }}</p>
+      <button class="btn btn-primary" @click="taskStore.fetchResults(searchText, taskStore.currentPage)">重试</button>
     </div>
 
     <!-- 统计 -->
@@ -242,7 +269,7 @@ function getStatusText(): string {
     </div>
 
     <!-- 空状态 -->
-    <div v-if="!taskStore.posts.length && !taskStore.isCompleted" class="empty-state">
+    <div v-if="!taskStore.posts.length && !taskStore.resultsError && !taskStore.isCompleted" class="empty-state">
       <div class="icon">📭</div>
       <p>暂无结果数据，等待任务完成...</p>
     </div>

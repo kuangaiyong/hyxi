@@ -3,17 +3,22 @@ import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import * as sentimentApi from '@/api/sentiment'
 import * as resultsApi from '@/api/results'
+import { useToast } from '@/composables/useToast'
+import { downloadFile } from '@/utils/download'
 import type { SentimentData, PostWithSentiment } from '@/types/sentiment'
 import type { PostData } from '@/types/result'
 
 const route = useRoute()
 const router = useRouter()
+const toast = useToast()
 const taskId = computed(() => route.params.id as string)
 
 const data = ref<SentimentData | null>(null)
 const loading = ref(false)
 const analyzing = ref(false)
 const error = ref('')
+const crossTaskWarning = ref('')
+const downloading = ref(false)
 const eventSource = ref<EventSource | null>(null)
 const showDetail = ref(false)
 const detailPost = ref<PostWithSentiment | null>(null)
@@ -42,24 +47,26 @@ const allDimensions = computed(() => {
 })
 
 // 过滤后的结果
+// 注意不能用 { ...r, _idx } 打平：展开 null 得到的是 {_idx} 这种永远 truthy 的对象，
+// 分析失败的条目会伪装成正常结果，模板里的空值守卫全部失效。
 const filteredResults = computed(() => {
   if (!data.value?.results) return []
-  let results = data.value.results.map((r, i) => ({ ...r, _idx: i }))
+  let rows = data.value.results.map((result, _idx) => ({ result, _idx }))
 
   if (filterSentiment.value) {
-    results = results.filter(r => r?.sentiment === filterSentiment.value)
+    rows = rows.filter(x => x.result?.sentiment === filterSentiment.value)
   }
   if (filterDimension.value) {
-    results = results.filter(r => r?.dimensions?.includes(filterDimension.value))
+    rows = rows.filter(x => x.result?.dimensions?.includes(filterDimension.value))
   }
   if (filterKeyword.value) {
     const kw = filterKeyword.value.toLowerCase()
-    results = results.filter(r =>
-      r?.reason_cn?.toLowerCase().includes(kw) ||
-      r?.dimensions?.some(d => d.toLowerCase().includes(kw))
+    rows = rows.filter(x =>
+      x.result?.reason_cn?.toLowerCase().includes(kw) ||
+      x.result?.dimensions?.some(d => d.toLowerCase().includes(kw))
     )
   }
-  return results
+  return rows
 })
 
 function clearFilters() {
@@ -97,7 +104,52 @@ onMounted(() => {
 
 onUnmounted(() => {
   closeSSE()
+  stopPolling()
+  clearConnectTimer()
 })
+
+// 定时器句柄：组件卸载后再触发就会泄漏一条无人持有的 EventSource
+let connectTimer: number | null = null
+let pollTimer: number | null = null
+let sseRetries = 0
+
+function clearConnectTimer() {
+  if (connectTimer !== null) {
+    clearTimeout(connectTimer)
+    connectTimer = null
+  }
+}
+
+function stopPolling() {
+  if (pollTimer !== null) {
+    clearTimeout(pollTimer)
+    pollTimer = null
+  }
+}
+
+/** SSE 反复重连失败后的兜底：每 5 秒直接拉一次结果，直到分析结束 */
+function schedulePoll() {
+  stopPolling()
+  pollTimer = window.setTimeout(async () => {
+    pollTimer = null
+    let result: SentimentData | null = null
+    try {
+      result = await sentimentApi.getSentiment(taskId.value)
+    } catch {
+      /* 后端仍不可达，继续轮询 */
+    }
+    if (result?.task_id) {
+      applyData(result)
+      analyzing.value = false
+      await loadPosts()
+    } else if (!result || result.status === 'running') {
+      schedulePoll()
+    } else {
+      analyzing.value = false
+      error.value = '分析已结束但未取到结果，请重试'
+    }
+  }, 5000)
+}
 
 function closeSSE() {
   if (eventSource.value) {
@@ -108,6 +160,8 @@ function closeSSE() {
 
 function connectSSE() {
   closeSSE()
+  stopPolling()
+  sseRetries = 0
   const url = sentimentApi.getSentimentEventsUrl(taskId.value)
   const es = new EventSource(url)
   eventSource.value = es
@@ -133,8 +187,13 @@ function connectSSE() {
   })
 
   es.addEventListener('error', (e: MessageEvent) => {
-    const d = e.data ? JSON.parse(e.data) : { message: '连接中断' }
+    // 无 data 的是连接层错误，交给下面的 onerror 走重连/轮询；这里只处理后端主动推的错误
+    if (!e.data) return
+    const d = JSON.parse(e.data)
     progressLogs.value.push('⚠️ ' + (d.message || '发生错误'))
+    closeSSE()
+    analyzing.value = false
+    error.value = '分析失败: ' + (d.message || '未知错误')
   })
 
   es.addEventListener('sentiment_complete', (e: MessageEvent) => {
@@ -150,19 +209,42 @@ function connectSSE() {
   })
 
   es.onerror = () => {
-    // SSE 连接中断，回退到轮询
-    closeSSE()
+    // 不能在这里 close()：那会连 EventSource 自带的自动重连一起关掉，界面永久转圈
+    sseRetries++
+    if (sseRetries >= 3) {
+      closeSSE()
+      progressLogs.value.push('⚠️ 实时连接持续中断，改用轮询获取结果')
+      schedulePoll()
+    }
   }
 }
 
+/** 后端曾对查不到的任务回退返回最新一条舆情，索引与本任务帖子对不上，必须显式提示 */
+function applyData(result: SentimentData) {
+  data.value = result
+  crossTaskWarning.value = result.task_id === taskId.value
+    ? ''
+    : `当前展示的是任务 ${result.task_id} 的舆情结果，与本任务的帖子并不对应`
+}
+
 async function loadPosts() {
-  // 一次性加载所有帖子数据
+  // 趋势图和详情弹窗都按绝对下标取帖子，只拉第一页会让 index ≥ 200 的行全空
   try {
-    const result = await resultsApi.fetchPosts(taskId.value, 1, 200)
-    postsMap.value.clear()
-    for (const p of result.posts) {
-      postsMap.value.set(p.index - 1, p)  // index 是 1-based
+    const size = 200  // 后端 page_size 上限
+    const map = new Map<number, PostData>()
+    const first = await resultsApi.fetchPosts(taskId.value, 1, size)
+    for (const p of first.posts) {
+      map.set(p.index - 1, p)  // index 是 1-based
     }
+    // 页数由首个响应的 total 定死，避免网络循环依赖后端的翻页终止条件
+    const pages = Math.ceil(first.total / size)
+    for (let page = 2; page <= pages; page++) {
+      const result = await resultsApi.fetchPosts(taskId.value, page, size)
+      for (const p of result.posts) {
+        map.set(p.index - 1, p)
+      }
+    }
+    postsMap.value = map
   } catch (e) {
     // 非关键数据，静默失败
   }
@@ -172,7 +254,7 @@ async function loadResults() {
   try {
     const result = await sentimentApi.getSentiment(taskId.value)
     if (result.task_id) {
-      data.value = result
+      applyData(result)
       analyzing.value = false
       await loadPosts()
     } else if (result.status === 'running') {
@@ -207,7 +289,7 @@ async function checkStatus() {
       return
     }
     if (result.task_id) {
-      data.value = result
+      applyData(result)
       await loadPosts()
     } else {
       error.value = '尚未进行舆情分析'
@@ -236,11 +318,17 @@ async function startAnalysis() {
       if (match) pendingCount.value = parseInt(match[1])
     }
     if (result.status === 'started' || result.status === 'running') {
-      await new Promise(r => setTimeout(r, 500))
-      connectSSE()
+      clearConnectTimer()
+      connectTimer = window.setTimeout(() => {
+        connectTimer = null
+        connectSSE()
+      }, 500)
     } else if (result.status === 'completed') {
       // 所有帖子已完成分析，直接加载已有结果
       await loadResults()
+    } else {
+      analyzing.value = false
+      error.value = '分析未能启动: ' + (result.message || result.status || '未知状态')
     }
   } catch (e: any) {
     analyzing.value = false
@@ -324,12 +412,33 @@ const trendMax = computed(() => {
   return max
 })
 
-function sentimentLabel(s: string): string {
+function sentimentLabel(s: string | null | undefined): string {
+  if (!s) return '未分析'
   return { positive: '正面', negative: '负面', neutral: '中立' }[s] || s
 }
 
+function sentimentColor(s: string | null | undefined): string {
+  return (COLORS as Record<string, string>)[s || ''] || '#94A3B8'
+}
+
 function intensityStars(n: number): string {
-  return '★'.repeat(Math.round(n)) + '☆'.repeat(5 - Math.round(n))
+  // LLM 可能返回越界或非数值的 intensity，String.repeat 收到负数会直接抛 RangeError
+  const stars = Number.isFinite(n) ? Math.min(5, Math.max(0, Math.round(n))) : 0
+  return '★'.repeat(stars) + '☆'.repeat(5 - stars)
+}
+
+async function handleDownload() {
+  downloading.value = true
+  try {
+    await downloadFile(
+      sentimentApi.getSentimentDownloadUrl(taskId.value),
+      `舆情分析报告_${taskId.value}.xlsx`
+    )
+  } catch (e: any) {
+    toast.error('下载舆情报告失败: ' + (e?.message || '网络错误'))
+  } finally {
+    downloading.value = false
+  }
 }
 
 function viewPost(idx: number) {
@@ -351,14 +460,14 @@ function viewPost(idx: number) {
     <div class="flex items-center justify-between mb-4">
       <h2 style="font-size: 18px; font-weight: 600;">📊 舆情分析</h2>
       <div class="flex gap-2">
-        <a
+        <button
           v-if="data"
-          :href="sentimentApi.getSentimentDownloadUrl(taskId)"
           class="btn btn-success btn-sm"
-          download
+          :disabled="downloading"
+          @click="handleDownload"
         >
-          📥 下载舆情报告
-        </a>
+          {{ downloading ? '下载中...' : '📥 下载舆情报告' }}
+        </button>
         <button class="btn btn-outline btn-sm" @click="router.push(`/tasks/${taskId}/results`)">
           ← 返回结果
         </button>
@@ -419,6 +528,14 @@ function viewPost(idx: number) {
 
     <!-- 分析结果 -->
     <template v-else-if="data">
+      <div
+        v-if="crossTaskWarning"
+        class="card"
+        style="border-left: 4px solid var(--warning, #F59E0B); margin-bottom: 16px;"
+      >
+        ⚠️ {{ crossTaskWarning }}
+      </div>
+
       <!-- 概览卡片 -->
       <div class="stats-grid">
         <div class="stat-card">
@@ -598,10 +715,10 @@ function viewPost(idx: number) {
               <td colspan="6" class="text-center text-secondary" style="padding: 32px;">无匹配结果</td>
             </tr>
             <tr
-              v-for="r in filteredResults"
-              :key="r._idx"
+              v-for="row in filteredResults"
+              :key="row._idx"
             >
-              <td style="text-align: center; font-size: 12px; color: var(--text-light);">{{ r._idx + 1 }}</td>
+              <td style="text-align: center; font-size: 12px; color: var(--text-light);">{{ row._idx + 1 }}</td>
               <td style="text-align: center;">
                 <span
                   :style="{
@@ -610,24 +727,24 @@ function viewPost(idx: number) {
                     borderRadius: '10px',
                     fontSize: '12px',
                     fontWeight: 600,
-                    background: r ? (COLORS as any)[r.sentiment] + '18' : '#F1F5F9',
-                    color: r ? (COLORS as any)[r.sentiment] : '#94A3B8',
+                    background: sentimentColor(row.result?.sentiment) + '18',
+                    color: sentimentColor(row.result?.sentiment),
                   }"
                 >
-                  {{ r ? sentimentLabel(r.sentiment) : '-' }}
+                  {{ sentimentLabel(row.result?.sentiment) }}
                 </span>
               </td>
               <td style="text-align: center;">
-                <span v-if="r" style="font-size: 13px; color: #F59E0B; letter-spacing: 1px;">{{ intensityStars(r.intensity) }}</span>
+                <span v-if="row.result?.sentiment" style="font-size: 13px; color: #F59E0B; letter-spacing: 1px;">{{ intensityStars(row.result.intensity) }}</span>
                 <span v-else class="text-secondary">-</span>
               </td>
               <td style="font-size: 13px; max-width: 360px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
-                {{ r?.reason_cn || '-' }}
+                {{ row.result?.reason_cn || '-' }}
               </td>
               <td>
-                <div v-if="r?.dimensions?.length" style="display: flex; gap: 3px; flex-wrap: wrap;">
+                <div v-if="row.result?.dimensions?.length" style="display: flex; gap: 3px; flex-wrap: wrap;">
                   <span
-                    v-for="d in r.dimensions"
+                    v-for="d in row.result.dimensions"
                     :key="d"
                     style="padding: 1px 6px; border-radius: 3px; font-size: 10px; white-space: nowrap;"
                     :style="{ background: (DIM_COLORS[d] || '#E2E8F0') + '28', color: DIM_COLORS[d] || '#64748B' }"
@@ -636,7 +753,7 @@ function viewPost(idx: number) {
                 <span v-else class="text-secondary" style="font-size: 11px;">-</span>
               </td>
               <td style="text-align: center;">
-                <button class="btn btn-outline btn-sm" @click="viewPost(r._idx)">查看</button>
+                <button class="btn btn-outline btn-sm" @click="viewPost(row._idx)">查看</button>
               </td>
             </tr>
           </tbody>
@@ -660,8 +777,8 @@ function viewPost(idx: number) {
               borderRadius: '16px',
               fontSize: '14px',
               fontWeight: 700,
-              background: (COLORS as any)[detailPost.sentiment.sentiment] + '18',
-              color: (COLORS as any)[detailPost.sentiment.sentiment],
+              background: sentimentColor(detailPost.sentiment.sentiment) + '18',
+              color: sentimentColor(detailPost.sentiment.sentiment),
             }"
           >{{ sentimentLabel(detailPost.sentiment.sentiment) }}</span>
           <span class="text-secondary">强度:</span>

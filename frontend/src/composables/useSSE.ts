@@ -91,7 +91,7 @@ export function useSSE(taskId: Ref<string | null>) {
       })
     })
 
-    es.addEventListener('task_complete', (e: MessageEvent) => {
+    es.addEventListener('task_complete', async (e: MessageEvent) => {
       const data = JSON.parse(e.data)
       if (data.status === 'completed') {
         taskStore.addTimelineEvent({
@@ -108,8 +108,11 @@ export function useSSE(taskId: Ref<string | null>) {
           level: 'error',
         })
       }
+      // currentTask 只有 fetchTask 会写，而 isCompleted / isFailed 全派生于它——
+      // 不在断开前刷新，进度页就会永远停在 running，跳转和「查看结果」都不出现
+      await taskStore.fetchTask(taskId.value!)
       // 刷新任务列表以更新侧边栏
-      taskStore.fetchTasks()
+      await taskStore.fetchTasks()
       disconnect()
     })
 

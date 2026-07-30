@@ -67,8 +67,10 @@ export const useConfigStore = defineStore('config', () => {
       modelName.value = result.model_name
       isConfigured.value = false
       testResult.value = null
+      return true
     } catch (e) {
       console.error('重置配置失败:', e)
+      return false
     }
   }
 

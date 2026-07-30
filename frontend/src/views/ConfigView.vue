@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { useConfigStore } from '@/stores/config'
+import { useToast } from '@/composables/useToast'
 
 const configStore = useConfigStore()
+const toast = useToast()
 const apiKey = ref('')
 const saveSuccess = ref(false)
 
@@ -15,6 +17,8 @@ async function handleSave() {
   if (ok) {
     saveSuccess.value = true
     setTimeout(() => { saveSuccess.value = false }, 3000)
+  } else {
+    toast.error('保存配置失败，请确认后端服务可用')
   }
 }
 
@@ -23,8 +27,13 @@ async function handleTest() {
 }
 
 async function handleReset() {
-  await configStore.resetConfig()
-  apiKey.value = ''
+  // 重置失败时不能清空输入框，否则界面显示「已重置」而服务端配置还在
+  const ok = await configStore.resetConfig()
+  if (ok) {
+    apiKey.value = ''
+  } else {
+    toast.error('重置配置失败，请确认后端服务可用')
+  }
 }
 </script>
 

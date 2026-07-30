@@ -6,6 +6,7 @@ import * as sentimentApi from '@/api/sentiment'
 const router = useRouter()
 const items = ref<any[]>([])
 const loading = ref(true)
+const loadError = ref('')
 
 // 过滤
 const filterTaskStatus = ref('')
@@ -23,6 +24,7 @@ onMounted(async () => {
 
 async function loadData() {
   loading.value = true
+  loadError.value = ''
   try {
     const { fetchTasks } = await import('@/api/tasks')
     const result = await fetchTasks()
@@ -60,7 +62,10 @@ async function loadData() {
       } catch { /* skip */ }
     }
     items.value = list
-  } catch { /* */ }
+  } catch (e: any) {
+    // 后端不可达时渲染「暂无分析记录」会把故障说成空数据，用户只会白等
+    loadError.value = '加载失败: ' + (e.response?.data?.detail || e.message || '网络错误')
+  }
   finally { loading.value = false }
 }
 
@@ -197,6 +202,13 @@ function statusLabel(s: string): string {
 
     <!-- 加载中 -->
     <div v-if="loading" class="card text-center" style="padding: 48px;"><span class="spinner spinner-lg"></span></div>
+
+    <!-- 加载失败 -->
+    <div v-else-if="loadError" class="card text-center" style="padding: 48px;">
+      <div style="font-size: 48px; margin-bottom: 12px;">⚠️</div>
+      <p class="text-secondary mb-4">{{ loadError }}</p>
+      <button class="btn btn-primary" @click="loadData">重试</button>
+    </div>
 
     <!-- 空状态 -->
     <div v-else-if="!items.length" class="card text-center" style="padding: 48px;">

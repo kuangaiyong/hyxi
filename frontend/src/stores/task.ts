@@ -20,6 +20,7 @@ export const useTaskStore = defineStore('task', () => {
   const currentPage = ref(1)
   const pageSize = ref(50)
   const stats = ref<TaskStats | null>(null)
+  const resultsError = ref('')
   const progressPct = ref(0)
   const progressMsg = ref('')
 
@@ -127,18 +128,34 @@ export const useTaskStore = defineStore('task', () => {
 
   async function fetchResults(search = '', page = 1) {
     if (!currentTaskId.value) return
-    try {
-      const [postsData, statsData] = await Promise.all([
-        resultApi.fetchPosts(currentTaskId.value, page, pageSize.value, search),
-        resultApi.fetchStats(currentTaskId.value),
-      ])
-      posts.value = postsData.posts
-      postsTotal.value = postsData.total
+    resultsError.value = ''
+    // allSettled 而非 all：/stats 失败不该把已经取到的帖子一起丢掉
+    const [postsRes, statsRes] = await Promise.allSettled([
+      resultApi.fetchPosts(currentTaskId.value, page, pageSize.value, search),
+      resultApi.fetchStats(currentTaskId.value),
+    ])
+    if (postsRes.status === 'fulfilled') {
+      posts.value = postsRes.value.posts
+      postsTotal.value = postsRes.value.total
       currentPage.value = page
-      stats.value = statsData
-    } catch (e) {
-      console.error('获取结果失败:', e)
+    } else {
+      posts.value = []
+      postsTotal.value = 0
+      resultsError.value = describeFetchError(postsRes.reason)
     }
+    if (statsRes.status === 'fulfilled') {
+      stats.value = statsRes.value
+    } else {
+      stats.value = null
+      if (!resultsError.value) resultsError.value = describeFetchError(statsRes.reason)
+    }
+  }
+
+  // 404 是「这个任务没有结果」的正常空态，交给空状态渲染；其余才是需要重试的故障
+  function describeFetchError(e: any): string {
+    if (e?.response?.status === 404) return ''
+    console.error('获取结果失败:', e)
+    return '加载失败: ' + (e?.response?.data?.detail || e?.message || '网络错误')
   }
 
   function getDownloadUrl(): string {
@@ -158,6 +175,7 @@ export const useTaskStore = defineStore('task', () => {
     currentPage,
     pageSize,
     stats,
+    resultsError,
     progressPct,
     progressMsg,
     currentTaskStatus,

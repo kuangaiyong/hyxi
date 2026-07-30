@@ -1,7 +1,9 @@
 import apiClient from './client'
 import type { SentimentData } from '@/types/sentiment'
 
-export async function triggerSentiment(taskId: string): Promise<{ message: string; status: string }> {
+export async function triggerSentiment(
+  taskId: string
+): Promise<{ message: string; status: string; pending_count?: number }> {
   const { data } = await apiClient.post(`/tasks/${taskId}/sentiment`)
   return data
 }

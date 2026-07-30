@@ -85,13 +85,14 @@ async function handleSubmit() {
     router.push('/config')
     return
   }
-  const task = await taskStore.submitTask(description.value)
-  if (task) {
+  try {
+    const task = await taskStore.submitTask(description.value)
     description.value = ''
     createExpanded.value = false
     router.push(`/tasks/${task.id}/progress`)
-  } else {
-    createError.value = '创建任务失败'
+  } catch (e: any) {
+    // submitTask 失败时是抛异常而非返回空，不接住的话只会留下一条 unhandled rejection
+    createError.value = '创建任务失败: ' + (e?.response?.data?.detail || e?.message || '网络错误')
   }
 }
 

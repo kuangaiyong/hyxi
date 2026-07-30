@@ -2,6 +2,7 @@
 
 import os
 import json
+from datetime import datetime
 from typing import Optional
 from collections import Counter
 from openpyxl import Workbook
@@ -24,6 +25,21 @@ THIN_BORDER = Border(
 CONTENT_ALIGN = Alignment(vertical="top", wrap_text=True)
 CENTER_ALIGN = Alignment(horizontal="center", vertical="top")
 ALT_FILL = PatternFill(start_color="F2F7FB", end_color="F2F7FB", fill_type="solid")
+
+
+def _star_level(value) -> int:
+    """LLM 可能把 intensity 返回成字符串、None 或越界数值，星级渲染只接受 0..5"""
+    if not isinstance(value, (int, float)) or value != value:
+        return 0
+    return round(max(0, min(5, value)))
+
+
+def _parse_dutch_timestamp(ts: str):
+    """帖子时间戳落盘格式为 dd-mm-yyyy HH:MM，字典序不等于时间序"""
+    try:
+        return datetime.strptime(ts, "%d-%m-%Y %H:%M")
+    except (ValueError, TypeError):
+        return None
 
 
 class ExcelService:
@@ -119,13 +135,15 @@ class ExcelService:
             unique_users = len(user_counter)
             pages = set(p.get("page_number", 1) for p in posts)
             timestamps = [p.get("timestamp", "") for p in posts if p.get("timestamp")]
+            dated = [(_parse_dutch_timestamp(t), t) for t in timestamps]
+            dated = [d for d in dated if d[0] is not None]
 
             stat_rows = [
                 ("总帖子数", len(posts)),
                 ("唯一用户数", unique_users),
                 ("总页数", len(pages)),
-                ("时间范围开始", timestamps[0] if timestamps else "N/A"),
-                ("时间范围结束", timestamps[-1] if timestamps else "N/A"),
+                ("时间范围开始", min(dated)[1] if dated else "N/A"),
+                ("时间范围结束", max(dated)[1] if dated else "N/A"),
             ]
             for i, (label, value) in enumerate(stat_rows):
                 ws2.cell(row=i + 2, column=1, value=label).border = THIN_BORDER
@@ -299,12 +317,13 @@ class ExcelService:
                     ws2.cell(row=row, column=c).alignment = CONTENT_ALIGN
                 continue
 
-            sentiment_cn = sentiment_labels.get(r.get("sentiment", ""), r.get("sentiment", ""))
+            sentiment_cn = sentiment_labels.get(r.get("sentiment"), r.get("sentiment") or "(未分析)")
             intensity = r.get("intensity", 0)
             reason = r.get("reason_cn", "")
             dimensions = ", ".join(r.get("dimensions", []))
 
-            values = [idx + 1, sentiment_cn, f"{'★' * round(intensity)}{'☆' * (5 - round(intensity))} ({intensity})", reason, dimensions]
+            stars = _star_level(intensity)
+            values = [idx + 1, sentiment_cn, f"{'★' * stars}{'☆' * (5 - stars)} ({intensity})", reason, dimensions]
             for col, val in enumerate(values, 1):
                 cell = ws2.cell(row=row, column=col, value=val)
                 cell.border = THIN_BORDER

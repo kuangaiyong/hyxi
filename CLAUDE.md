@@ -15,6 +15,7 @@ HYXi 舆情分析平台 — 对荷兰 Tweakers.net 论坛的 HYXi Halo 家用储
 ```powershell
 py -3.12 -m venv backend\.venv
 .\backend\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt apscheduler sqlalchemy pytest
+npm ci
 cd frontend; npm install
 ```
 
@@ -44,7 +45,9 @@ cd frontend; npm run dev
 
 **PowerShell 路径注意**：PS 5.1 下调用相对路径的 exe 必须带 `.\` 前缀，写 `backend\.venv\Scripts\python.exe` 会报 `CommandNotFoundException`；且 `&&` 是语法错误，串联用 `;`。
 
-爬虫依赖装在项目根目录（根 `package.json` 只有 playwright）。脚本用 `channel: 'chrome'` 启动，**要求本机装有真实 Chrome**，Playwright 自带的 chromium 不满足。
+**爬虫依赖必须在项目根目录装**（上面那条 `npm ci`，根 `package.json` 只有 playwright）——漏掉它抓取步骤会以 `Cannot find module 'playwright'` 失败；`frontend/node_modules` 和 `%LOCALAPPDATA%\ms-playwright` 里的浏览器二进制都不顶用。`ScraperService` 启动子进程前会自检该依赖并直接提示执行 `npm ci`。脚本用 `channel: 'chrome'` 启动，**要求本机装有真实 Chrome**，Playwright 自带的 chromium 不满足。
+
+抓取节奏是刻意放慢的（见「反爬虫姿态」一节），首次全量抓超长帖建议把超时调大：`TWEAKERS_TASK_TIMEOUT_MINUTES=60`（默认 30 分钟约够 160 页）。日常 `--incremental` 不受影响。
 
 ## Python 语法约束
 
@@ -160,6 +163,8 @@ GET    /api/health                   健康检查
 LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐步执行：
 
 1. **scrape** → `node tweakers_scraper_playwright.js --thread=ID --start=N [--headless] [--incremental]`，orchestrator 默认注入 `incremental=True`
+   - `--start` 是**显示页码**（1-based），不是 URL 里那个页码；两者差一位，见下方「常见陷阱」
+   - **起始页不由 LLM 决定**：prompt 里已删掉 `start_page` 参数，`orchestrator._resolve_start_page()` 只认用户描述里的显式指令（`从第 N 页开始`、`start_page: N`），其余一律 1，LLM 若仍输出该参数会被忽略并打 warning 日志。这么设计是因为抓取循环只前进不回补，起始页给大了就是永久丢数据，而默认 1 能让「所有页面 / 全部 / 整个帖子」等所有措辞都自动落到正确值
 2. **translate** → LLM 批量翻译（5 条/次），跳过 `_processed.translated == true` 且已有 `translation` 的帖子；完成后按 fingerprint 合并回原始顺序并写回根目录 JSON
 3. **generate_excel** → openpyxl 生成双语 Excel（sheet「论坛帖子翻译」+ 可选统计表）
 
@@ -171,7 +176,7 @@ translate 和 generate_excel 在 context 里没有 posts 时会**自动从 `twea
 
 ## 测试
 
-**56 个测试，必须全部 PASSED**（本机实测 `56 passed in 3.35s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**99 个测试，必须全部 PASSED**（本机实测 `99 passed in 9.68s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
@@ -211,12 +216,30 @@ cd frontend && npx vite build
 - **深色模式**：CSS 变量 + `[data-theme="dark"]`，首次跟随系统偏好，之后 localStorage 记忆
 - **响应式**：≤768px 侧边栏收缩为图标模式，≤480px 进一步精简
 
+## 反爬虫姿态
+
+目标是「让流量像一个诚实、有礼貌的真实浏览器用户」，**不是**「压着人家打还不被发现」。当前实现对目标站的压力严格低于改造前：请求速率降到约 1/4，并发保持 1，收到限流主动停止。
+
+- **身份自洽优先于伪装**：`resolveUserAgent()` 运行期从浏览器自己读 UA，只把 `HeadlessChrome` 换成 `Chrome`。不硬编码 UA —— Chrome 升级后硬编码的指纹会和客户端提示失配，那是定时炸弹。自相矛盾的指纹（UA 说 mac、`navigator.platform` 说 Windows）恰恰是最容易被判定的一类
+- **客户端提示和 accept-language 一律不手工覆盖**（实测结论，别再"优化"回去）：设了 `userAgent` 之后 Chrome 会自己把 `sec-ch-ua` 同步成不含 HeadlessChrome 的值，且与页面侧 `navigator.userAgentData.brands` 逐字一致；手写一份反而在 GREASE 品牌上对不上（`Not=A?Brand;v=24` vs 真实 `Not;A=Brand;v=8`）。`accept-language` 由 `locale` 决定：塞进 `extraHTTPHeaders` 会被 locale 覆盖，把 q 值列表塞进 `locale` 会产出畸形的 `nl;q=0.9;q=0.9` 并污染 `navigator.languages`，去掉 `locale` 则 `navigator.language` 掉回 `zh-CN` 与请求头分家
+- **时区故意不设**：跟随宿主机 `Asia/Shanghai`。检测方比的是时区与出口 IP 的地理位置，从中国境内出网却报 `Europe/Amsterdam` 是更硬的矛盾。将来改从欧洲机器出网时要一并调整
+- **节奏**：翻页间隔随机 4-11s，页内 `humanRead()` 随机滚动，每 8~15 页休息 25~60s（日志里的 ☕）
+- **会话复用**：`.scraper_state.json`（已 gitignore，含会话 cookie）保存 cookie/localStorage，不必每轮重走 DPG 隐私 gate。用 `storageState` 而非 `launchPersistentContext` —— 后者的用户数据目录不能被两个进程同时占用，`max_concurrent_tasks > 1` 时会启动失败
+- **限流即停**：`gotoPage()` 遇 429/403/503 读 `Retry-After` 退让一次（无则 60s，上限 300s），仍失败即抛错终止。`handleConsent()` 里跳转 DPG 回调那一跳**也必须走 `gotoPage`** —— 被拒时正是那个请求返回 403，而它落地后的 URL 仍是正常的 `/forum/...`，只看 URL 发现不了
+- **明确不做**：代理池 / IP 轮换、验证码破解、提高并发或速度、无视 robots.txt、stealth 插件
+- **升级路径**：若仍被拦，先改有头模式（`headless=False`）观察实际拦截页面，而不是继续叠伪装
+
+> **当前状态（2026-07-31 实测）：本机出口 IP `43.110.141.12` 已被 Tweakers 防火墙整体封禁**，任何请求都会跳 DPG 隐私 gate 后拿到 403，页面原文是「De toegang tot Tweakers vanaf dit IP is geweigerd」，申诉邮箱 `gathering@tweakers.net`（需在邮件里附上该 IP）。这是 IP 级封禁，**不是**指纹或节奏问题 —— 继续调 UA / 延时没有任何意义，换 IP 也在「明确不做」之列。抓取链路本身已验证可用（403 会被正确识别并让任务失败），恢复抓取需要先解封或换一台出网机器。
+
+
+
 ## 常见陷阱
 
 - **`result` 为 None 时 `.get()` 崩溃（现存 bug，已实测复现）**：`task.get("result", {}).get("posts")` 在 `result` 键存在但值为 `None` 时返回 `None` 而非 `{}`。`create_task()` 明确写入 `"result": None`，所以**任何未成功完成的任务**访问这几个端点都会 500 + `AttributeError`：`results.py:91`（/posts）、`152`（/stats）、`198`（/export/csv）、`230`（/export/json）。正确写法是同文件 `129-130` / `180-181` 用的 `(task.get("result") or {}).get(...)`
 - **`_persist()` 永远不会删行**：`_save_tasks()` 在 SQLite 分支只对 `self.tasks` 里**剩余**的任务逐条 upsert，从不发 DELETE。所以任何"从 `self.tasks` 移除条目"的新逻辑都必须自己显式调 `db_delete_task()`，否则残留行会在下次启动被 `_load_tasks()` 读回来（`delete_task()` 曾因此让删除的任务重启后复活，已修）。JSON 回退分支是全量覆写，无此问题
 - **`storage.DB_PATH` 是 import 时算好的常量**：测试里只改 `settings.data_dir` **不会**改变 DB 位置，必须一并重定向 `storage.DB_PATH`，否则测试会写进真实的 `backend/data/hyxi.db`。`tests/test_core.py` 的 `_create_orchestrator()` 已这么做；`tests/test_api.py` 则是靠在 import 前改 `data_dir` 生效 —— 新增测试文件时注意这个先后顺序
-- **爬虫脚本失败也返回 exit 0**：`main()` 内部 `try/catch` 吞掉异常后照样写文件，所以 `ScraperService` 里的 `proc.returncode != 0` 检查基本不会触发；判断抓取是否真的成功要看输出 JSON 的内容
+- **爬虫退出码是契约**：`0` 完整 / `1` 硬失败（无可用数据）/ `2` 部分完成（数据已落盘，可 `--incremental` 续抓）。残缺时 `total_pages` 保留站点声明的真值**不再被截断点覆盖**，输出 JSON 带 `complete: false` + `stop_reason`，原因同时写 stderr 并被 `ScraperService` 拼进任务的 `error_message`。退出码非 0 一律让抓取步骤失败——残缺数据继续跑翻译→Excel→舆情，产出的是一份看起来完整、实际有偏的报告，比任务失败糟得多；续抓走 `POST /api/v1/tasks/{id}/retry`
+- **「第一页零帖子」也算硬失败**：全量抓取时第一页一条都提不出来（且没有历史数据可依），脚本直接抛错而不是写一份 `complete: true` 的空结果。这不是假想场景 —— IP 被封时页面返回 200 外壳、DOM 里没有任何 `.message`，改造前正是靠这条路径写出「0 条帖子、抓取成功」，下游照常翻译 0 条并导出空 Excel。站点改类名导致提取器失效时也是同一条路径
 - **爬虫 URL 页码有偏移**：`/list_messages/{id}/0` 是第 1 页，`/1` 是第 2 页（`displayToUrl` / `urlToDisplay`）
 - **增量抓取从 `maxPage + 1` 开始**：已抓过的最后一页后来新增的回帖会被永久漏掉，fingerprint 去重救不了（那一页不会再访问）。要补全就去掉 `--incremental` 跑全量
 - **爬虫必须通过 `node` 子进程调用**，不能 import

@@ -238,6 +238,13 @@ class TaskOrchestrator:
                     if step.action == "scrape":
                         # 增量模式：默认开启
                         step.params.setdefault("incremental", True)
+                        ignored_start = _resolve_start_page(task, step.params)
+                        if ignored_start is not None:
+                            await self._task_log(
+                                task_id, "warning",
+                                f"忽略 LLM 给出的 start_page={ignored_start}，"
+                                f"改为从第 {step.params['start_page']} 页开始",
+                            )
                         result = await ScraperService.execute(
                             task_id, step.params, progress_manager
                         )
@@ -485,6 +492,27 @@ def _merge_by_fingerprint(source_posts: list, translated: list) -> list:
     """
     fp_to_post = {p.get("fingerprint"): p for p in translated if p.get("fingerprint")}
     return [fp_to_post.get(p.get("fingerprint"), p) for p in source_posts]
+
+
+def _resolve_start_page(task: dict, params: dict) -> Optional[int]:
+    """确定性派生抓取起始页，写回 params，并返回被忽略的 LLM 取值（无则 None）。
+
+    LLM 常把帖子 URL 末尾的页码误当成起始页，而抓取循环只前进不回补，前面几页会被
+    永久跳过。所以起始页只认用户描述里的显式指令，其余情况一律从第 1 页开始。
+    """
+    import re
+
+    ignored = params.get("start_page")
+    resolved = 1
+    desc = task.get("description", "")
+    for pattern in (r"从第\s*(\d+)\s*页\s*(?:开始|起)", r"start_page\s*[:=]\s*(\d+)"):
+        m = re.search(pattern, desc)
+        if m:
+            resolved = max(int(m.group(1)), 1)
+            break
+
+    params["start_page"] = resolved
+    return ignored if ignored is not None and ignored != resolved else None
 
 
 def _extract_thread_id(task: dict) -> int:

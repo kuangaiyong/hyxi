@@ -993,6 +993,14 @@ class TestUpstreamErrorRedactionEndToEnd:
 # 真实拉起 node 子进程，没有 node 就跳过而不是伪造
 _HAS_NODE = shutil.which("node") is not None
 
+
+def _fake_playwright_install(root: str) -> None:
+    """让 ScraperService 的依赖自检在 tmpdir 里通过（用假脚本的测试并不需要真 playwright）"""
+    pkg_dir = os.path.join(root, "node_modules", "playwright")
+    os.makedirs(pkg_dir, exist_ok=True)
+    with open(os.path.join(pkg_dir, "package.json"), "w", encoding="utf-8") as f:
+        f.write('{"name":"playwright","version":"0.0.0-test"}')
+
 STALL_SCRIPT = """
 const fs = require('fs');
 const path = require('path');
@@ -1016,6 +1024,7 @@ class TestScraperStallTimeoutEndToEnd:
         self.tmpdir = tempfile.mkdtemp()
         with open(os.path.join(self.tmpdir, "tweakers_scraper_playwright.js"), "w", encoding="utf-8") as f:
             f.write(STALL_SCRIPT)
+        _fake_playwright_install(self.tmpdir)
         import app.services.scraper_service as scraper_mod
         self.mod = scraper_mod
         self._old_root = scraper_mod.settings.project_root
@@ -1062,3 +1071,175 @@ class TestScraperStallTimeoutEndToEnd:
         before = os.path.getmtime(beat)
         time.sleep(2)
         assert os.path.getmtime(beat) == before, "子进程树没被清理干净，孙进程仍在运行"
+
+
+class TestStartPageResolutionEndToEnd:
+    """起始页由后端确定性派生 —— LLM 把 URL 末尾页码当起始页会永久丢掉前面几页"""
+
+    def _resolve(self, description: str, params: dict):
+        from app.services.orchestrator import _resolve_start_page
+        ignored = _resolve_start_page({"description": description}, params)
+        return params.get("start_page"), ignored
+
+    def test_url_trailing_page_does_not_become_start_page(self):
+        # 用户原话回归锁：URL 末尾的 /4 是页码，且「所有页面」必须从第 1 页开始
+        start, ignored = self._resolve(
+            "抓取https://gathering.tweakers.net/forum/list_messages/2336074/4所有页面，翻译成中文",
+            {"thread_id": 2336074, "start_page": 4},
+        )
+        assert start == 1
+        assert ignored == 4, "被忽略的 LLM 取值必须回传给调用方打日志，静默纠正同样难排查"
+
+    def test_no_llm_value_resolves_to_first_page_silently(self):
+        start, ignored = self._resolve("抓取帖子 2336074 所有页面", {"thread_id": 2336074})
+        assert start == 1
+        assert ignored is None
+
+    def test_explicit_instruction_is_honored(self):
+        assert self._resolve("抓取帖子 2336074，从第 7 页开始", {})[0] == 7
+        assert self._resolve("抓取帖子 2336074，从第7页起", {})[0] == 7
+        assert self._resolve("scrape thread 2336074 start_page: 7", {})[0] == 7
+
+    def test_illegal_values_fall_back_to_first_page(self):
+        assert self._resolve("抓取帖子 2336074，从第 0 页开始", {"start_page": 0})[0] == 1
+        assert self._resolve("抓取帖子 2336074", {"start_page": -3})[0] == 1
+        assert self._resolve("抓取帖子 2336074", {"start_page": "第四页"})[0] == 1
+
+
+OK_SCRIPT = """
+const fs = require('fs');
+const path = require('path');
+console.log('第 1/1 页');
+fs.writeFileSync(
+  path.join(__dirname, 'tweakers_thread_123.json'),
+  JSON.stringify({ thread_id: 123, total_pages: 1, total_posts: 0, complete: true, stop_reason: null, posts: [] }),
+  'utf-8'
+);
+"""
+
+ARGV_SCRIPT = """
+const fs = require('fs');
+const path = require('path');
+fs.writeFileSync(
+  path.join(__dirname, 'tweakers_thread_123.json'),
+  JSON.stringify({ thread_id: 123, total_pages: 1, total_posts: 0, complete: true,
+                   stop_reason: null, posts: [], argv: process.argv.slice(2) }),
+  'utf-8'
+);
+"""
+
+PARTIAL_SCRIPT = """
+const fs = require('fs');
+const path = require('path');
+console.log('第 1/9 页');
+fs.writeFileSync(
+  path.join(__dirname, 'tweakers_thread_123.json'),
+  JSON.stringify({ thread_id: 123, total_pages: 9, total_posts: 1, complete: false,
+                   stop_reason: '目标站拒绝访问 (HTTP 429)，已主动停止抓取', posts: [] }),
+  'utf-8'
+);
+console.error('目标站拒绝访问 (HTTP 429)，已主动停止抓取');
+process.exitCode = 2;
+"""
+
+
+class _ScraperTmpRoot:
+    """把 project_root 指到 tmpdir，脚本内容由子类给出"""
+
+    script = OK_SCRIPT
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+        with open(os.path.join(self.tmpdir, "tweakers_scraper_playwright.js"), "w", encoding="utf-8") as f:
+            f.write(self.script)
+        import app.services.scraper_service as scraper_mod
+        self.mod = scraper_mod
+        self._old_root = scraper_mod.settings.project_root
+        scraper_mod.settings.project_root = self.tmpdir
+
+    def teardown_method(self):
+        self.mod.settings.project_root = self._old_root
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _execute(self, params=None):
+        import asyncio
+        from app.services.progress_manager import ProgressManager
+
+        async def run():
+            return await self.mod.ScraperService.execute(
+                "t", params or {"thread_id": 123}, ProgressManager()
+            )
+
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(run())
+        finally:
+            loop.close()
+
+
+class TestScraperDependencyGuardEndToEnd(_ScraperTmpRoot):
+    """根目录没装 Node 依赖时，用户该看到「怎么修」而不是 MODULE_NOT_FOUND 堆栈"""
+
+    def test_missing_playwright_reports_how_to_fix(self):
+        try:
+            self._execute()
+        except Exception as e:
+            assert "npm" in str(e), f"异常没告诉用户怎么修: {e}"
+        else:
+            assert False, "缺少 playwright 时没有报错"
+
+    def test_guard_passes_once_installed(self):
+        if not _HAS_NODE:
+            import pytest
+            pytest.skip("未安装 node")
+        _fake_playwright_install(self.tmpdir)
+        data = self._execute()
+        assert data["complete"] is True
+
+
+class TestScraperPartialExitEndToEnd(_ScraperTmpRoot):
+    """残缺结果必须让任务失败，且原因要能被用户读懂"""
+
+    script = PARTIAL_SCRIPT
+
+    def setup_method(self):
+        super().setup_method()
+        _fake_playwright_install(self.tmpdir)
+
+    def test_partial_exit_code_and_reason_reach_the_user(self):
+        if not _HAS_NODE:
+            import pytest
+            pytest.skip("未安装 node")
+        try:
+            self._execute()
+        except Exception as e:
+            message = str(e)
+        else:
+            message = ""
+        assert "code=2" in message, f"退出码 2 没有让抓取步骤失败: {message!r}"
+        assert "拒绝访问" in message, f"中断原因没带到用户面前: {message!r}"
+
+
+class TestStartPageReachesCommandLineEndToEnd(_ScraperTmpRoot):
+    """用户原话 → 真实子进程命令行：URL 末尾的页码不能变成 --start"""
+
+    script = ARGV_SCRIPT
+
+    def setup_method(self):
+        super().setup_method()
+        _fake_playwright_install(self.tmpdir)
+
+    def test_url_trailing_page_does_not_become_start_page(self):
+        if not _HAS_NODE:
+            import pytest
+            pytest.skip("未安装 node")
+        from app.services.orchestrator import _resolve_start_page
+
+        task = {"description": "抓取 https://gathering.tweakers.net/forum/list_messages/2336074/4"
+                               "所有页面，翻译成中文，导出Excel，分析舆情"}
+        params = {"thread_id": 123, "start_page": 4}  # LLM 把 URL 末尾的 4 当成了起始页
+        _resolve_start_page(task, params)
+
+        argv = self._execute(params)["argv"]
+        assert "--start=1" in argv, f"起始页没有落到第 1 页: {argv}"
+        assert "--start=4" not in argv, f"URL 页码被当成起始页传给了脚本: {argv}"

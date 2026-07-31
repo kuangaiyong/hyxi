@@ -106,7 +106,7 @@ class LLMService:
         """调用 LLM 解析用户意图，返回执行计划（含自动重试）"""
         system_prompt = """你是一个 Tweakers.net 论坛数据抓取工具的智能调度器。
 你可以执行以下操作：
-1. scrape - 抓取帖子（参数：thread_id 帖子ID, start_page 起始页默认1, headless 是否无头模式默认true）
+1. scrape - 抓取帖子（参数：thread_id 帖子ID, headless 是否无头模式默认true）
 2. translate - 翻译帖子内容（参数：source_lang 源语言默认nl, target_lang 目标语言默认zh-CN）
 3. generate_excel - 生成Excel报告（参数：include_stats 是否包含统计表默认true）
 
@@ -122,6 +122,9 @@ class LLMService:
 
 规则：
 - 从用户描述中提取帖子ID（数字），如果用户提到"帖子"、"thread"、"帖子ID"后面的数字
+- 帖子URL形如 https://gathering.tweakers.net/forum/list_messages/{帖子ID}/{页码}，
+  thread_id 只取第一段数字，末尾那段数字是页码不是帖子ID
+- scrape 不接受起始页参数，任何情况下都不要输出 start_page
 - 如果用户没有指定帖子ID，设置为0（后续提示用户补充）
 - 如果用户只要求翻译已有的JSON文件，不要包含 scrape 步骤
 - 如果用户只要求抓取不翻译，不要包含 translate 步骤

@@ -66,6 +66,13 @@ class ScraperService:
 
         script_path = os.path.join(settings.project_root, "tweakers_scraper_playwright.js")
 
+        # 依赖缺失在 Python 侧就拦下：这条异常会进 task["error_message"] 并在前端展示，
+        # 用户看到的是「怎么修」而不是一段 Node 的 MODULE_NOT_FOUND 堆栈
+        if not os.path.exists(
+            os.path.join(settings.project_root, "node_modules", "playwright", "package.json")
+        ):
+            raise ValueError("缺少 Node 依赖 playwright。请在项目根目录执行 npm ci 后重试。")
+
         cmd = [
             "node", script_path,
             f"--thread={thread_id}",
@@ -157,7 +164,10 @@ class ScraperService:
                 })
 
             if proc.returncode != 0:
-                raise Exception(f"抓取脚本异常退出 (code={proc.returncode})")
+                # 脚本用 stderr 说明中断原因（限流 / 重定向 / 页面异常），不带上就只剩一个退出码
+                lines = stderr_text.strip().splitlines()
+                detail = f": {lines[-1][:200]}" if lines else ""
+                raise Exception(f"抓取脚本异常退出 (code={proc.returncode}){detail}")
 
             # 读取输出 JSON
             output_file = os.path.join(settings.project_root, f"tweakers_thread_{thread_id}.json")

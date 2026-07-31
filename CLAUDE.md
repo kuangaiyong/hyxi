@@ -45,7 +45,7 @@ cd frontend; npm run dev
 
 **PowerShell 路径注意**：PS 5.1 下调用相对路径的 exe 必须带 `.\` 前缀，写 `backend\.venv\Scripts\python.exe` 会报 `CommandNotFoundException`；且 `&&` 是语法错误，串联用 `;`。
 
-**爬虫依赖必须在项目根目录装**（上面那条 `npm ci`，根 `package.json` 只有 playwright）——漏掉它抓取步骤会以 `Cannot find module 'playwright'` 失败；`frontend/node_modules` 和 `%LOCALAPPDATA%\ms-playwright` 里的浏览器二进制都不顶用。`ScraperService` 启动子进程前会自检该依赖并直接提示执行 `npm ci`。脚本用 `channel: 'chrome'` 启动，**要求本机装有真实 Chrome**，Playwright 自带的 chromium 不满足。
+**爬虫依赖必须在项目根目录装**（上面那条 `npm ci`，根 `package.json` 只有 playwright）——漏掉它抓取步骤会以 `Cannot find module 'playwright'` 失败；`frontend/node_modules` 和 `%LOCALAPPDATA%\ms-playwright` 里的浏览器二进制都不顶用。`CollectorRunner` 启动子进程前会自检该依赖并直接提示执行 `npm ci`。脚本用 `channel: 'chrome'` 启动，**要求本机装有真实 Chrome**，Playwright 自带的 chromium 不满足。
 
 抓取节奏是刻意放慢的（见「反爬虫姿态」一节），首次全量抓超长帖建议把超时调大：`TWEAKERS_TASK_TIMEOUT_MINUTES=60`（默认 30 分钟约够 160 页）。日常 `--incremental` 不受影响。
 
@@ -71,7 +71,8 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
     ├── app/services/orchestrator.py    任务编排引擎（核心，含等待队列，全局单例）
     ├── app/services/llm_service.py     LLM API 客户端（_retry_with_backoff 指数退避）
     ├── app/services/llm_utils.py       共享配置加载 (get_llm_service / load_llm_config)
-    ├── app/services/scraper_service.py 调用 Node Playwright 子进程（超时 + 取消清理）
+    ├── app/collectors/                 采集器声明（base + 每个来源一个纯声明类）
+    ├── app/services/collector_runner.py 驱动 Node 采集脚本（job.json + NDJSON，超时 + 取消清理）
     ├── app/services/translator_service.py LLM 翻译（5 条/批 + 失败条目单条重译）
     ├── app/services/sentiment_service.py  LLM 舆情分析（3 条/批，双写 JSON + SQLite）
     ├── app/services/excel_service.py   openpyxl 生成双语 Excel + 舆情报告
@@ -162,8 +163,11 @@ GET    /api/health                   健康检查
 
 LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐步执行：
 
-1. **scrape** → `node tweakers_scraper_playwright.js --thread=ID --start=N [--headless] [--incremental]`，orchestrator 默认注入 `incremental=True`
-   - `--start` 是**显示页码**（1-based），不是 URL 里那个页码；两者差一位，见下方「常见陷阱」
+1. **scrape** → `node collectors/tweakers.js --job=<path>`，orchestrator 默认注入 `incremental=True`
+   - **入参只有一个 job 文件**，argv 里没有站点参数。job 由 `Collector.build_job()` 生成，字段见 `app/collectors/tweakers.py`；`base_url` / `pacing` 只从 source 取不从 params 取，免得 LLM 能改抓取目标和请求节奏
+   - **进度靠脚本自报**：stdout 上的 NDJSON 行 `{"evt":"progress","current":N,"total":M}`，解析不出 JSON 的行原样当日志转发。不再有 `第 X/Y 页` 文本正则
+   - **输出位置由 job 指定**（`Collector.output_path()` 是全项目唯一的文件名来源）
+   - `start_page` 是**显示页码**（1-based），不是 URL 里那个页码；两者差一位，见下方「常见陷阱」
    - **起始页不由 LLM 决定**：prompt 里已删掉 `start_page` 参数，`orchestrator._resolve_start_page()` 只认用户描述里的显式指令（`从第 N 页开始`、`start_page: N`），其余一律 1，LLM 若仍输出该参数会被忽略并打 warning 日志。这么设计是因为抓取循环只前进不回补，起始页给大了就是永久丢数据，而默认 1 能让「所有页面 / 全部 / 整个帖子」等所有措辞都自动落到正确值
 2. **translate** → LLM 批量翻译（5 条/次），跳过 `_processed.translated == true` 且已有 `translation` 的帖子；完成后按 fingerprint 合并回原始顺序并写回根目录 JSON
 3. **generate_excel** → openpyxl 生成双语 Excel（sheet「论坛帖子翻译」+ 可选统计表）
@@ -238,10 +242,10 @@ cd frontend && npx vite build
 - **`result` 为 None 时 `.get()` 崩溃（现存 bug，已实测复现）**：`task.get("result", {}).get("posts")` 在 `result` 键存在但值为 `None` 时返回 `None` 而非 `{}`。`create_task()` 明确写入 `"result": None`，所以**任何未成功完成的任务**访问这几个端点都会 500 + `AttributeError`：`results.py:91`（/posts）、`152`（/stats）、`198`（/export/csv）、`230`（/export/json）。正确写法是同文件 `129-130` / `180-181` 用的 `(task.get("result") or {}).get(...)`
 - **`_persist()` 永远不会删行**：`_save_tasks()` 在 SQLite 分支只对 `self.tasks` 里**剩余**的任务逐条 upsert，从不发 DELETE。所以任何"从 `self.tasks` 移除条目"的新逻辑都必须自己显式调 `db_delete_task()`，否则残留行会在下次启动被 `_load_tasks()` 读回来（`delete_task()` 曾因此让删除的任务重启后复活，已修）。JSON 回退分支是全量覆写，无此问题
 - **`storage.DB_PATH` 是 import 时算好的常量**：测试里只改 `settings.data_dir` **不会**改变 DB 位置，必须一并重定向 `storage.DB_PATH`，否则测试会写进真实的 `backend/data/hyxi.db`。`tests/test_core.py` 的 `_create_orchestrator()` 已这么做；`tests/test_api.py` 则是靠在 import 前改 `data_dir` 生效 —— 新增测试文件时注意这个先后顺序
-- **爬虫退出码是契约**：`0` 完整 / `1` 硬失败（无可用数据）/ `2` 部分完成（数据已落盘，可 `--incremental` 续抓）。残缺时 `total_pages` 保留站点声明的真值**不再被截断点覆盖**，输出 JSON 带 `complete: false` + `stop_reason`，原因同时写 stderr 并被 `ScraperService` 拼进任务的 `error_message`。退出码非 0 一律让抓取步骤失败——残缺数据继续跑翻译→Excel→舆情，产出的是一份看起来完整、实际有偏的报告，比任务失败糟得多；续抓走 `POST /api/v1/tasks/{id}/retry`
+- **爬虫退出码是契约**：`0` 完整 / `1` 硬失败（无可用数据）/ `2` 部分完成（数据已落盘，可增量续抓）。残缺时 `total_pages` 保留站点声明的真值**不再被截断点覆盖**，输出 JSON 带 `complete: false` + `stop_reason`，原因同时写 stderr 并被 `CollectorRunner` 拼进任务的 `error_message`。退出码非 0 一律让抓取步骤失败——残缺数据继续跑翻译→Excel→舆情，产出的是一份看起来完整、实际有偏的报告，比任务失败糟得多；续抓走 `POST /api/v1/tasks/{id}/retry`
 - **「第一页零帖子」也算硬失败**：全量抓取时第一页一条都提不出来（且没有历史数据可依），脚本直接抛错而不是写一份 `complete: true` 的空结果。这不是假想场景 —— IP 被封时页面返回 200 外壳、DOM 里没有任何 `.message`，改造前正是靠这条路径写出「0 条帖子、抓取成功」，下游照常翻译 0 条并导出空 Excel。站点改类名导致提取器失效时也是同一条路径
 - **爬虫 URL 页码有偏移**：`/list_messages/{id}/0` 是第 1 页，`/1` 是第 2 页（`displayToUrl` / `urlToDisplay`）
-- **增量抓取从 `maxPage + 1` 开始**：已抓过的最后一页后来新增的回帖会被永久漏掉，fingerprint 去重救不了（那一页不会再访问）。要补全就去掉 `--incremental` 跑全量
+- **增量抓取从 `maxPage + 1` 开始**：已抓过的最后一页后来新增的回帖会被永久漏掉，fingerprint 去重救不了（那一页不会再访问）。要补全就把 job 里的 `incremental` 置 false 跑全量
 - **爬虫必须通过 `node` 子进程调用**，不能 import
 - **日志有两套命名空间**：`logging_config.get_logger()` 用全局 `_logger` 缓存，**第一个调用者的 name 定死了整个 logger**（实际是 orchestrator 的 `app.services.orchestrator`）；其余 service 用 `logging.getLogger("hyxi.xxx")`，拿不到那些 handler。加日志时注意实际输出去向
 - **Excel 列名 `chr(64 + col)` 仅支持 26 列以内**

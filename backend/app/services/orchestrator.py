@@ -10,8 +10,9 @@ from datetime import datetime
 from app.models import LLMConfig, TaskStatus, PlanStep
 from app.config import settings
 from app.logging_config import get_logger
+from app.collectors import get_collector
 from app.services.llm_service import LLMService
-from app.services.scraper_service import ScraperService
+from app.services.collector_runner import CollectorRunner
 from app.services.translator_service import TranslatorService
 from app.services.excel_service import ExcelService
 from app.services.progress_manager import progress_manager
@@ -245,10 +246,13 @@ class TaskOrchestrator:
                                 f"忽略 LLM 给出的 start_page={ignored_start}，"
                                 f"改为从第 {step.params['start_page']} 页开始",
                             )
-                        result = await ScraperService.execute(
-                            task_id, step.params, progress_manager
+                        collector = get_collector("tweakers")
+                        result = await CollectorRunner.execute(
+                            task_id, collector,
+                            {"id": collector.id, "params": step.params},
+                            progress_manager, idx,
                         )
-                        context["posts"] = result.get("posts", [])
+                        context["posts"] = collector.normalize(result)
                         context["thread_id"] = step.params.get("thread_id")
                         context["total_pages"] = result.get("total_pages", 0)
                         context["raw_json"] = result
@@ -258,7 +262,7 @@ class TaskOrchestrator:
                         # 如果没有 scrape 步骤，从已有 JSON 加载
                         if not posts:
                             thread_id = step.params.get("thread_id") or _extract_thread_id(task)
-                            json_path = os.path.join(settings.project_root, f"tweakers_thread_{thread_id}.json")
+                            json_path = _thread_json_path(thread_id)
                             if os.path.exists(json_path):
                                 await self._task_log(task_id, "info", f"从已有文件加载数据: {json_path}")
                                 with open(json_path, "r", encoding="utf-8") as f:
@@ -296,7 +300,7 @@ class TaskOrchestrator:
                         if not posts:
                             # 同样从已有 JSON 加载
                             thread_id = step.params.get("thread_id") or _extract_thread_id(task)
-                            json_path = os.path.join(settings.project_root, f"tweakers_thread_{thread_id}.json")
+                            json_path = _thread_json_path(thread_id)
                             if os.path.exists(json_path):
                                 with open(json_path, "r", encoding="utf-8") as f:
                                     loaded = json.load(f)
@@ -377,7 +381,7 @@ class TaskOrchestrator:
 
     def _save_translated_json(self, thread_id: int, posts: list):
         """保存带翻译的帖子数据到 JSON 文件"""
-        json_path = os.path.join(settings.project_root, f"tweakers_thread_{thread_id}.json")
+        json_path = _thread_json_path(thread_id)
         if os.path.exists(json_path):
             with open(json_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -482,6 +486,11 @@ class TaskOrchestrator:
 
 # 全局单例
 orchestrator = TaskOrchestrator()
+
+
+def _thread_json_path(thread_id) -> str:
+    """帖子数据的落盘位置。文件名只有采集器声明这一个来源，调用方不再自己拼。"""
+    return get_collector("tweakers").output_path({"params": {"thread_id": thread_id}})
 
 
 def _merge_by_fingerprint(source_posts: list, translated: list) -> list:

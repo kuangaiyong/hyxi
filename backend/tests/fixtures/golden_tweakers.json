@@ -1,0 +1,81 @@
+{
+  "note": "由重构前的 tweakers_scraper_playwright.js 对 fixtures/tweakers_site 抓出，指纹回归锁，勿手改",
+  "thread_id": 9990001,
+  "total_pages": 3,
+  "total_posts": 9,
+  "unique_users": 7,
+  "posts": [
+    {
+      "username": "Dorpjes",
+      "timestamp": "22-05-2026 17:06",
+      "content": "Ik heb de HYXi Halo nu drie maanden draaien in combinatie met veertien panelen op het zuiden. De laadsnelheid is netjes en de app doet precies wat hij moet doen.",
+      "page_number": 1,
+      "message_id": "80000001",
+      "fingerprint": "84e8667fe8b8916b"
+    },
+    {
+      "username": "Havelaar",
+      "timestamp": "22-05-2026 18:41",
+      "content": "Bij mij viel de omvormer twee keer stil tijdens het ontladen. Support reageerde binnen een dag, maar een echte oplossing is er nog niet. [图片]",
+      "page_number": 1,
+      "message_id": "80000002",
+      "fingerprint": "99a21d52f9d46ee9"
+    },
+    {
+      "username": "Kees_NL",
+      "timestamp": "23-05-2026 09:12",
+      "content": "Let op: de garantie geldt alleen bij installatie door een gecertificeerde partij. Dat stond niet duidelijk in de brochure.",
+      "page_number": 1,
+      "message_id": "80000003",
+      "fingerprint": "b69d10cd1515d1a4"
+    },
+    {
+      "username": "Marloes",
+      "timestamp": "24-05-2026 11:03",
+      "content": "Prijs-kwaliteit vind ik uitstekend vergeleken met de concurrentie. Terugverdientijd komt bij mij uit op ongeveer zeven jaar.",
+      "page_number": 2,
+      "message_id": "80000004",
+      "fingerprint": "a8f5a815198e5534"
+    },
+    {
+      "username": "TechnischTim",
+      "timestamp": "24-05-2026 15:47",
+      "content": "Dat hangt sterk af van je dynamische contract. Zonder dynamisch tarief haal je die zeven jaar niet.",
+      "page_number": 2,
+      "message_id": "80000005",
+      "fingerprint": "51b0a6a5433b205d"
+    },
+    {
+      "username": "Dorpjes",
+      "timestamp": "25-05-2026 08:20",
+      "content": "Firmware 2.4.1 heeft het stilvallen bij mij opgelost. Update is via de app beschikbaar.",
+      "page_number": 2,
+      "message_id": "80000006",
+      "fingerprint": "b4345f5668799312"
+    },
+    {
+      "username": "Bramske",
+      "timestamp": "26-05-2026 19:55",
+      "content": "Geluidsniveau valt tegen in een bijkeuken naast de slaapkamer. Verder ben ik tevreden.",
+      "page_number": 3,
+      "message_id": "80000007",
+      "fingerprint": "2a12a67a8c5be14a"
+    },
+    {
+      "username": "Havelaar",
+      "timestamp": "27-05-2026 07:31",
+      "content": "Na de firmware-update draait mijn systeem inmiddels twee weken zonder storing. Ik trek mijn eerdere klacht terug.",
+      "page_number": 3,
+      "message_id": "80000008",
+      "fingerprint": "7a3421a6c2eefebc"
+    },
+    {
+      "username": "用户3",
+      "timestamp": "27-05-2026 12:00",
+      "content": "Iemand die de Halo aan een warmtepomp heeft gekoppeld? Ik overweeg die combinatie.",
+      "page_number": 3,
+      "message_id": "80000009",
+      "fingerprint": "50e7e5db19116e9c"
+    }
+  ]
+}

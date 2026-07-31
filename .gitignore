@@ -11,6 +11,7 @@ backend/data/sentiment_*.json
 backend/data/exports/
 backend/data/hyxi.db*
 backend/data/logs/
+backend/data/jobs/
 
 # 依赖
 node_modules/

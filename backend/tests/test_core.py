@@ -995,11 +995,25 @@ _HAS_NODE = shutil.which("node") is not None
 
 
 def _fake_playwright_install(root: str) -> None:
-    """让 ScraperService 的依赖自检在 tmpdir 里通过（用假脚本的测试并不需要真 playwright）"""
+    """让 CollectorRunner 的依赖自检在 tmpdir 里通过（用假脚本的测试并不需要真 playwright）"""
     pkg_dir = os.path.join(root, "node_modules", "playwright")
     os.makedirs(pkg_dir, exist_ok=True)
     with open(os.path.join(pkg_dir, "package.json"), "w", encoding="utf-8") as f:
         f.write('{"name":"playwright","version":"0.0.0-test"}')
+
+def _write_collector_script(root: str, script: str) -> None:
+    """假采集器脚本写到 collectors/tweakers.js —— 与真实布局一致"""
+    os.makedirs(os.path.join(root, "collectors"), exist_ok=True)
+    with open(os.path.join(root, "collectors", "tweakers.js"), "w", encoding="utf-8") as f:
+        f.write(script)
+
+
+# 采集脚本读 job 文件而不是 argv，假脚本也必须走同一条协议
+_READ_JOB = """
+const fs = require('fs');
+const jobArg = process.argv.find(a => a.startsWith('--job='));
+const job = JSON.parse(fs.readFileSync(jobArg.slice('--job='.length), 'utf-8'));
+"""
 
 STALL_SCRIPT = """
 const fs = require('fs');
@@ -1022,18 +1036,20 @@ class TestScraperStallTimeoutEndToEnd:
 
     def setup_method(self):
         self.tmpdir = tempfile.mkdtemp()
-        with open(os.path.join(self.tmpdir, "tweakers_scraper_playwright.js"), "w", encoding="utf-8") as f:
-            f.write(STALL_SCRIPT)
+        _write_collector_script(self.tmpdir, STALL_SCRIPT)
         _fake_playwright_install(self.tmpdir)
-        import app.services.scraper_service as scraper_mod
-        self.mod = scraper_mod
-        self._old_root = scraper_mod.settings.project_root
-        self._old_timeout = scraper_mod.SUBPROCESS_TIMEOUT
-        scraper_mod.settings.project_root = self.tmpdir
-        scraper_mod.SUBPROCESS_TIMEOUT = 3
+        import app.services.collector_runner as runner_mod
+        self.mod = runner_mod
+        self._old_root = runner_mod.settings.project_root
+        self._old_data = runner_mod.settings.data_dir
+        self._old_timeout = runner_mod.SUBPROCESS_TIMEOUT
+        runner_mod.settings.project_root = self.tmpdir
+        runner_mod.settings.data_dir = self.tmpdir
+        runner_mod.SUBPROCESS_TIMEOUT = 3
 
     def teardown_method(self):
         self.mod.settings.project_root = self._old_root
+        self.mod.settings.data_dir = self._old_data
         self.mod.SUBPROCESS_TIMEOUT = self._old_timeout
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
@@ -1043,12 +1059,19 @@ class TestScraperStallTimeoutEndToEnd:
             pytest.skip("未安装 node")
 
         import asyncio, time
+        from app.collectors import get_collector
         from app.services.progress_manager import ProgressManager
+
+        collector = get_collector("tweakers")
 
         async def run():
             # 外层再套一层超时：回归时读流循环永不结束，测试应快速失败而不是挂死
             with_timeout = asyncio.wait_for(
-                self.mod.ScraperService.execute("stall", {"thread_id": 123}, ProgressManager()),
+                self.mod.CollectorRunner.execute(
+                    "stall", collector,
+                    {"id": collector.id, "params": {"thread_id": 123}},
+                    ProgressManager(),
+                ),
                 timeout=30,
             )
             try:
@@ -1066,7 +1089,7 @@ class TestScraperStallTimeoutEndToEnd:
         assert "超时" in message, f"stall 的子进程没有触发超时: {message!r}"
 
         # 心跳文件由孙进程写：只 terminate 父进程的话它会继续跳（Playwright 的 Chromium 同理）
-        beat = os.path.join(self.tmpdir, "heartbeat.txt")
+        beat = os.path.join(self.tmpdir, "collectors", "heartbeat.txt")
         assert os.path.exists(beat), "孙进程没起来，本用例失去意义"
         before = os.path.getmtime(beat)
         time.sleep(2)
@@ -1106,34 +1129,28 @@ class TestStartPageResolutionEndToEnd:
         assert self._resolve("抓取帖子 2336074", {"start_page": "第四页"})[0] == 1
 
 
-OK_SCRIPT = """
-const fs = require('fs');
-const path = require('path');
-console.log('第 1/1 页');
+OK_SCRIPT = _READ_JOB + """
+console.log(JSON.stringify({ evt: 'progress', current: 1, total: 1, msg: '第 1/1 页' }));
 fs.writeFileSync(
-  path.join(__dirname, 'tweakers_thread_123.json'),
+  job.output_path,
   JSON.stringify({ thread_id: 123, total_pages: 1, total_posts: 0, complete: true, stop_reason: null, posts: [] }),
   'utf-8'
 );
 """
 
-ARGV_SCRIPT = """
-const fs = require('fs');
-const path = require('path');
+JOB_ECHO_SCRIPT = _READ_JOB + """
 fs.writeFileSync(
-  path.join(__dirname, 'tweakers_thread_123.json'),
+  job.output_path,
   JSON.stringify({ thread_id: 123, total_pages: 1, total_posts: 0, complete: true,
-                   stop_reason: null, posts: [], argv: process.argv.slice(2) }),
+                   stop_reason: null, posts: [], job: job }),
   'utf-8'
 );
 """
 
-PARTIAL_SCRIPT = """
-const fs = require('fs');
-const path = require('path');
-console.log('第 1/9 页');
+PARTIAL_SCRIPT = _READ_JOB + """
+console.log(JSON.stringify({ evt: 'progress', current: 1, total: 9, msg: '第 1/9 页' }));
 fs.writeFileSync(
-  path.join(__dirname, 'tweakers_thread_123.json'),
+  job.output_path,
   JSON.stringify({ thread_id: 123, total_pages: 9, total_posts: 1, complete: false,
                    stop_reason: '目标站拒绝访问 (HTTP 429)，已主动停止抓取', posts: [] }),
   'utf-8'
@@ -1150,24 +1167,31 @@ class _ScraperTmpRoot:
 
     def setup_method(self):
         self.tmpdir = tempfile.mkdtemp()
-        with open(os.path.join(self.tmpdir, "tweakers_scraper_playwright.js"), "w", encoding="utf-8") as f:
-            f.write(self.script)
-        import app.services.scraper_service as scraper_mod
-        self.mod = scraper_mod
-        self._old_root = scraper_mod.settings.project_root
-        scraper_mod.settings.project_root = self.tmpdir
+        _write_collector_script(self.tmpdir, self.script)
+        import app.services.collector_runner as runner_mod
+        self.mod = runner_mod
+        self._old_root = runner_mod.settings.project_root
+        self._old_data = runner_mod.settings.data_dir
+        runner_mod.settings.project_root = self.tmpdir
+        runner_mod.settings.data_dir = self.tmpdir
 
     def teardown_method(self):
         self.mod.settings.project_root = self._old_root
+        self.mod.settings.data_dir = self._old_data
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _execute(self, params=None):
         import asyncio
+        from app.collectors import get_collector
         from app.services.progress_manager import ProgressManager
 
+        collector = get_collector("tweakers")
+
         async def run():
-            return await self.mod.ScraperService.execute(
-                "t", params or {"thread_id": 123}, ProgressManager()
+            return await self.mod.CollectorRunner.execute(
+                "t", collector,
+                {"id": collector.id, "params": params or {"thread_id": 123}},
+                ProgressManager(),
             )
 
         loop = asyncio.new_event_loop()
@@ -1220,10 +1244,10 @@ class TestScraperPartialExitEndToEnd(_ScraperTmpRoot):
         assert "拒绝访问" in message, f"中断原因没带到用户面前: {message!r}"
 
 
-class TestStartPageReachesCommandLineEndToEnd(_ScraperTmpRoot):
-    """用户原话 → 真实子进程命令行：URL 末尾的页码不能变成 --start"""
+class TestStartPageReachesCollectorJobEndToEnd(_ScraperTmpRoot):
+    """用户原话 → 真实子进程收到的 job：URL 末尾的页码不能变成起始页"""
 
-    script = ARGV_SCRIPT
+    script = JOB_ECHO_SCRIPT
 
     def setup_method(self):
         super().setup_method()
@@ -1240,6 +1264,99 @@ class TestStartPageReachesCommandLineEndToEnd(_ScraperTmpRoot):
         params = {"thread_id": 123, "start_page": 4}  # LLM 把 URL 末尾的 4 当成了起始页
         _resolve_start_page(task, params)
 
-        argv = self._execute(params)["argv"]
-        assert "--start=1" in argv, f"起始页没有落到第 1 页: {argv}"
-        assert "--start=4" not in argv, f"URL 页码被当成起始页传给了脚本: {argv}"
+        job = self._execute(params)["job"]
+        assert job["params"]["start_page"] == 1, f"起始页没有落到第 1 页: {job['params']}"
+
+    def test_llm_params_cannot_redirect_target_site_or_pacing(self):
+        """base_url / pacing 只认 source，不认 params —— 否则模型能改抓取目标和请求节奏"""
+        if not _HAS_NODE:
+            import pytest
+            pytest.skip("未安装 node")
+
+        job = self._execute({
+            "thread_id": 123,
+            "base_url": "http://evil.example",
+            "pacing": {"delay_min": 0, "delay_max": 0},
+        })["job"]
+        assert job["base_url"] == "https://gathering.tweakers.net"
+        assert job["pacing"] == {"delay_min": 4000, "delay_max": 11000}
+
+
+_FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+GOLDEN_FILE = os.path.join(_FIXTURES_DIR, "golden_tweakers.json")
+FIXTURE_THREAD_ID = 9990001
+
+
+class TestTweakersCollectorGoldenEndToEnd:
+    """真 Chrome + 真 HTTP + 真子进程跑本地 fixture 站点，提取结果必须与黄金基线逐字相等。
+
+    出口 IP 已被 Tweakers 防火墙封禁，真站抓不了；换成本地站点后跑的仍是完整链路，
+    不涉及任何 mock。基线由重构前的脚本对同一份 HTML 抓出，指纹是增量去重与跨文件
+    合并的唯一锚点 —— 它变了，全部历史数据失配、已翻译的帖子会被重新付费翻译。
+    """
+
+    def setup_method(self):
+        from app.config import settings
+        self.tmpdir = tempfile.mkdtemp()
+        self.output = os.path.join(
+            settings.project_root, f"tweakers_thread_{FIXTURE_THREAD_ID}.json"
+        )
+        if os.path.exists(self.output):
+            os.remove(self.output)
+
+    def teardown_method(self):
+        if os.path.exists(self.output):
+            os.remove(self.output)
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_extraction_matches_golden_baseline(self):
+        import pytest
+        from app.config import settings
+
+        if not _HAS_NODE:
+            pytest.skip("未安装 node")
+        if not os.path.exists(
+            os.path.join(settings.project_root, "node_modules", "playwright", "package.json")
+        ):
+            pytest.skip("项目根目录未安装 playwright")
+
+        sys.path.insert(0, _FIXTURES_DIR)
+        from fixture_site import FixtureSite
+
+        import asyncio
+        from app.collectors import get_collector
+        from app.services.collector_runner import CollectorRunner
+        from app.services.progress_manager import ProgressManager
+
+        collector = get_collector("tweakers")
+
+        with FixtureSite() as base_url:
+            source = {
+                "id": "fixture_tweakers",
+                "params": {
+                    "thread_id": FIXTURE_THREAD_ID,
+                    "headless": True,
+                    "incremental": False,
+                },
+                "base_url": base_url,
+                "state_file": os.path.join(self.tmpdir, "state.json"),
+                "pacing": {"delay_min": 200, "delay_max": 400},
+            }
+            loop = asyncio.new_event_loop()
+            try:
+                data = loop.run_until_complete(
+                    CollectorRunner.execute("golden", collector, source, ProgressManager())
+                )
+            finally:
+                loop.close()
+
+        with open(GOLDEN_FILE, "r", encoding="utf-8") as f:
+            golden = json.load(f)
+
+        assert data["complete"] is True, f"抓取未完成: {data.get('stop_reason')}"
+        assert data["total_pages"] == golden["total_pages"]
+        assert len(data["posts"]) == len(golden["posts"]), "帖子数与基线不一致"
+
+        fields = ("username", "timestamp", "content", "page_number", "message_id", "fingerprint")
+        for got, want in zip(data["posts"], golden["posts"]):
+            assert {k: got.get(k) for k in fields} == {k: want.get(k) for k in fields}

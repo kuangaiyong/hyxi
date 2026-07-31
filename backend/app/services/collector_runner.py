@@ -1,14 +1,21 @@
-"""Playwright 抓取服务 - 调用 Node.js 脚本（含超时与取消清理）"""
+"""采集器 runner —— 用 job.json + stdout NDJSON 协议驱动 Node 采集脚本。
+
+这里没有任何站点分支：入参由 Collector.build_job() 生成，进度由脚本自报，输出位置由
+job 指定。超时控制、进程树清理、退出码契约沿用已验证的实现，不要改。
+"""
 
 import os
-import re
 import json
+import uuid
 import asyncio
 import logging
+from typing import Any, Dict
+
+from app.collectors.base import Collector
 from app.config import settings
 from app.services.progress_manager import ProgressManager
 
-logger = logging.getLogger("hyxi.scraper")
+logger = logging.getLogger("hyxi.collector")
 
 # 子进程超时（秒）
 SUBPROCESS_TIMEOUT = getattr(settings, "task_timeout_minutes", 30) * 60
@@ -46,25 +53,23 @@ async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
         pass
 
 
-class ScraperService:
-    """调用 tweakers_scraper_playwright.js 抓取帖子"""
+class CollectorRunner:
+    """执行一个采集器脚本并返回它写出的原始 JSON"""
 
     @staticmethod
     async def execute(
         task_id: str,
-        params: dict,
+        collector: Collector,
+        source: Dict[str, Any],
         progress: ProgressManager,
+        step_index: int = 0,
     ) -> dict:
-        """执行抓取（含超时控制，取消时自动清理子进程）"""
-        thread_id = params.get("thread_id")
-        start_page = params.get("start_page", 1)
-        headless = params.get("headless", True)
-        incremental = params.get("incremental", True)
+        output_path = collector.output_path(source)
+        job = collector.build_job(source, output_path)
 
-        if not thread_id:
-            raise ValueError("缺少 thread_id 参数")
-
-        script_path = os.path.join(settings.project_root, "tweakers_scraper_playwright.js")
+        script_path = collector.script_path()
+        if not os.path.exists(script_path):
+            raise ValueError(f"采集脚本不存在: {script_path}")
 
         # 依赖缺失在 Python 侧就拦下：这条异常会进 task["error_message"] 并在前端展示，
         # 用户看到的是「怎么修」而不是一段 Node 的 MODULE_NOT_FOUND 堆栈
@@ -73,28 +78,48 @@ class ScraperService:
         ):
             raise ValueError("缺少 Node 依赖 playwright。请在项目根目录执行 npm ci 后重试。")
 
-        cmd = [
-            "node", script_path,
-            f"--thread={thread_id}",
-            f"--start={start_page}",
-        ]
-        if headless:
-            cmd.append("--headless")
-        if incremental:
-            cmd.append("--incremental")
+        jobs_dir = os.path.join(settings.data_dir, "jobs")
+        os.makedirs(jobs_dir, exist_ok=True)
+        job_file = os.path.join(jobs_dir, f"{task_id}_{uuid.uuid4().hex[:8]}.json")
+        with open(job_file, "w", encoding="utf-8") as f:
+            json.dump(job, f, ensure_ascii=False)
+
+        try:
+            return await CollectorRunner._run(
+                task_id, collector, source, job_file, output_path, progress, step_index
+            )
+        finally:
+            # job 文件将来会携带凭据引用，不留在磁盘上
+            try:
+                os.remove(job_file)
+            except OSError:
+                pass
+
+    @staticmethod
+    async def _run(
+        task_id: str,
+        collector: Collector,
+        source: Dict[str, Any],
+        job_file: str,
+        output_path: str,
+        progress: ProgressManager,
+        step_index: int,
+    ) -> dict:
+        source_id = source.get("id") or collector.id
 
         await progress.emit(task_id, "step_progress", {
-            "step": 0,
+            "step": step_index,
             "progress": 0.05,
-            "message": f"正在启动浏览器抓取帖子 {thread_id}...",
+            "message": f"正在启动 {collector.display_name} 采集...",
         })
+        # 只记采集器和来源，不回显命令行：job 里将来带凭据引用，命令行会进任务日志和 SSE
         await progress.emit(task_id, "log", {
             "level": "info",
-            "message": f"执行命令: {' '.join(cmd)}",
+            "message": f"启动采集器 {collector.id}（来源 {source_id}）",
         })
 
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
+            "node", collector.script_path(), f"--job={job_file}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=settings.project_root,
@@ -117,28 +142,29 @@ class ScraperService:
                 if not line_str:
                     continue
 
+                event = None
+                if line_str.startswith("{"):
+                    try:
+                        event = json.loads(line_str)
+                    except ValueError:
+                        event = None
+
+                if isinstance(event, dict) and event.get("evt") == "progress":
+                    total = event.get("total") or 0
+                    current = event.get("current") or 0
+                    pct = 0.05 + (current / total) * 0.75 if total > 0 else 0.05
+                    await progress.emit(task_id, "step_progress", {
+                        "step": step_index,
+                        "progress": min(pct, 0.8),
+                        "message": event.get("msg") or f"已采集 {current}/{total}",
+                    })
+                    continue
+
+                # 解析不出结构化事件的行原样当日志转发
                 await progress.emit(task_id, "log", {
                     "level": "info",
                     "message": line_str,
                 })
-
-                page_match = re.search(r"第\s*(\d+)/(\d+)\s*页", line_str)
-                if page_match:
-                    current = int(page_match.group(1))
-                    total = int(page_match.group(2))
-                    pct = 0.05 + (current / total) * 0.75
-                    await progress.emit(task_id, "step_progress", {
-                        "step": 0,
-                        "progress": min(pct, 0.8),
-                        "message": f"正在抓取第 {current}/{total} 页...",
-                    })
-
-                if "提取完成" in line_str or "总帖子" in line_str:
-                    await progress.emit(task_id, "step_progress", {
-                        "step": 0,
-                        "progress": 0.85,
-                        "message": "抓取完成，正在保存数据...",
-                    })
 
             await proc.wait()
 
@@ -154,7 +180,7 @@ class ScraperService:
                 stderr_task.cancel()
                 await asyncio.gather(stderr_task, return_exceptions=True)
                 await _kill_process_tree(proc)
-                raise Exception(f"抓取任务超时（超过 {settings.task_timeout_minutes} 分钟），已终止子进程")
+                raise Exception(f"采集任务超时（超过 {settings.task_timeout_minutes} 分钟），已终止子进程")
 
             stderr_text = await stderr_task
             if stderr_text.strip():
@@ -167,34 +193,30 @@ class ScraperService:
                 # 脚本用 stderr 说明中断原因（限流 / 重定向 / 页面异常），不带上就只剩一个退出码
                 lines = stderr_text.strip().splitlines()
                 detail = f": {lines[-1][:200]}" if lines else ""
-                raise Exception(f"抓取脚本异常退出 (code={proc.returncode}){detail}")
+                raise Exception(f"采集脚本异常退出 (code={proc.returncode}){detail}")
 
-            # 读取输出 JSON
-            output_file = os.path.join(settings.project_root, f"tweakers_thread_{thread_id}.json")
-            if not os.path.exists(output_file):
-                raise Exception(f"输出文件未生成: {output_file}")
+            if not os.path.exists(output_path):
+                raise Exception(f"输出文件未生成: {output_path}")
 
-            with open(output_file, "r", encoding="utf-8") as f:
+            with open(output_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
             await progress.emit(task_id, "step_progress", {
-                "step": 0,
+                "step": step_index,
                 "progress": 1.0,
-                "message": f"抓取完成: {data.get('total_posts', 0)} 条帖子",
+                "message": f"采集完成: {data.get('total_posts', 0)} 条帖子",
             })
 
             return data
 
         except asyncio.CancelledError:
-            # 任务被取消时清理子进程
-            logger.info("抓取任务被取消，正在终止子进程... task=%s", task_id)
+            logger.info("采集任务被取消，正在终止子进程... task=%s", task_id)
             stderr_task.cancel()
             await asyncio.gather(stderr_task, return_exceptions=True)
             await _kill_process_tree(proc)
             raise
 
         except Exception:
-            # 其他异常时也确保清理子进程
             stderr_task.cancel()
             await asyncio.gather(stderr_task, return_exceptions=True)
             await _kill_process_tree(proc)

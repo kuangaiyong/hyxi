@@ -1,3 +1,5 @@
+import { getApiKey } from '@/api/client'
+
 function filenameFromDisposition(disposition: string | null): string {
   if (!disposition) return ''
   const utf8 = disposition.match(/filename\*=UTF-8''([^;]+)/i)
@@ -11,7 +13,8 @@ function filenameFromDisposition(disposition: string | null): string {
  * 用户拿到的是一个名为 .csv/.xlsx 的损坏文件却毫无提示。
  */
 export async function downloadFile(url: string, fallbackName: string): Promise<void> {
-  const resp = await fetch(url)
+  const key = getApiKey()
+  const resp = await fetch(url, { headers: key ? { 'X-API-Key': key } : {} })
   if (!resp.ok) {
     let detail = ''
     try {

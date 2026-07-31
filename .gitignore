@@ -1,4 +1,5 @@
 # 敏感配置
+.env
 backend/data/config.json
 backend/data/scheduler.db
 

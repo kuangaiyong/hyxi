@@ -1,4 +1,5 @@
 import { ref, onUnmounted, watch, type Ref } from 'vue'
+import { withApiKey } from '@/api/client'
 import { useTaskStore } from '@/stores/task'
 import type { TimelineEvent } from '@/types/result'
 
@@ -11,7 +12,7 @@ export function useSSE(taskId: Ref<string | null>) {
     if (!taskId.value) return
     disconnect()
 
-    const url = `/api/v1/tasks/${taskId.value}/events`
+    const url = withApiKey(`/api/v1/tasks/${taskId.value}/events`)
     const es = new EventSource(url)
     eventSource.value = es
 

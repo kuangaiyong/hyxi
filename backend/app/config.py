@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     port: int = 8000
     cors_origins: List[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
     enable_docs: bool = True  # 对外暴露时设 TWEAKERS_ENABLE_DOCS=false 关闭 /docs
+    # /api/v1/* 的共享密钥，留空则不鉴权（见 app/auth.py）
+    api_key: str = ""
 
     # 任务限制
     max_concurrent_tasks: int = 1

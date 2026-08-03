@@ -1,4 +1,4 @@
-import apiClient from './client'
+import apiClient, { withApiKey } from './client'
 import type {
   CollectorInfo,
   CredentialInput,
@@ -39,4 +39,14 @@ export async function setCredential(id: string, payload: CredentialInput): Promi
 export async function deleteCredential(id: string): Promise<SourcePublic> {
   const { data } = await apiClient.delete(`/sources/${id}/credential`)
   return data
+}
+
+export async function authorizeSource(id: string): Promise<{ message: string; channel: string }> {
+  const { data } = await apiClient.post(`/sources/${id}/authorize`)
+  return data
+}
+
+/** 人工授权的进度流。EventSource 不能自定义请求头，密钥只能挂 query 上 */
+export function authorizeEventsUrl(id: string): string {
+  return withApiKey(`/api/v1/sources/${id}/authorize/events`)
 }

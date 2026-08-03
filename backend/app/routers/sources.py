@@ -3,6 +3,7 @@
 from typing import List
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 
 from app.collectors import get_collector
 from app.models import (
@@ -13,6 +14,7 @@ from app.models import (
     SourceUpdate,
 )
 from app.services import source_service
+from app.services.progress_manager import progress_manager
 
 router = APIRouter(prefix="/api/v1", tags=["数据源"])
 
@@ -104,3 +106,44 @@ async def delete_credential(source_id: str):
         raise HTTPException(status_code=404, detail="数据源不存在")
     source_service.delete_credential(source_id)
     return _to_public(source)
+
+
+def _auth_channel(source_id: str) -> str:
+    """人工授权借用 progress_manager 的 pub/sub，频道名与任务 id 空间区分开"""
+    return f"auth_{source_id}"
+
+
+@router.post("/sources/{source_id}/authorize")
+async def authorize_source(source_id: str):
+    """人工登录：开一个有头浏览器，让人自己完成两步验证 / 安全检查。
+
+    这是「撞上验证就交给人，不硬闯」那条既有姿态的落点。登录成功后保存会话，
+    之后的采集直接复用，不必每轮都用密码。
+    """
+    source = source_service.get_source(source_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="数据源不存在")
+    collector = get_collector(source["collector_id"])
+    if not collector.needs_credentials:
+        raise HTTPException(status_code=400, detail="该采集器不需要登录")
+    if source_service.is_authorizing(source_id):
+        raise HTTPException(status_code=409, detail="该数据源正在授权中")
+
+    source_service.start_authorization(source_id, source)
+    return {"message": "已打开浏览器，请在弹出的窗口里完成登录", "channel": _auth_channel(source_id)}
+
+
+@router.get("/sources/{source_id}/authorize/events")
+async def authorize_events(source_id: str):
+    """人工授权的实时进度流"""
+    if not source_service.get_source(source_id):
+        raise HTTPException(status_code=404, detail="数据源不存在")
+    return StreamingResponse(
+        progress_manager.event_generator(_auth_channel(source_id)),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

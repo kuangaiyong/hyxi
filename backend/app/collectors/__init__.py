@@ -3,11 +3,12 @@
 from typing import Dict, List
 
 from app.collectors.base import Collector
+from app.collectors.facebook_group import FacebookGroupCollector
 from app.collectors.group_feed import GroupFeedCollector
 from app.collectors.tweakers import TweakersCollector
 
 _REGISTRY: Dict[str, Collector] = {
-    c.id: c for c in (TweakersCollector(), GroupFeedCollector())
+    c.id: c for c in (TweakersCollector(), GroupFeedCollector(), FacebookGroupCollector())
 }
 
 

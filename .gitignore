@@ -39,3 +39,4 @@ Thumbs.db
 # 抓取的帖子数据（体积大，按需拉取）
 tweakers_thread_*.json
 group_feed_*.json
+facebook_group_*.json

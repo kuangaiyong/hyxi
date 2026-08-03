@@ -123,6 +123,29 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 `source_service._validate_params()` 只保留 `Collector.param_fields` 声明过的键 —— params 会原样进 job 文件，放任未知键通过等于给了一条绕过声明往采集脚本塞参数的路。
 
+**明文密码只走子进程环境变量**（`CollectorRunner._child_env()` 设 `HYXI_CRED_USERNAME` / `HYXI_CRED_PASSWORD`）：不进 argv（会出现在进程列表和任何回显命令行的地方），不进 job 文件（要落磁盘），随进程结束一起消失。取凭据失败**不在这里抛**——脚本会走「会话失效且没凭据」那条路给出可操作提示，在这里抛只会变成一个看不懂的 `OperationalError` 把它盖掉。
+
+## 登录与会话（needs_credentials 的采集器）
+
+`collectors/lib/auth.js` 是唯一的登录入口，`facebook_group.js` 用它。顺序是**会话优先**：先用 `storageState` 打开目标页，选择器判定已登录就直接返回（日志打「复用会话，跳过登录」），只有会话失效才动用密码。这就是「第一次登录后避免每次都用账号密码」的落点。
+
+会话按 **source 而非 collector** 隔离，落 `backend/data/sessions/{source_id}.json`（已 gitignore）—— 同一个采集器可能挂两个账号。
+
+登录后落地页分四种，处置完全不同，混成一个「登录失败」会让用户无从下手：成功 / `checkpoint`（URL 含 `/checkpoint/`）/ `two_factor`（出现验证码输入框）/ `bad_credentials`。**非成功一律 `emit('need_manual_auth')` + 退出码 3**，`CollectorRunner` 转成 `ManualAuthRequired`，orchestrator 把它的消息原样写进 `error_message` —— 那句话本身就是给用户看的人话（「数据源「X」需要人工重新授权：……请到「数据源」页点「人工登录」」），**别再包一层技术描述把它埋掉**。
+
+`POST /api/v1/sources/{id}/authorize` 走 `mode: "login_only"` + `headless: false`：开有头 Chrome 让人自己过两步验证，轮询到登录成功或超时（默认 5 分钟，`manual_login_timeout_ms` 可配），成功即存会话 + `mark_authorized()`。进度走 `progress_manager` 的 `auth_{source_id}` 频道。**这是「撞上验证就交给人，不硬闯」既有姿态的落点，不是绕过验证码。**
+
+> ⚠️ **Facebook 服务条款禁止自动化登录与抓取，账号可能被封。用专用小号，不要复用任何有价值的账号。**
+
+**`facebook_group.js` 的登录逻辑目前只在本地 fixture（`tests/fixtures/login_site.py`，传统同步表单 + Set-Cookie）上验证过，真站没跑过。** 下面四点是 fixture 覆盖不到、上真站前必须先用有头模式（`headless=False`）人工过一遍的：
+
+1. `ensureLogin()` 里 `Promise.all([waitForLoadState('domcontentloaded'), click(submit)])` 假设点登录会触发整页导航。真站大概率是 AJAX 局部刷新，`waitForLoadState` 会立刻在旧页面上 resolve，`classifyLanding()` 读到的就是提交前的状态
+2. `classifyLanding()` 用 `/\/checkpoint\//` 判安全检查。真站的检查页 / 异常登录提示 URL 形态很多（含同页弹层），大概率覆盖不全，会落到 `unknown` 分支
+3. `SELECTORS` 是对当前 Facebook DOM 的推测。选择器失配时提取那边有「第一批零帖子即硬失败」兜住（不会误报成功），但**登录判定本身会一直落不到 `ok`**，表现为每次都判登录失败
+4. `loggedIn` 判定假设未登录访问 `/groups/{id}` 会看到登录表单。真站对公开小组很可能给未登录用户看只读预览，那样这条判定整个失效
+
+改这四处时**先在有头模式下看真实页面长什么样**，而不是照着猜再叠选择器 —— 与「反爬虫姿态」一节的升级路径一致。
+
 ## 帖子数据模型
 
 ```json
@@ -193,6 +216,8 @@ PATCH  /api/v1/sources/{id}                  更新（采集器不可换）
 DELETE /api/v1/sources/{id}                  删除（凭据级联删除）
 PUT    /api/v1/sources/{id}/credential       录入凭据（加密落库，只进不出）
 DELETE /api/v1/sources/{id}/credential       清除凭据
+POST   /api/v1/sources/{id}/authorize        人工登录（开有头浏览器让人过 2FA）
+GET    /api/v1/sources/{id}/authorize/events 人工登录 SSE 进度流
 
 GET    /api/health                   健康检查
 ```
@@ -221,7 +246,7 @@ translate 和 generate_excel 在 context 里没有 posts 时会**从各数据源
 
 ## 测试
 
-**146 个测试，必须全部 PASSED**（本机实测 `146 passed in 47.05s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**159 个测试，必须全部 PASSED**（本机实测 `159 passed in 93s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
@@ -282,7 +307,8 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 - **422 报文默认会回显提交值**：FastAPI 把 pydantic 的 `input` 字段序列化进 `detail`，密码超长这一种情况就够让明文进响应体、再被前端拦截器打进浏览器控制台。`main.py` 注册了 `RequestValidationError` handler 统一剔掉 `input`，新增敏感字段不用额外处理
 - **`_persist()` 永远不会删行**：`_save_tasks()` 在 SQLite 分支只对 `self.tasks` 里**剩余**的任务逐条 upsert，从不发 DELETE。所以任何"从 `self.tasks` 移除条目"的新逻辑都必须自己显式调 `db_delete_task()`，否则残留行会在下次启动被 `_load_tasks()` 读回来（`delete_task()` 曾因此让删除的任务重启后复活，已修）。JSON 回退分支是全量覆写，无此问题
 - **`storage.DB_PATH` 是 import 时算好的常量**：测试里只改 `settings.data_dir` **不会**改变 DB 位置，必须一并重定向 `storage.DB_PATH`，否则测试会写进真实的 `backend/data/hyxi.db`。`tests/test_core.py` 的 `_create_orchestrator()` 已这么做；`tests/test_api.py` 则是靠在 import 前改 `data_dir` 生效 —— 新增测试文件时注意这个先后顺序
-- **爬虫退出码是契约**：`0` 完整 / `1` 硬失败（无可用数据）/ `2` 部分完成（数据已落盘，可增量续抓）。残缺时 `total_pages` 保留站点声明的真值**不再被截断点覆盖**，输出 JSON 带 `complete: false` + `stop_reason`，原因同时写 stderr 并被 `CollectorRunner` 拼进任务的 `error_message`。退出码非 0 一律让抓取步骤失败——残缺数据继续跑翻译→Excel→舆情，产出的是一份看起来完整、实际有偏的报告，比任务失败糟得多；续抓走 `POST /api/v1/tasks/{id}/retry`
+- **采集脚本的 stdout 只走 SSE，不落进 `task["logs"]`**：`CollectorRunner` 用 `progress.emit()` 转发，而 `task["logs"]` 只由 orchestrator 的 `_task_log()` 写。所以「复用会话，跳过登录」这类脚本自报的行只有在页面盯着 SSE 时看得到，任务跑完再翻记录是找不到的；要断言它就得在流上收
+- **爬虫退出码是契约**：`0` 完整 / `1` 硬失败（无可用数据）/ `2` 部分完成（数据已落盘，可增量续抓）/ `3` 需要人工授权（见「登录与会话」一节）。残缺时 `total_pages` 保留站点声明的真值**不再被截断点覆盖**，输出 JSON 带 `complete: false` + `stop_reason`，原因同时写 stderr 并被 `CollectorRunner` 拼进任务的 `error_message`。退出码非 0 一律让抓取步骤失败——残缺数据继续跑翻译→Excel→舆情，产出的是一份看起来完整、实际有偏的报告，比任务失败糟得多；续抓走 `POST /api/v1/tasks/{id}/retry`
 - **「第一页零帖子」也算硬失败**：全量抓取时第一页一条都提不出来（且没有历史数据可依），脚本直接抛错而不是写一份 `complete: true` 的空结果。这不是假想场景 —— IP 被封时页面返回 200 外壳、DOM 里没有任何 `.message`，改造前正是靠这条路径写出「0 条帖子、抓取成功」，下游照常翻译 0 条并导出空 Excel。站点改类名导致提取器失效时也是同一条路径
 - **爬虫 URL 页码有偏移**：`/list_messages/{id}/0` 是第 1 页，`/1` 是第 2 页（`displayToUrl` / `urlToDisplay`）；`group_feed` 的 `/batch/{n}` 同理差一位
 - **本地 fixture 站点是唯一能跑通的验证手段**：Tweakers 出口 IP 被封，`backend/tests/fixtures/fixture_site.py` 同时挂论坛（`/forum/list_messages/...`）和小组（`/groups/{id}/batch/{n}`）两个站点。跑的仍是真 Chrome、真 HTTP、真子进程、真 DOM 提取，只是被抓的站点换成本地的。要把数据源指过去就在数据源页填 `base_url`

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useToast } from '@/composables/useToast'
 import * as sourcesApi from '@/api/sources'
 import type { CollectorInfo, SourcePublic } from '@/types/source'
@@ -157,6 +157,54 @@ async function handleDeleteCredential(source: SourcePublic) {
   }
 }
 
+// ===== 人工登录 =====
+
+const authorizingId = ref('')
+const authLogs = ref<string[]>([])
+let authStream: EventSource | null = null
+
+function closeAuthStream() {
+  authStream?.close()
+  authStream = null
+}
+
+async function handleAuthorize(source: SourcePublic) {
+  authorizingId.value = source.id
+  authLogs.value = []
+  try {
+    await sourcesApi.authorizeSource(source.id)
+  } catch (e: any) {
+    authorizingId.value = ''
+    toast.error('发起授权失败: ' + (e.response?.data?.detail || e.message))
+    return
+  }
+  closeAuthStream()
+  authStream = new EventSource(sourcesApi.authorizeEventsUrl(source.id))
+  authStream.addEventListener('log', (ev: MessageEvent) => {
+    authLogs.value.push(JSON.parse(ev.data).message)
+  })
+  authStream.addEventListener('step_progress', (ev: MessageEvent) => {
+    authLogs.value.push(JSON.parse(ev.data).message)
+  })
+  authStream.addEventListener('task_complete', async (ev: MessageEvent) => {
+    const payload = JSON.parse(ev.data)
+    closeAuthStream()
+    authorizingId.value = ''
+    if (payload.status === 'completed') {
+      toast.success('授权成功，之后的采集会直接复用会话')
+    } else {
+      toast.error('授权失败: ' + (payload.error || '未知原因'))
+    }
+    await loadData()
+  })
+  authStream.onerror = () => {
+    closeAuthStream()
+    authorizingId.value = ''
+  }
+}
+
+onUnmounted(closeAuthStream)
+
 function paramSummary(source: SourcePublic): string {
   const entries = Object.entries(source.params || {})
   if (!entries.length) return '-'
@@ -262,6 +310,18 @@ function formatTime(iso: string | null): string {
       </div>
     </div>
 
+    <!-- 人工登录进度 -->
+    <div v-if="authorizingId" class="card">
+      <div class="card-header">🧑 人工登录进行中</div>
+      <p class="text-secondary text-sm mb-4">
+        已在服务器上打开一个浏览器窗口，请在里面完成登录（含两步验证 / 安全检查）。
+        登录成功后会话会被保存，之后的采集不再需要密码。5 分钟内未完成即超时。
+      </p>
+      <div style="font-family: monospace; font-size: 12px; max-height: 180px; overflow-y: auto;">
+        <div v-for="(line, i) in authLogs" :key="i" class="text-secondary">{{ line }}</div>
+      </div>
+    </div>
+
     <!-- 加载中 -->
     <div v-if="loading" class="card text-center" style="padding: 48px;">
       <span class="spinner spinner-lg"></span>
@@ -318,6 +378,9 @@ function formatTime(iso: string | null): string {
               <template v-else>
                 <span class="badge badge-failed">未配置</span>
               </template>
+              <div v-if="item.needs_credentials" class="text-secondary" style="margin-top: 2px;">
+                {{ item.last_auth_at ? '会话正常' : '需重新授权' }}
+              </div>
             </td>
             <td style="text-align: center;">
               <span :style="{
@@ -332,6 +395,12 @@ function formatTime(iso: string | null): string {
                 <button v-if="item.needs_credentials || item.has_credential"
                   class="btn btn-outline btn-sm" @click="openCredential(item)">
                   🔐 凭据
+                </button>
+                <!-- 两步验证和安全检查交给人过，脚本不做任何绕过 -->
+                <button v-if="item.needs_credentials" class="btn btn-outline btn-sm"
+                  :disabled="!!authorizingId" @click="handleAuthorize(item)">
+                  <span v-if="authorizingId === item.id" class="spinner"></span>
+                  {{ authorizingId === item.id ? '授权中' : '🧑 人工登录' }}
                 </button>
                 <button class="btn btn-outline btn-sm" @click="handleToggle(item)">
                   {{ item.enabled ? '⏸' : '▶' }}

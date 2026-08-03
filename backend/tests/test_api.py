@@ -450,6 +450,63 @@ class TestSourcesAPIEndToEnd:
         source_service.seed_default_sources()
         assert len(self.client.get("/api/v1/sources").json()) == 1
 
+    # ===== 人工授权端点 =====
+    # 这几条都不触发浏览器：真打 HTTP、真读库，只走「不该启动子进程」的那些分支。
+    # 真正开浏览器的成功路径由 test_core.py 的 TestFacebookLoginEndToEnd 覆盖。
+
+    def test_authorize_rejects_collector_that_needs_no_login(self):
+        sid = self._create(name="不需要登录").json()["id"]
+        try:
+            resp = self.client.post(f"/api/v1/sources/{sid}/authorize")
+            assert resp.status_code == 400
+            assert "不需要登录" in resp.json()["detail"]
+        finally:
+            self.client.delete(f"/api/v1/sources/{sid}")
+
+    def test_authorize_endpoints_404_on_unknown_source(self):
+        assert self.client.post("/api/v1/sources/src_nope/authorize").status_code == 404
+        assert self.client.get("/api/v1/sources/src_nope/authorize/events").status_code == 404
+
+    def test_authorize_is_rejected_while_one_is_running(self):
+        """同一个数据源不能同时开两个授权窗口"""
+        from app.services import source_service
+
+        resp = self.client.post("/api/v1/sources", json={
+            "collector_id": "facebook_group", "name": "并发授权",
+            "params": {"group_id": "123"},
+        })
+        sid = resp.json()["id"]
+        # 直接把它标成「授权中」，等价于前一个授权还没结束
+        source_service._authorizing.add(sid)
+        try:
+            resp = self.client.post(f"/api/v1/sources/{sid}/authorize")
+            assert resp.status_code == 409
+            assert "授权中" in resp.json()["detail"]
+        finally:
+            source_service._authorizing.discard(sid)
+            self.client.delete(f"/api/v1/sources/{sid}")
+
+    def test_authorization_result_is_visible_on_the_source(self):
+        """授权成功后界面靠 last_auth_at 把徽标从「需重新授权」翻成「会话正常」"""
+        from app.services import source_service
+
+        resp = self.client.post("/api/v1/sources", json={
+            "collector_id": "facebook_group", "name": "授权徽标",
+            "params": {"group_id": "123"},
+        })
+        sid = resp.json()["id"]
+        try:
+            assert resp.json()["needs_credentials"] is True
+            assert resp.json()["last_auth_at"] is None
+
+            source_service.mark_authorized(sid)
+            after = self.client.get(f"/api/v1/sources/{sid}").json()
+            assert after["last_auth_at"], "授权成功没有反映到出口模型上"
+            # 授权不该动凭据
+            assert after["has_credential"] is False
+        finally:
+            self.client.delete(f"/api/v1/sources/{sid}")
+
 
 class TestNestedPostsApiEndToEnd:
     """嵌套评论的出口：真实 HTTP 请求打到真实落盘的采集结果上"""

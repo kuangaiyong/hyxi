@@ -1735,3 +1735,244 @@ class TestGroupFeedCollectorEndToEnd:
         kept = next(p for p in again["posts"] if p["fingerprint"] == first_fp)
         assert kept["translation"] == "我已经用了三个月", "译文被增量重跑抹掉了"
         assert kept["_processed"]["translated"] is True, "_processed 标记被抹掉了"
+
+
+class TestFacebookLoginEndToEnd:
+    """登录 / 会话复用 / 两步验证退出路径 —— 真 Chrome 打真带登录门的本地站点。
+
+    facebook.com 本身不在这里跑：一次失败的自动登录很可能把真账号推进 checkpoint，
+    那是不可逆的对外动作。这里验的是脚本用的**同一套选择器和同一条代码路径**，
+    fixture 站点有真表单、真 Set-Cookie、真重定向，不涉及任何 mock。
+    """
+
+    GROUP_ID = "2407063016436085"
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.output = os.path.join(self.tmpdir, "fb_out.json")
+        self.state = os.path.join(self.tmpdir, "session.json")
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _skip_unless_ready(self):
+        import pytest
+        from app.config import settings
+
+        if not _HAS_NODE:
+            pytest.skip("未安装 node")
+        if not os.path.exists(
+            os.path.join(settings.project_root, "node_modules", "playwright", "package.json")
+        ):
+            pytest.skip("项目根目录未安装 playwright")
+
+    def _run(self, base_url, username, password, incremental=False):
+        import asyncio
+        from app.collectors import get_collector
+        from app.services.collector_runner import CollectorRunner
+        from app.services.progress_manager import ProgressManager
+
+        collector = type(get_collector("facebook_group"))()
+        collector.output_path = lambda source: self.output
+        # 凭据只走子进程环境变量，绝不进 argv 和 job 文件
+        os.environ["HYXI_CRED_USERNAME"] = username
+        os.environ["HYXI_CRED_PASSWORD"] = password
+        try:
+            source = {
+                "id": "fixture_fb",
+                "collector_id": "facebook_group",
+                "name": "FB fixture",
+                "params": {
+                    "group_id": self.GROUP_ID,
+                    "base_url": base_url,
+                    "headless": True,
+                    "incremental": incremental,
+                    "max_batches": 1,
+                },
+                "state_file": self.state,
+                "pacing": {"delay_min": 200, "delay_max": 400},
+            }
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(
+                    CollectorRunner.execute("fb-e2e", collector, source, ProgressManager())
+                )
+            finally:
+                loop.close()
+        finally:
+            os.environ.pop("HYXI_CRED_USERNAME", None)
+            os.environ.pop("HYXI_CRED_PASSWORD", None)
+
+    def _login_site(self):
+        sys.path.insert(0, _FIXTURES_DIR)
+        import login_site
+        return login_site
+
+    def test_credential_login_creates_reusable_session(self):
+        """(a) 首次凭据登录成功并落会话文件"""
+        self._skip_unless_ready()
+        site = self._login_site()
+
+        with site.LoginSite() as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
+
+        assert data["complete"] is True, data.get("stop_reason")
+        assert len(data["posts"]) == 3          # 2 主贴 + 1 评论
+        assert os.path.exists(self.state), "会话文件没有落盘，下一轮还得再输一次密码"
+
+        roots = [p for p in data["posts"] if not p["parent_fingerprint"]]
+        comments = [p for p in data["posts"] if p["parent_fingerprint"]]
+        assert len(roots) == 2 and len(comments) == 1
+        assert comments[0]["reply_level"] == 1
+        # data-utime 是 epoch 秒，要落成 dd-mm-yyyy HH:MM
+        import re
+        assert re.match(r"^\d{2}-\d{2}-\d{4} \d{2}:\d{2}$", roots[0]["timestamp"])
+
+    def test_session_is_reused_without_password(self):
+        """(c) 保留会话重跑：密码给成错的也应该照样成功，证明这一轮根本没走登录"""
+        self._skip_unless_ready()
+        site = self._login_site()
+
+        with site.LoginSite() as base_url:
+            self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
+            assert os.path.exists(self.state)
+            data = self._run(base_url, site.GOOD_USER, "这个密码是错的")
+
+        assert data["complete"] is True, data.get("stop_reason")
+        assert len(data["posts"]) == 3
+
+    def test_deleting_session_falls_back_to_credentials(self):
+        """(b) 删掉会话重跑仍能成功"""
+        self._skip_unless_ready()
+        site = self._login_site()
+
+        with site.LoginSite() as base_url:
+            self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
+            os.remove(self.state)
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
+
+        assert data["complete"] is True, data.get("stop_reason")
+        assert os.path.exists(self.state)
+
+    def test_two_factor_raises_manual_auth_with_actionable_message(self):
+        """撞上两步验证要以退出码 3 交回给人，并给出「去哪点哪个按钮」的人话"""
+        self._skip_unless_ready()
+        import pytest
+        from app.services.collector_runner import ManualAuthRequired
+
+        site = self._login_site()
+        with site.LoginSite() as base_url:
+            with pytest.raises(ManualAuthRequired) as e:
+                self._run(base_url, site.TWO_FACTOR_USER, "任意密码")
+
+        assert "两步验证" in e.value.reason
+        message = str(e.value)
+        assert "FB fixture" in message
+        assert "人工登录" in message, f"没告诉用户去哪操作: {message}"
+        assert not os.path.exists(self.output), "没登进去却写出了结果文件"
+
+    def test_bad_credentials_raise_manual_auth(self):
+        self._skip_unless_ready()
+        import pytest
+        from app.services.collector_runner import ManualAuthRequired
+
+        site = self._login_site()
+        with site.LoginSite() as base_url:
+            with pytest.raises(ManualAuthRequired) as e:
+                self._run(base_url, "wrong@example.com", "wrong")
+
+        assert "密码" in e.value.reason
+
+    def _run_login_only(self, base_url, timeout_ms):
+        import asyncio
+        from app.collectors import get_collector
+        from app.services.collector_runner import CollectorRunner
+        from app.services.progress_manager import ProgressManager
+
+        collector = type(get_collector("facebook_group"))()
+        collector.output_path = lambda source: self.output
+        source = {
+            "id": "fixture_fb",
+            "collector_id": "facebook_group",
+            "name": "FB fixture",
+            "mode": "login_only",
+            "params": {"group_id": self.GROUP_ID, "base_url": base_url},
+            "state_file": self.state,
+            "manual_login_timeout_ms": timeout_ms,
+            "pacing": {"delay_min": 200, "delay_max": 400},
+        }
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(
+                CollectorRunner.execute("fb-auth", collector, source, ProgressManager())
+            )
+        finally:
+            loop.close()
+
+    def test_manual_auth_saves_session_when_window_is_logged_in(self):
+        """人工授权模式：窗口里已是登录态时保存会话并成功退出。
+
+        真实场景里「变成登录态」这一步是人在窗口里过两步验证；这里先用凭据登录一次
+        拿到真会话，再跑 login_only —— 走的是同一条 waitForManualLogin 成功分支。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+
+        with site.LoginSite() as base_url:
+            self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
+            assert os.path.exists(self.state)
+            os.remove(self.output)
+            result = self._run_login_only(base_url, timeout_ms=30000)
+
+        assert result == {"mode": "login_only", "authorized": True}
+        assert os.path.exists(self.state), "授权成功却没落会话"
+        assert not os.path.exists(self.output), "人工授权模式不该产出帖子数据"
+
+    def test_manual_auth_times_out_with_actionable_message(self):
+        """没人去点时必须超时收场，不能永久挂住一个有头浏览器"""
+        self._skip_unless_ready()
+        import pytest
+        from app.services.collector_runner import ManualAuthRequired
+
+        site = self._login_site()
+        with site.LoginSite() as base_url:
+            with pytest.raises(ManualAuthRequired) as e:
+                self._run_login_only(base_url, timeout_ms=6000)
+
+        assert "超时" in e.value.reason
+        assert "人工登录" in str(e.value)
+
+    def test_missing_credentials_ask_for_manual_login_instead_of_crashing(self):
+        """没配凭据、会话又失效时，要给「去点人工登录」而不是一句技术报错。
+
+        取凭据失败在 CollectorRunner 里是被吞掉的（按无凭据处理），就是为了让脚本走到
+        这条路 —— 在那里抛只会变成一个看不懂的 OperationalError 把可操作提示盖掉。
+        """
+        self._skip_unless_ready()
+        import pytest
+        from app.services.collector_runner import ManualAuthRequired
+
+        site = self._login_site()
+        with site.LoginSite() as base_url:
+            with pytest.raises(ManualAuthRequired) as e:
+                self._run(base_url, "", "")   # 环境变量为空 = 库里没有凭据
+
+        assert "未配置凭据" in e.value.reason
+        # orchestrator 靠这两个字段给出人话并在界面上标出是哪个源要重新授权
+        assert e.value.source_id == "fixture_fb"
+        assert "人工登录" in str(e.value)
+
+    def test_password_never_reaches_argv_or_job_file(self):
+        """凭据只走环境变量：进程命令行和 job 文件里都不能出现"""
+        from app.collectors import get_collector
+
+        collector = get_collector("facebook_group")
+        source = {
+            "id": "fixture_fb", "collector_id": "facebook_group",
+            "params": {"group_id": self.GROUP_ID},
+        }
+        job = collector.build_job(source, self.output)
+        assert "HYXI_CRED_PASSWORD" not in json.dumps(job)
+        assert "password" not in json.dumps(job).lower()
+        # 命令行只有脚本路径和 --job=
+        assert collector.script_path().endswith("facebook_group.js")

@@ -76,6 +76,63 @@ def mark_authorized(source_id: str) -> None:
         storage.save_source(source)
 
 
+# ===== 人工授权 =====
+
+_authorizing: set = set()
+
+
+def is_authorizing(source_id: str) -> bool:
+    return source_id in _authorizing
+
+
+def start_authorization(source_id: str, source: dict) -> None:
+    """后台开一个有头浏览器让人自己完成登录，成功后落会话并记 last_auth_at。
+
+    只做「把人送到真实登录页」这一件事 —— 验证码和两步验证由人来过，脚本不做任何绕过。
+    """
+    import asyncio
+
+    from app.collectors import get_collector
+    from app.services.collector_runner import CollectorRunner, ManualAuthRequired
+    from app.services.progress_manager import progress_manager
+
+    channel = f"auth_{source_id}"
+    _authorizing.add(source_id)
+
+    async def _run():
+        try:
+            await progress_manager.emit(channel, "log", {
+                "level": "info",
+                "message": "正在打开浏览器，请在弹出的窗口里完成登录（5 分钟内）…",
+            })
+            collector = get_collector(source["collector_id"])
+            job_source = dict(source)
+            job_source["mode"] = "login_only"
+            await CollectorRunner.execute(
+                channel, collector, job_source, progress_manager, 0
+            )
+            mark_authorized(source_id)
+            await progress_manager.emit(channel, "log", {
+                "level": "success", "message": "授权成功，会话已保存",
+            })
+            await progress_manager.emit(channel, "task_complete", {
+                "task_id": channel, "status": "completed",
+            })
+        except ManualAuthRequired as e:
+            await progress_manager.emit(channel, "task_complete", {
+                "task_id": channel, "status": "failed", "error": e.reason,
+            })
+        except Exception as e:
+            logger.exception("人工授权失败 source=%s", source_id)
+            await progress_manager.emit(channel, "task_complete", {
+                "task_id": channel, "status": "failed", "error": str(e),
+            })
+        finally:
+            _authorizing.discard(source_id)
+
+    asyncio.create_task(_run())
+
+
 # ===== 凭据 =====
 
 def set_credential(source_id: str, username: str, password: str, kind: str = "password") -> None:

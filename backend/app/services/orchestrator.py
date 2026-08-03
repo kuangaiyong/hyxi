@@ -14,7 +14,7 @@ from app.collectors import get_collector
 from app.services import source_service
 from app.services.post_tree import build_tree, post_key
 from app.services.llm_service import LLMService
-from app.services.collector_runner import CollectorRunner
+from app.services.collector_runner import CollectorRunner, ManualAuthRequired
 from app.services.translator_service import TranslatorService
 from app.services.excel_service import ExcelService
 from app.services.progress_manager import progress_manager
@@ -259,9 +259,16 @@ class TaskOrchestrator:
                                 f"忽略 LLM 给出的 start_page={ignored_start}，"
                                 f"改为从第 {source['params']['start_page']} 页开始",
                             )
-                        result = await CollectorRunner.execute(
-                            task_id, collector, source, progress_manager, idx,
-                        )
+                        try:
+                            result = await CollectorRunner.execute(
+                                task_id, collector, source, progress_manager, idx,
+                            )
+                        except ManualAuthRequired as e:
+                            # 这条异常的消息本身就是给用户看的人话（含「去哪点哪个按钮」），
+                            # 不要再包一层技术描述把它埋掉
+                            await self._task_log(task_id, "error", str(e))
+                            task["needs_auth_source_id"] = e.source_id
+                            raise
                         posts = collector.normalize(result)
                         for p in posts:
                             p["source"] = source["id"]

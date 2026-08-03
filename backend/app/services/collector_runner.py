@@ -23,6 +23,26 @@ SUBPROCESS_TIMEOUT = getattr(settings, "task_timeout_minutes", 30) * 60
 # StreamReader 默认上限 64KiB，超长行会抛 LimitOverrunError 打断正常抓取
 STREAM_LIMIT = 4 * 1024 * 1024
 
+# 退出码契约：0 完整 / 1 硬失败 / 2 部分完成 / 3 需要人工授权
+EXIT_NEEDS_MANUAL_AUTH = 3
+
+
+class ManualAuthRequired(Exception):
+    """脚本报告需要人工完成登录（两步验证、安全检查、密码失效）。
+
+    单独一个异常类型，是为了让 orchestrator 能给出「去数据源页点人工登录」这句人话，
+    而不是把用户丢给一个退出码。
+    """
+
+    def __init__(self, source_id: str, source_name: str, reason: str):
+        self.source_id = source_id
+        self.source_name = source_name
+        self.reason = reason
+        super().__init__(
+            f"数据源「{source_name}」需要人工重新授权：{reason}。"
+            "请到「数据源」页点「人工登录」完成验证后重试。"
+        )
+
 
 async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
     """终止子进程及其后代。
@@ -96,6 +116,39 @@ class CollectorRunner:
                 pass
 
     @staticmethod
+    def _child_env(collector: Collector, source: Dict[str, Any]) -> Dict[str, str]:
+        """凭据只走子进程环境变量。
+
+        **绝不能进 argv**（会出现在进程列表和任何回显命令行的日志里），
+        **也不能进 job 文件**（要落磁盘）。环境变量随进程结束一起消失。
+        """
+        env = dict(os.environ)
+        if not collector.needs_credentials:
+            return env
+        source_id = source.get("id")
+        if not source_id:
+            return env
+
+        from app.services import source_service
+
+        # 取不到凭据不在这里抛：脚本会走「会话失效且没凭据」那条路，
+        # 以退出码 3 给出「去点人工登录」的人话。在这里抛只会变成一个看不懂的
+        # OperationalError/InvalidToken，把真正可操作的提示盖掉
+        try:
+            info = source_service.credential_info(source_id)
+            if not info["has_credential"]:
+                return env
+            secret = source_service.get_credential_secret(source_id)
+        except Exception as e:
+            logger.warning("读取数据源 %s 的凭据失败，将按无凭据处理: %s", source_id, e)
+            return env
+        if secret is None:
+            return env
+        env["HYXI_CRED_USERNAME"] = info["credential_username"]
+        env["HYXI_CRED_PASSWORD"] = secret
+        return env
+
+    @staticmethod
     async def _run(
         task_id: str,
         collector: Collector,
@@ -124,7 +177,10 @@ class CollectorRunner:
             stderr=asyncio.subprocess.PIPE,
             cwd=settings.project_root,
             limit=STREAM_LIMIT,
+            env=CollectorRunner._child_env(collector, source),
         )
+
+        auth_reason = [""]
 
         # 并发读取 stdout 和 stderr，避免管道死锁
         async def read_stderr():
@@ -148,6 +204,15 @@ class CollectorRunner:
                         event = json.loads(line_str)
                     except ValueError:
                         event = None
+
+                if isinstance(event, dict) and event.get("evt") == "need_manual_auth":
+                    # 记下原因，退出码 3 落地时拼进给用户的那句人话
+                    auth_reason[0] = event.get("reason") or "需要人工完成登录验证"
+                    await progress.emit(task_id, "log", {
+                        "level": "warning",
+                        "message": f"需要人工授权: {auth_reason[0]}",
+                    })
+                    continue
 
                 if isinstance(event, dict) and event.get("evt") == "progress":
                     total = event.get("total") or 0
@@ -189,11 +254,25 @@ class CollectorRunner:
                     "message": f"stderr: {stderr_text[:500]}",
                 })
 
+            if proc.returncode == EXIT_NEEDS_MANUAL_AUTH:
+                lines = stderr_text.strip().splitlines()
+                reason = auth_reason[0] or (lines[-1][:200] if lines else "需要人工完成登录验证")
+                raise ManualAuthRequired(
+                    source_id, source.get("name") or source_id, reason
+                )
+
             if proc.returncode != 0:
                 # 脚本用 stderr 说明中断原因（限流 / 重定向 / 页面异常），不带上就只剩一个退出码
                 lines = stderr_text.strip().splitlines()
                 detail = f": {lines[-1][:200]}" if lines else ""
                 raise Exception(f"采集脚本异常退出 (code={proc.returncode}){detail}")
+
+            # 人工登录模式只落会话文件，不产出帖子数据
+            if source.get("mode") == "login_only":
+                await progress.emit(task_id, "step_progress", {
+                    "step": step_index, "progress": 1.0, "message": "授权完成，会话已保存",
+                })
+                return {"mode": "login_only", "authorized": True}
 
             if not os.path.exists(output_path):
                 raise Exception(f"输出文件未生成: {output_path}")

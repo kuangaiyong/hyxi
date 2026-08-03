@@ -1,4 +1,5 @@
 const { emit, log } = require('./job');
+const { humanType } = require('./human');
 
 // 凭据只从环境变量取。绝不进 argv（会出现在进程列表和任何回显命令行的日志里），
 // 也绝不进 job 文件（要落磁盘）。
@@ -93,8 +94,10 @@ async function ensureLogin(page, { entryUrl, loginUrl, selectors, timeout, gotoP
     if (!(await page.$(selectors.passwordInput))) {
         await gotoPage(page, loginUrl, timeout);
     }
-    await page.fill(selectors.usernameInput, username);
-    await page.fill(selectors.passwordInput, password);
+    // 逐字输入而不是 fill()：零耗时填完一整个密码在行为分析里很扎眼。
+    // 这只降低「被要求做人机验证」的概率，弹出来之后照样得人来过。
+    await humanType(page, selectors.usernameInput, username);
+    await humanType(page, selectors.passwordInput, password);
     // 在密码框按回车走原生表单提交，不去点按钮。实测（2026-08-03，真 facebook.com）
     // 登录表单里那个 input[type=submit] 是 0×0 不可见的，而 DOM 顺序第一个
     // [role="button"] 是 24×24 的「显示密码」图标 —— 按选择器点过去只会把密码显示出来，

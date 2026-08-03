@@ -147,6 +147,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 - **`[role="alert"]` 绝不能当登录错误**：密码框一被填入，页面就冒出一条 aria-live 提示（荷兰语 `Je wachtwoord wordt weergegeven`），当成错误会让**每一次正常登录都被判成密码不对**。`loginError` 只认 `#error_box`
 - **提交后不要赌它整页导航**：`waitForLanding()` 轮询到状态确定为止（`classifyLanding()` 对「还停在登录页且没报错」返回 `pending`），导航还是 AJAX 都不影响。当场判死会把提交到落地之间那一段误报成密码错
 - **真实拦截点是 Arkose Labs 人机验证**：落地 URL 为 `/two_step_verification/authentication/?...&flow=pre_authentication`，正文提到 “MatchKey van Arkose Labs”。这不是输个短信码就完事的两步验证，**必须人来过** —— `classifyLanding()` 把它归入 `checkpoint`，脚本以退出码 3 交回给人。破解它属于「明确不做」
+- **把输入改成逐字键入（`humanType`）后实测无任何变化，照样弹人机验证**。所以别再往「模拟得更像人」这个方向调登录了：触发信号是账号 + 出口 IP 归属地 + 全新浏览器指纹这个组合，不是打字速度。`humanType` 保留（零耗时填完一整个密码本来就不该出现），但它解决不了这件事。**唯一可靠的路径是人工授权一次，之后复用会话**
 
 `tests/fixtures/login_site.py` 已按上述结论复刻：302 跳转、随机 id、0×0 的 submit、以及那个会抢走点击的「显示密码」图标 —— 测的就是真实路径上的坑。
 

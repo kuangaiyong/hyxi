@@ -5,6 +5,12 @@ export interface PostData {
   content: string
   translation: string
   page_number: number
+  source: string
+  source_name: string
+  reply_level: number
+  /** 搜索命中标记：命中评论时父贴会被一起带出来，靠这个区分谁才是命中项 */
+  matched: boolean
+  replies: PostData[]
 }
 
 export interface PostsResponse {

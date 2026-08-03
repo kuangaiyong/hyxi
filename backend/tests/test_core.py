@@ -205,6 +205,141 @@ class TestBuildSummaryEndToEnd:
         assert s["sentiment_percentages"]["positive"] == 0
 
 
+class TestDimensionNormalizationEndToEnd:
+    """维度必须保持封闭集合，否则 top_dimensions 会碎成近义标签、跨来源对比失效"""
+
+    def _norm(self, dims):
+        from app.services.sentiment_service import SentimentService
+        return SentimentService._normalize_dimensions(dims)
+
+    def test_shorthand_maps_to_canonical_label(self):
+        """实测 LLM 会把带括号的标签简写，于是同一维度在报表里占两行"""
+        assert self._norm(["认证/合规"]) == ["认证/合规(如Synergrid)"]
+        assert self._norm(["与其他品牌对比"]) == ["与其他品牌对比(如AEG/Marstek)"]
+
+    def test_exact_labels_pass_through(self):
+        assert self._norm(["价格/性价比", "安全性"]) == ["价格/性价比", "安全性"]
+
+    def test_unknown_label_is_dropped(self):
+        """宁可少一个标签，也不能让维度表不再封闭"""
+        assert self._norm(["用户自创的新维度"]) == []
+
+    def test_duplicates_after_normalization_are_collapsed(self):
+        assert self._norm(["认证/合规", "认证/合规(如Synergrid)"]) == ["认证/合规(如Synergrid)"]
+
+    def test_parse_sentiment_normalizes_inline(self):
+        from app.services.sentiment_service import SentimentService
+        parsed = SentimentService._parse_sentiment(
+            '{"sentiment":"positive","intensity":3,"reason_cn":"x","dimensions":["认证/合规"]}'
+        )
+        assert parsed["dimensions"] == ["认证/合规(如Synergrid)"]
+
+    def test_non_dict_and_bad_json_are_unchanged(self):
+        from app.services.sentiment_service import SentimentService
+        assert SentimentService._parse_sentiment("不是 JSON") is None
+
+
+class TestBySourceSummaryEndToEnd:
+    """跨来源对比：分组走纯 Python，不让 LLM 感知来源，免得它带着平台先验去评分"""
+
+    def _fixture(self):
+        results = [
+            {"sentiment": "positive", "intensity": 4, "dimensions": ["价格/性价比"]},
+            {"sentiment": "negative", "intensity": 2, "dimensions": ["固件更新"]},
+            {"sentiment": "negative", "intensity": 5, "dimensions": ["价格/性价比", "安全性"]},
+        ]
+        posts = [
+            {"source": "src_forum", "fingerprint": "a"},
+            {"source": "src_forum", "fingerprint": "b"},
+            {"source": "src_social", "fingerprint": "c"},
+        ]
+        return results, posts, {"src_forum": "论坛", "src_social": "社媒"}
+
+    def test_no_posts_means_no_by_source(self):
+        """既有调用方一行不改：不传 posts 就是原来的行为"""
+        from app.services.sentiment_service import SentimentService
+        results, _, _ = self._fixture()
+        assert "by_source" not in SentimentService._build_summary(results)
+
+    def test_by_source_splits_the_same_batch(self):
+        from app.services.sentiment_service import SentimentService
+        results, posts, names = self._fixture()
+        s = SentimentService._build_summary(results, posts, names)
+
+        assert set(s["by_source"]) == {"src_forum", "src_social"}
+        assert s["by_source"]["src_forum"]["name"] == "论坛"
+        assert s["by_source"]["src_forum"]["distribution"] == {"positive": 1, "negative": 1, "neutral": 0}
+        assert s["by_source"]["src_forum"]["avg_intensity"] == 3.0
+        assert s["by_source"]["src_social"]["distribution"]["negative"] == 1
+        # 分组统计不能改变全局统计
+        assert s["sentiment_distribution"] == {"positive": 1, "negative": 2, "neutral": 0}
+
+    def test_cross_source_lines_up_dimensions(self):
+        from app.services.sentiment_service import SentimentService
+        results, posts, names = self._fixture()
+        s = SentimentService._build_summary(results, posts, names)
+        assert s["cross_source"]["价格/性价比"] == {"src_forum": 1, "src_social": 1}
+        assert s["cross_source"]["安全性"] == {"src_social": 1}
+
+    def test_legacy_posts_without_source_are_grouped_as_tweakers(self):
+        from app.services.sentiment_service import SentimentService
+        s = SentimentService._build_summary(
+            [{"sentiment": "positive", "intensity": 3, "dimensions": []}],
+            [{"fingerprint": "old"}],
+            {},
+        )
+        assert list(s["by_source"]) == ["tweakers"]
+
+
+class TestResolveSourcesEndToEnd:
+    """LLM 提议、后端保证：来源一多模型很容易只挑一个，那是静默漏采"""
+
+    def _sources(self):
+        return [
+            {"id": "src_a", "name": "论坛A"},
+            {"id": "src_b", "name": "社媒B"},
+        ]
+
+    def _resolve(self, desc, plan_actions):
+        from app.models import PlanStep
+        from app.services.orchestrator import _resolve_sources
+        plan = [PlanStep(action=a, params=p) for a, p in plan_actions]
+        return _resolve_sources({"description": desc}, plan, self._sources())
+
+    def test_all_sources_wording_expands_regardless_of_llm(self):
+        plan, warns = self._resolve(
+            "采集所有来源，翻译，导出Excel",
+            [("collect", {"source_id": "src_a"}), ("translate", {}), ("generate_excel", {})],
+        )
+        assert [s.params["source_id"] for s in plan if s.action == "collect"] == ["src_a", "src_b"]
+        assert any("漏掉" in w for w in warns)
+        # 非 collect 步骤保持原有顺序，跟在 collect 后面
+        assert [s.action for s in plan] == ["collect", "collect", "translate", "generate_excel"]
+
+    def test_named_single_source_is_respected(self):
+        plan, warns = self._resolve("只采集论坛A", [("collect", {"source_id": "src_a"})])
+        assert [s.params["source_id"] for s in plan] == ["src_a"]
+        assert warns == []
+
+    def test_hallucinated_source_id_is_ignored_with_warning(self):
+        plan, warns = self._resolve("采集数据", [("collect", {"source_id": "src_不存在"})])
+        assert any("编造" in w for w in warns)
+        # 一个有效来源都没给出时全采，比静默不采安全
+        assert len(plan) == 2
+
+    def test_override_fails_loudly_instead_of_substituting(self):
+        """用户临时贴的链接不能拿已注册来源顶替 —— 那是答非所问，报告里还看不出来"""
+        import pytest
+        with pytest.raises(Exception) as e:
+            self._resolve("采集 https://example.com/thread/1", [("collect", {"override": "https://example.com/thread/1"})])
+        assert "数据源" in str(e.value)
+
+    def test_plan_without_collect_is_untouched(self):
+        plan, warns = self._resolve("翻译已有数据", [("translate", {}), ("generate_excel", {})])
+        assert [s.action for s in plan] == ["translate", "generate_excel"]
+        assert warns == []
+
+
 class TestTimestampNormalizationEndToEnd:
     """时间戳格式转换：荷兰 dd-mm-yyyy → yyyy-mm-dd"""
 
@@ -266,10 +401,12 @@ class TestExcelGenerationEndToEnd:
         assert "统计信息" in wb.sheetnames
 
         ws = wb["论坛帖子翻译"]
-        assert ws.cell(1, 1).value == "序号"
+        assert [ws.cell(1, c).value for c in range(1, 9)] == [
+            "序号", "来源", "层级", "用户名", "发布时间", "原文", "中文翻译", "页码",
+        ]
         assert ws.cell(2, 1).value == 1
-        assert ws.cell(2, 2).value == "TestUser"
-        assert ws.cell(2, 5).value == "Test translation"
+        assert ws.cell(2, 4).value == "TestUser"
+        assert ws.cell(2, 7).value == "Test translation"
 
     def test_generate_excel_without_stats(self):
         from app.services.excel_service import ExcelService
@@ -288,21 +425,68 @@ class TestExcelGenerationEndToEnd:
         assert "统计信息" not in wb.sheetnames
 
 
-class TestThreadIdExtractionEndToEnd:
-    """帖子 ID 提取"""
+class TestPostKeyEndToEnd:
+    """跨来源索引键：指纹不含来源，键必须带上，否则两个平台的帖子会互相覆盖"""
 
-    def _extract(self, desc, plan=None):
-        from app.services.orchestrator import _extract_thread_id
-        return _extract_thread_id({"description": desc, "plan": plan or []})
+    def test_same_fingerprint_different_sources_do_not_collide(self):
+        from app.services.post_tree import post_key
+        a = {"source": "src_aaa", "fingerprint": "deadbeefdeadbeef"}
+        b = {"source": "src_bbb", "fingerprint": "deadbeefdeadbeef"}
+        assert post_key(a) != post_key(b)
 
-    def test_from_description(self):
-        assert self._extract("抓取帖子2336074的所有内容") == 2336074
+    def test_legacy_posts_without_source_fall_back_to_tweakers(self):
+        """历史数据没有 source 字段，缺省填 tweakers 才能和既有落盘数据对上"""
+        from app.services.post_tree import post_key
+        assert post_key({"fingerprint": "abc123"}) == "tweakers:abc123"
+        assert post_key({"source": "", "fingerprint": "abc123"}) == "tweakers:abc123"
 
-    def test_from_plan_scrape_step(self):
-        assert self._extract("翻译数据", [{"action": "scrape", "params": {"thread_id": 2336074}}]) == 2336074
+    def test_merge_by_key_does_not_leak_across_sources(self):
+        from app.services.orchestrator import _merge_by_fingerprint
+        source_posts = [
+            {"source": "src_a", "fingerprint": "ff", "content": "A 的帖子"},
+            {"source": "src_b", "fingerprint": "ff", "content": "B 的帖子"},
+        ]
+        translated = [{"source": "src_a", "fingerprint": "ff", "content": "A 的帖子", "translation": "只属于A"}]
+        merged = _merge_by_fingerprint(source_posts, translated)
+        assert merged[0]["translation"] == "只属于A"
+        assert "translation" not in merged[1]
 
-    def test_no_match_returns_zero(self):
-        assert self._extract("帮助翻译帖子") == 0
+
+class TestPostTreeEndToEnd:
+    """扁平数组 → 出口组树。存储层不动，8 处依赖扁平结构的逻辑一行不改"""
+
+    def _posts(self):
+        return [
+            {"source": "s", "fingerprint": "root1", "content": "主贴1"},
+            {"source": "s", "fingerprint": "c1", "parent_fingerprint": "root1", "content": "评论1"},
+            {"source": "s", "fingerprint": "c2", "parent_fingerprint": "c1", "content": "评论1的回复"},
+            {"source": "s", "fingerprint": "root2", "content": "主贴2"},
+        ]
+
+    def test_build_tree_groups_children_under_parents(self):
+        from app.services.post_tree import build_tree, post_key
+        roots, children = build_tree(self._posts())
+        assert [r["fingerprint"] for r in roots] == ["root1", "root2"]
+        assert [c["fingerprint"] for c in children[post_key(roots[0])]] == ["c1"]
+
+    def test_orphan_comment_is_kept_as_root(self):
+        """父贴不在本批数据里的评论不能被丢掉 —— 增量只抓到评论那一轮就会这样"""
+        from app.services.post_tree import build_tree
+        roots, _ = build_tree([
+            {"source": "s", "fingerprint": "x", "parent_fingerprint": "不存在的父贴"},
+        ])
+        assert len(roots) == 1
+
+    def test_order_by_thread_is_depth_first_and_fills_level(self):
+        from app.services.post_tree import order_by_thread
+        ordered = order_by_thread(self._posts())
+        assert [p["fingerprint"] for p in ordered] == ["root1", "c1", "c2", "root2"]
+        assert [p["reply_level"] for p in ordered] == [0, 1, 2, 0]
+
+    def test_pure_forum_data_is_returned_untouched(self):
+        from app.services.post_tree import order_by_thread
+        posts = [{"fingerprint": "a"}, {"fingerprint": "b"}]
+        assert order_by_thread(posts) is posts
 
 
 class TestFingerprintGenerationEndToEnd:
@@ -687,6 +871,40 @@ class TestTranslationNumberingStripEndToEnd:
         assert _strip_numbering("[2]. 这块电池不错") == "这块电池不错"
         assert _strip_numbering("3) 这块电池不错") == "这块电池不错"
         assert _strip_numbering("4、这块电池不错") == "这块电池不错"
+
+    def test_bracketed_number_followed_by_newline_removed(self):
+        """请求里的编号就是 [n] 这个形态，模型经常原样抄回来。
+        实测在双来源端到端里印进了 Excel 和结果页。"""
+        from app.services.translator_service import _strip_numbering
+        assert _strip_numbering("[1]\n我使用HYXi Halo已经三个月了") == "我使用HYXi Halo已经三个月了"
+        assert _strip_numbering("[12] 逆变器停机了") == "逆变器停机了"
+
+    def test_bracketed_value_in_text_preserved(self):
+        from app.services.translator_service import _strip_numbering
+        # 方括号里是编号才剥；正文本身以数字开头的照旧保留
+        assert _strip_numbering("15 分钟就装好了") == "15 分钟就装好了"
+
+
+class TestUntranslatedDetectionEndToEnd:
+    """批内混语种时 LLM 有时把一种语言原样吐回来，要能被判成漏译进重译队列"""
+
+    def test_identical_non_chinese_is_flagged(self):
+        from app.services.translator_service import _looks_untranslated
+        assert _looks_untranslated("Firmware update broke my WiFi", "Firmware update broke my WiFi")
+
+    def test_chinese_source_is_not_flagged(self):
+        """原文本来就是中文时「译文==原文」是正确结果，不能拉去重译"""
+        from app.services.translator_service import _looks_untranslated
+        assert not _looks_untranslated("这块电池不错", "这块电池不错")
+
+    def test_real_translation_is_not_flagged(self):
+        from app.services.translator_service import _looks_untranslated
+        assert not _looks_untranslated("固件更新弄坏了我的 WiFi", "Firmware update broke my WiFi")
+
+    def test_empty_translation_is_not_flagged_here(self):
+        """空译文由既有的 [翻译为空] 分支处理，这里不重复判定"""
+        from app.services.translator_service import _looks_untranslated
+        assert not _looks_untranslated("", "Firmware update")
 
 
 class TestIncrementalMergeOrderEndToEnd:
@@ -1297,19 +1515,39 @@ class TestStartPageReachesCollectorJobEndToEnd(_ScraperTmpRoot):
         job = self._execute(params)["job"]
         assert job["params"]["start_page"] == 1, f"起始页没有落到第 1 页: {job['params']}"
 
-    def test_llm_params_cannot_redirect_target_site_or_pacing(self):
-        """base_url / pacing 只认 source，不认 params —— 否则模型能改抓取目标和请求节奏"""
+    def test_pacing_is_not_configurable_at_all(self):
+        """请求节奏是反爬纪律，谁都不能改 —— 塞进 params 也得被忽略"""
         if not _HAS_NODE:
             import pytest
             pytest.skip("未安装 node")
 
         job = self._execute({
             "thread_id": 123,
-            "base_url": "http://evil.example",
             "pacing": {"delay_min": 0, "delay_max": 0},
         })["job"]
-        assert job["base_url"] == "https://gathering.tweakers.net"
         assert job["pacing"] == {"delay_min": 4000, "delay_max": 11000}
+
+    def test_llm_cannot_reach_collector_params_at_all(self):
+        """collect 步骤只把 source_id 交给编排层，LLM 给的其它参数一律不进 job。
+
+        这比「base_url 只认 source」更强：模型现在连一个字段都递不进来。
+        base_url 本身是允许用户在数据源页配的（自建镜像 / 本地验证）。
+        """
+        from app.models import PlanStep
+        from app.services.orchestrator import _resolve_sources
+
+        sources = [{"id": "src_x", "name": "某来源"}]
+        plan, _warns = _resolve_sources(
+            {"description": "采集"},
+            [PlanStep(action="collect", params={
+                "source_id": "src_x",
+                "base_url": "http://evil.example",
+                "thread_id": 999,
+                "pacing": {"delay_min": 0},
+            })],
+            sources,
+        )
+        assert set(plan[0].params) == {"source_id", "source_name"}, plan[0].params
 
 
 _FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
@@ -1390,3 +1628,110 @@ class TestTweakersCollectorGoldenEndToEnd:
         fields = ("username", "timestamp", "content", "page_number", "message_id", "fingerprint")
         for got, want in zip(data["posts"], golden["posts"]):
             assert {k: got.get(k) for k in fields} == {k: want.get(k) for k in fields}
+
+
+class TestGroupFeedCollectorEndToEnd:
+    """真 Chrome + 真 HTTP + 真子进程跑本地小组 fixture：嵌套评论与增量合并"""
+
+    GROUP_ID = "2407063016436085"
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.output = os.path.join(self.tmpdir, "group_feed_out.json")
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _run(self, incremental: bool):
+        import asyncio
+        from app.collectors import get_collector
+        from app.services.collector_runner import CollectorRunner
+        from app.services.progress_manager import ProgressManager
+
+        sys.path.insert(0, _FIXTURES_DIR)
+        from fixture_site import FixtureSite
+
+        collector = get_collector("group_feed")
+        # 输出改到临时目录，不污染项目根
+        collector = type(collector)()
+        collector.output_path = lambda source: self.output
+
+        with FixtureSite() as base_url:
+            source = {
+                "id": "fixture_group",
+                "collector_id": "group_feed",
+                "params": {
+                    "group_id": self.GROUP_ID,
+                    "base_url": base_url,
+                    "headless": True,
+                    "incremental": incremental,
+                },
+                "state_file": os.path.join(self.tmpdir, "state.json"),
+                "pacing": {"delay_min": 200, "delay_max": 400},
+            }
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(
+                    CollectorRunner.execute("group-e2e", collector, source, ProgressManager())
+                )
+            finally:
+                loop.close()
+
+    def _skip_unless_ready(self):
+        import pytest
+        from app.config import settings
+
+        if not _HAS_NODE:
+            pytest.skip("未安装 node")
+        if not os.path.exists(
+            os.path.join(settings.project_root, "node_modules", "playwright", "package.json")
+        ):
+            pytest.skip("项目根目录未安装 playwright")
+
+    def test_nested_comments_are_extracted_with_parent_links(self):
+        self._skip_unless_ready()
+        data = self._run(incremental=False)
+
+        assert data["complete"] is True, f"采集未完成: {data.get('stop_reason')}"
+        posts = data["posts"]
+        roots = [p for p in posts if not p["parent_fingerprint"]]
+        comments = [p for p in posts if p["parent_fingerprint"]]
+        assert len(roots) == 4, [p["username"] for p in roots]
+        assert len(comments) == 4
+
+        # 每条评论的 parent_fingerprint 必须真的指向本批数据里的某个主贴
+        by_fp = {p["fingerprint"]: p for p in posts}
+        for c in comments:
+            assert c["parent_fingerprint"] in by_fp
+            assert by_fp[c["parent_fingerprint"]]["parent_fingerprint"] is None
+            assert c["reply_level"] == 1
+
+        # 空用户名要落到兜底命名，不能是空字符串
+        assert all(p["username"] for p in posts)
+        # 时间统一成落盘格式 dd-mm-yyyy HH:MM
+        assert posts[0]["timestamp"] == "02-06-2026 09:14"
+
+    def test_incremental_rerun_keeps_translations(self):
+        """增量重跑绝不能整体覆盖旧文件。
+
+        落盘文件同时承载 translation 和 _processed 标记，覆盖等于把已翻译的帖子
+        重新变成新帖 —— 下一轮再付一次翻译钱，舆情也重算一遍。
+        """
+        self._skip_unless_ready()
+        self._run(incremental=False)
+
+        # 模拟翻译步骤写回：给第一条挂上译文和已处理标记
+        with open(self.output, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        first_fp = data["posts"][0]["fingerprint"]
+        data["posts"][0]["translation"] = "我已经用了三个月"
+        data["posts"][0]["_processed"] = {"translated": True}
+        with open(self.output, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+
+        again = self._run(incremental=True)
+
+        assert len(again["posts"]) == 8, "增量重跑后帖子数变了，说明历史数据被覆盖"
+        kept = next(p for p in again["posts"] if p["fingerprint"] == first_fp)
+        assert kept["translation"] == "我已经用了三个月", "译文被增量重跑抹掉了"
+        assert kept["_processed"]["translated"] is True, "_processed 标记被抹掉了"

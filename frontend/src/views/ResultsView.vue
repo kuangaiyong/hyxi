@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useTaskStore } from '@/stores/task'
 import { useToast } from '@/composables/useToast'
 import { downloadFile } from '@/utils/download'
+import type { PostData } from '@/types/result'
 
 const route = useRoute()
 const router = useRouter()
@@ -22,6 +23,17 @@ const isSearching = ref(false)
 const totalPages = computed(() =>
   Math.ceil(taskStore.postsTotal / taskStore.pageSize)
 )
+
+/** 后端按主贴分页并把评论挂在 replies 里，表格渲染成一行一条，靠 reply_level 缩进 */
+const flatPosts = computed(() => {
+  const out: PostData[] = []
+  const walk = (p: PostData) => {
+    out.push(p)
+    ;(p.replies || []).forEach(walk)
+  }
+  taskStore.posts.forEach(walk)
+  return out
+})
 
 onMounted(async () => {
   taskStore.currentTaskId = taskId.value
@@ -213,35 +225,43 @@ function getStatusText(): string {
             @click="handleSearchClear"
           >清除</button>
         </div>
-        <span class="text-sm text-secondary">共 {{ taskStore.postsTotal }} 条帖子</span>
+        <span class="text-sm text-secondary">共 {{ taskStore.postsTotal }} 个主贴</span>
       </div>
       <table class="data-table">
         <thead>
           <tr>
             <th class="col-narrow">#</th>
+            <th class="col-medium">来源</th>
             <th class="col-medium">用户</th>
             <th class="col-medium">时间</th>
-            <th class="col-wide">原文（荷兰语）</th>
+            <th class="col-wide">原文</th>
             <th class="col-wide">中文翻译</th>
             <th class="col-narrow">页</th>
           </tr>
         </thead>
         <tbody>
-          <tr
-            v-for="post in taskStore.posts"
-            :key="post.index"
-            @click="viewDetail(post)"
-            style="cursor: pointer;"
-          >
-            <td class="col-narrow">{{ post.index }}</td>
-            <td class="col-medium">
-              <strong>{{ post.username }}</strong>
-            </td>
-            <td class="col-medium text-sm text-secondary">{{ post.timestamp }}</td>
-            <td class="col-wide">{{ formatContent(post.content) }}</td>
-            <td class="col-wide">{{ formatContent(post.translation) }}</td>
-            <td class="col-narrow">{{ post.page_number }}</td>
-          </tr>
+          <!-- 评论跟着父贴走：分页粒度是主贴，一个主贴的评论不会被切在两页之间 -->
+          <template v-for="post in flatPosts" :key="post.source + post.index">
+            <tr
+              @click="viewDetail(post)"
+              style="cursor: pointer;"
+              :style="{
+                background: post.matched ? 'var(--warning-bg, #FEF3C7)' : undefined,
+              }"
+            >
+              <td class="col-narrow">{{ post.index }}</td>
+              <td class="col-medium text-sm text-secondary">{{ post.source_name }}</td>
+              <td class="col-medium">
+                <span v-if="post.reply_level" class="text-secondary"
+                  :style="{ paddingLeft: (post.reply_level - 1) * 14 + 'px' }">└─ </span>
+                <strong>{{ post.username }}</strong>
+              </td>
+              <td class="col-medium text-sm text-secondary">{{ post.timestamp }}</td>
+              <td class="col-wide">{{ formatContent(post.content) }}</td>
+              <td class="col-wide">{{ formatContent(post.translation) }}</td>
+              <td class="col-narrow">{{ post.page_number }}</td>
+            </tr>
+          </template>
         </tbody>
       </table>
 
@@ -288,7 +308,7 @@ function getStatusText(): string {
         </div>
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
           <div>
-            <div class="form-label">原文（荷兰语）</div>
+            <div class="form-label">原文</div>
             <div style="white-space: pre-wrap; font-size: 13px; line-height: 1.6; max-height: 50vh; overflow-y: auto;">
               {{ detailPost?.content || '(空)' }}
             </div>

@@ -21,10 +21,11 @@ const filterStatus = ref('')
 const filterKeyword = ref('')
 const confirmDelete = ref<string | null>(null)
 
+// 采集目标由「数据源」页管理，任务描述里不再出现帖子 ID
 const quickActions = [
-  { label: '抓取+翻译+舆情', icon: '📊', text: '抓取帖子2336074所有页面，翻译成中文，导出Excel，分析舆情' },
-  { label: '仅抓取+翻译', icon: '🔄', text: '抓取帖子2336074的所有内容，翻译成中文，导出Excel报告' },
-  { label: '翻译已有数据', icon: '🌐', text: '翻译已有的2336074数据，生成Excel' },
+  { label: '全部来源+翻译+舆情', icon: '📊', text: '采集所有来源的帖子，翻译成中文，导出Excel，分析舆情' },
+  { label: '全部来源+翻译', icon: '🔄', text: '采集所有来源的帖子，翻译成中文，导出Excel报告' },
+  { label: '翻译已有数据', icon: '🌐', text: '翻译已采集的数据，生成Excel' },
 ]
 
 onMounted(() => {
@@ -70,9 +71,15 @@ function shortDesc(d: string): string {
   return d.length > 35 ? d.slice(0, 35) + '...' : d
 }
 
-function extractThreadId(desc: string): string {
-  const m = desc.match(/(\d{5,})/)
-  return m ? m[1] : '-'
+/** 采集了哪些来源。跑完看 result.sources，跑之前看 plan 里 collect 步骤的 source_name */
+function taskSources(task: any): string {
+  const done = (task.result?.sources || []).map((s: any) => s.name)
+  if (done.length) return done.join('、')
+  const planned = (task.plan || [])
+    .filter((s: any) => s.action === 'collect')
+    .map((s: any) => s.params?.source_name)
+    .filter(Boolean)
+  return planned.length ? planned.join('、') : '-'
 }
 
 async function handleSubmit() {
@@ -219,7 +226,7 @@ async function retryTask(taskId: string) {
             <th style="width: 44px; text-align: center;">#</th>
             <th>任务描述</th>
             <th style="width: 80px; text-align: center;">状态</th>
-            <th style="width: 72px; text-align: center;">帖子</th>
+            <th style="width: 120px; text-align: center;">来源</th>
             <th style="width: 140px; text-align: center;">时间</th>
             <th style="width: 80px; text-align: center;">步骤</th>
             <th style="width: 120px; text-align: center;">操作</th>
@@ -237,8 +244,8 @@ async function retryTask(taskId: string) {
             <td style="text-align: center;">
               <span class="badge" :class="'badge-' + task.status">{{ statusLabel(task.status) }}</span>
             </td>
-            <td style="text-align: center; font-size: 12px; font-family: monospace;">
-              {{ extractThreadId(task.description) }}
+            <td class="text-sm text-secondary" style="text-align: center;">
+              {{ taskSources(task) }}
             </td>
             <td class="text-sm text-secondary" style="text-align: center;">{{ formatTime(task.created_at) }}</td>
             <td style="text-align: center; font-size: 12px;">

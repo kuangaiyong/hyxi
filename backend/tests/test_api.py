@@ -272,7 +272,10 @@ class TestSourcesAPIEndToEnd:
         assert resp.status_code == 200
         tweakers = next(c for c in resp.json() if c["id"] == "tweakers")
         assert tweakers["needs_credentials"] is False
-        assert [f["name"] for f in tweakers["param_fields"]] == ["thread_id"]
+        assert [f["name"] for f in tweakers["param_fields"]] == ["thread_id", "base_url"]
+        assert [f["required"] for f in tweakers["param_fields"]] == [True, False]
+        group = next(c for c in resp.json() if c["id"] == "group_feed")
+        assert group["incremental_strategy"] == "watermark"
 
     def test_source_crud(self):
         resp = self._create(name="Tweakers 主帖")
@@ -309,10 +312,10 @@ class TestSourcesAPIEndToEnd:
         """params 会原样进 job 文件，未声明的键不能借这条路塞进采集脚本"""
         resp = self.client.post("/api/v1/sources", json={
             "collector_id": "tweakers", "name": "夹带私货",
-            "params": {"thread_id": "2336074", "base_url": "https://evil.test"},
+            "params": {"thread_id": "2336074", "pacing": {"delay_min": 0}, "headless": False},
         })
         assert resp.status_code == 201
-        assert "base_url" not in resp.json()["params"]
+        assert set(resp.json()["params"]) == {"thread_id"}
         self.client.delete(f"/api/v1/sources/{resp.json()['id']}")
 
     def test_credential_never_leaves_backend_and_is_encrypted_at_rest(self):
@@ -446,6 +449,149 @@ class TestSourcesAPIEndToEnd:
 
         source_service.seed_default_sources()
         assert len(self.client.get("/api/v1/sources").json()) == 1
+
+
+class TestNestedPostsApiEndToEnd:
+    """嵌套评论的出口：真实 HTTP 请求打到真实落盘的采集结果上"""
+
+    @classmethod
+    def setup_class(cls):
+        import app.config as cfg
+
+        cls.cfg = cfg
+        cls._old_api_key = cfg.settings.api_key
+        cfg.settings.api_key = ""
+
+        from main import app
+        from app.services import storage
+
+        cls.tmpdir = tempfile.mkdtemp()
+        cls.storage = storage
+        cls._old_db_path = storage.DB_PATH
+        storage.DB_PATH = os.path.join(cls.tmpdir, "hyxi.db")
+        storage.init_db()
+        cls.client = TestClient(app)
+
+        # 两个来源各自落一份真实结构的数据文件：论坛（无评论）+ 小组（主贴带评论）
+        cls.forum_path = os.path.join(cls.tmpdir, "forum.json")
+        cls.group_path = os.path.join(cls.tmpdir, "group.json")
+        forum = [
+            {"username": f"用户{i}", "timestamp": "22-05-2026 17:0{}".format(i),
+             "content": f"论坛帖子{i}", "translation": "", "page_number": 1,
+             "fingerprint": f"f{i}", "source": "src_forum",
+             "parent_fingerprint": None, "reply_level": 0}
+            for i in range(3)
+        ]
+        group = []
+        for i in range(2):
+            root_fp = f"g{i}"
+            group.append({
+                "username": f"楼主{i}", "timestamp": "02-06-2026 09:1{}".format(i),
+                "content": f"小组主贴{i}", "translation": "", "page_number": 1,
+                "fingerprint": root_fp, "source": "src_group",
+                "parent_fingerprint": None, "reply_level": 0,
+            })
+            for j in range(2):
+                group.append({
+                    "username": f"回复者{i}{j}", "timestamp": "02-06-2026 10:0{}".format(j),
+                    "content": f"评论{i}{j} 独特词{i}{j}", "translation": "", "page_number": 1,
+                    "fingerprint": f"g{i}c{j}", "source": "src_group",
+                    "parent_fingerprint": root_fp, "reply_level": 1,
+                })
+        for path, posts in ((cls.forum_path, forum), (cls.group_path, group)):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"total_pages": 1, "posts": posts}, f, ensure_ascii=False)
+
+        # 任务里记下来源与落盘路径，之后删掉数据源也还能读回来
+        cls.task_id = "nested-e2e"
+        from app.services.orchestrator import orchestrator
+        orchestrator.tasks[cls.task_id] = {
+            "id": cls.task_id, "status": "completed", "description": "嵌套出口",
+            "plan": [], "logs": [], "progress": 1.0, "current_step": None,
+            "result": {
+                "total_posts": len(forum) + len(group),
+                "sources": [
+                    {"id": "src_forum", "name": "论坛来源", "collector_id": "tweakers",
+                     "output_path": cls.forum_path, "post_count": len(forum)},
+                    {"id": "src_group", "name": "小组来源", "collector_id": "group_feed",
+                     "output_path": cls.group_path, "post_count": len(group)},
+                ],
+            },
+        }
+        cls.orchestrator = orchestrator
+
+    @classmethod
+    def teardown_class(cls):
+        cls.cfg.settings.api_key = cls._old_api_key
+        cls.storage.DB_PATH = cls._old_db_path
+        cls.orchestrator.tasks.pop(cls.task_id, None)
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _posts(self, **params):
+        return self.client.get(f"/api/v1/tasks/{self.task_id}/posts", params=params).json()
+
+    def test_pagination_counts_root_posts_only(self):
+        """分页粒度是主贴，评论跟着父贴走，不会被分页边界切断"""
+        data = self._posts(page_size=200)
+        assert data["total"] == 5          # 论坛 3 + 小组 2 个主贴
+        assert len(data["posts"]) == 5
+        with_replies = [p for p in data["posts"] if p["replies"]]
+        assert len(with_replies) == 2
+        assert all(len(p["replies"]) == 2 for p in with_replies)
+        assert all(r["reply_level"] == 1 for p in with_replies for r in p["replies"])
+
+    def test_index_is_absolute_and_never_overlaps_across_pages(self):
+        """index 是扁平存储数组里的真实位置，舆情详情靠它做绝对对齐。
+
+        一页只保证 page_size 个主贴，带上评论后条目数会超出 —— 按页内计数编号
+        会让相邻两页的 index 区间重叠，详情弹窗于是显示错帖子。
+        """
+        page1 = self._posts(page=1, page_size=4)
+        page2 = self._posts(page=2, page_size=4)
+
+        def all_indices(payload):
+            out = []
+            def walk(p):
+                out.append(p["index"])
+                for c in p["replies"]:
+                    walk(c)
+            for p in payload["posts"]:
+                walk(p)
+            return out
+
+        i1, i2 = all_indices(page1), all_indices(page2)
+        assert len(i1) == 6, i1          # 论坛 3 + 小组主贴1 及其 2 条评论
+        assert not (set(i1) & set(i2)), f"两页的 index 重叠了: {i1} vs {i2}"
+        assert sorted(i1 + i2) == list(range(1, 10))
+
+        # index 必须能直接反查到同一条帖子
+        detail = self.client.get(
+            f"/api/v1/tasks/{self.task_id}/posts/{i1[-1] - 1}"
+        ).json()
+        flat = [p for p in page1["posts"] for p in [p] + p["replies"]]
+        assert detail["content"] == flat[-1]["content"]
+
+    def test_search_hit_on_comment_brings_back_its_root(self):
+        data = self._posts(search="独特词10")
+        assert data["total"] == 1
+        root = data["posts"][0]
+        assert root["matched"] is False, "父贴本身没命中，不该标 matched"
+        assert root["content"] == "小组主贴1"
+        hits = [r for r in root["replies"] if r["matched"]]
+        assert [h["content"] for h in hits] == ["评论10 独特词10"]
+        # 兄弟评论也一并返回，保住上下文
+        assert len(root["replies"]) == 2
+
+    def test_results_survive_source_deletion(self):
+        """用户在数据源页删掉来源后，历史任务的结果不能静默变成空白"""
+        # 这两个来源本来就没注册过（DB 是空的），等价于「已被删除」
+        assert self.client.get("/api/v1/sources").json() == []
+        data = self._posts(page_size=200)
+        assert data["total"] == 5
+        assert {p["source_name"] for p in data["posts"]} == {"论坛来源", "小组来源"}
+
+        stats = self.client.get(f"/api/v1/tasks/{self.task_id}/stats").json()
+        assert stats["total_posts"] == 9
 
 
 class TestApiKeyAuthEndToEnd:

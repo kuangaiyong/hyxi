@@ -3,13 +3,14 @@
 import os
 import re
 import json
-import glob
 from collections import Counter
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 from app.models import PostsResponse, PostData, TaskStats
 from app.config import settings
-from app.services.orchestrator import orchestrator
+from app.services import source_service
+from app.services.post_tree import build_tree, order_by_thread, post_key
+from app.services.orchestrator import orchestrator, _load_posts_from_sources
 
 router = APIRouter(prefix="/api/v1/tasks/{task_id}", tags=["结果"])
 
@@ -39,42 +40,63 @@ def _get_task_or_404(task_id: str):
 
 
 def _load_posts_from_json(task: dict) -> list:
-    """从 JSON 文件加载帖子数据"""
-    # 方法1: 从任务 plan 中找 thread_id（包括 translate/generate_excel 步骤）
-    thread_id = None
-    plan = task.get("plan", [])
-    for step in plan:
-        tid = step.get("params", {}).get("thread_id")
-        if tid:
-            thread_id = tid
-            break
+    """从各数据源已落盘的 JSON 兜底加载。
 
-    # 方法2: 从任务描述中提取
-    if not thread_id:
-        desc = task.get("description", "")
-        match = re.search(r"(\d{5,})", desc)
-        if match:
-            thread_id = int(match.group(1))
+    不再靠猜 thread_id、也不再 glob `tweakers_thread_*.json` —— 文件名只有
+    `Collector.output_path()` 一个来源。任务里记了采过哪些源就只读那几个，
+    没记（比如任务还没跑完）就退回全部已注册的源。
+    """
+    recorded = (task.get("result") or {}).get("sources", [])
+    if not recorded:
+        posts, _meta = _load_posts_from_sources(source_service.list_sources())
+        return posts
 
-    # 方法3: 扫描项目根目录下的 tweakers_thread_*.json
-    if not thread_id:
-        json_files = glob.glob(os.path.join(settings.project_root, "tweakers_thread_*.json"))
-        if json_files:
-            json_files.sort(key=os.path.getmtime, reverse=True)
-            thread_id_match = re.search(r"tweakers_thread_(\d+)\.json", json_files[0])
-            if thread_id_match:
-                thread_id = int(thread_id_match.group(1))
+    registered = {s["id"]: s for s in source_service.list_sources()}
+    posts = []
+    for entry in recorded:
+        sid = entry.get("id")
+        source = registered.get(sid)
+        if source:
+            mine, _meta = _load_posts_from_sources([source])
+            posts.extend(mine)
+            continue
+        # 来源已被用户删除。任务结果里记了当时的落盘路径，照原路读回来 ——
+        # 否则一次「删数据源」会把所有引用它的历史任务结果一起变成空白
+        path = entry.get("output_path")
+        if not path or not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        for p in loaded.get("posts", []):
+            p.setdefault("source", sid)
+        posts.extend(loaded.get("posts", []))
+    return posts
 
-    if not thread_id:
-        return []
 
-    json_path = os.path.join(settings.project_root, f"tweakers_thread_{thread_id}.json")
-    if os.path.exists(json_path):
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data.get("posts", [])
+def _source_names(task: dict = None) -> dict:
+    """来源 id → 显示名。任务里记过的名字兜底，来源被删掉后列名不至于退成一串 id"""
+    names = {s["id"]: s["name"] for s in source_service.list_sources()}
+    for entry in ((task or {}).get("result") or {}).get("sources", []):
+        if entry.get("id"):
+            names.setdefault(entry["id"], entry.get("name") or entry["id"])
+    return names
 
-    return []
+
+def _to_post_data(post: dict, index: int, names: dict, matched: bool = False) -> PostData:
+    return PostData(
+        index=index,
+        username=post.get("username", ""),
+        timestamp=_normalize_timestamp(post.get("timestamp", "")),
+        content=post.get("content", ""),
+        translation=post.get("translation", ""),
+        page_number=post.get("page_number", 1),
+        source=post.get("source", ""),
+        source_name=names.get(post.get("source", ""), post.get("source", "")),
+        reply_level=int(post.get("reply_level", 0) or 0),
+        matched=matched,
+    )
+
+
 
 
 @router.get("/posts", response_model=PostsResponse)
@@ -84,41 +106,65 @@ async def get_posts(
     page_size: int = Query(50, ge=1, le=200),
     search: str = Query("", description="搜索关键词（匹配用户名、原文、翻译）"),
 ):
-    """获取分页帖子结果，支持全文搜索"""
+    """获取分页帖子结果，支持全文搜索。
+
+    分页粒度是**主贴**，评论挂在 replies 里跟着父贴走 —— 按扁平条数分页会把一个
+    主贴的评论切在两页之间。搜索命中评论时连整棵子树一起返回，命中项带 matched=true，
+    否则吐出来的是一堆没有上下文的孤儿评论。
+    """
     task = _get_task_or_404(task_id)
 
-    # 优先从内存，fallback 到 JSON 文件
+    # 优先从内存，fallback 到各数据源落盘的 JSON
     posts = (task.get("result") or {}).get("posts") or []
     if not posts:
         posts = _load_posts_from_json(task)
 
-    # 全文搜索过滤
+    roots, children = build_tree(posts)
+    hit_keys = set()
+
     if search and search.strip():
         kw = search.strip().lower()
-        posts = [
-            p for p in posts
-            if kw in (p.get("username", "") or "").lower()
-            or kw in (p.get("content", "") or "").lower()
-            or kw in (p.get("translation", "") or "").lower()
-        ]
 
-    total = len(posts)
+        def is_hit(p):
+            return (kw in (p.get("username", "") or "").lower()
+                    or kw in (p.get("content", "") or "").lower()
+                    or kw in (p.get("translation", "") or "").lower())
+
+        hit_keys = {post_key(p) for p in posts if is_hit(p)}
+        # 命中项所属的主贴：沿 children 反查，命中评论时保留整棵子树
+        parent_of = {
+            post_key(c): parent for parent, kids in children.items() for c in kids
+        }
+        kept_roots = set()
+        for key in hit_keys:
+            cur = key
+            while cur in parent_of:
+                cur = parent_of[cur]
+            kept_roots.add(cur)
+        roots = [r for r in roots if post_key(r) in kept_roots]
+
+    total = len(roots)
     start = (page - 1) * page_size
-    end = start + page_size
-    page_posts = posts[start:end]
+    page_roots = roots[start:start + page_size]
 
-    items = [
-        PostData(
-            index=i + 1,
-            username=p.get("username", ""),
-            timestamp=_normalize_timestamp(p.get("timestamp", "")),
-            content=p.get("content", ""),
-            translation=p.get("translation", ""),
-            page_number=p.get("page_number", 1),
+    # index 取的是**扁平存储数组里的真实位置**（1-based），不是页内序号：
+    # 舆情结果数组的下标就是这个位置（orchestrator 用 enumerate(all_posts) 建的），
+    # SentimentView 靠 index-1 反查帖子。按页内计数编号的话，只要某页的主贴带了评论，
+    # 该页吐出的条目数就超过 page_size，相邻两页的 index 区间会重叠、后续全部错位，
+    # 详情弹窗于是显示错帖子。
+    index_of = {post_key(p): i + 1 for i, p in enumerate(posts)}
+
+    names = _source_names(task)
+
+    def build(post) -> PostData:
+        item = _to_post_data(
+            post, index_of.get(post_key(post), 0), names,
+            matched=bool(hit_keys) and post_key(post) in hit_keys,
         )
-        for i, p in enumerate(page_posts, start=start)
-    ]
+        item.replies = [build(c) for c in children.get(post_key(post), [])]
+        return item
 
+    items = [build(r) for r in page_roots]
     return PostsResponse(posts=items, total=total, page=page, page_size=page_size)
 
 
@@ -134,15 +180,7 @@ async def get_post_detail(task_id: str, post_index: int):
     if post_index < 0 or post_index >= len(posts):
         raise HTTPException(status_code=404, detail="帖子不存在")
 
-    p = posts[post_index]
-    return PostData(
-        index=post_index + 1,
-        username=p.get("username", ""),
-        timestamp=_normalize_timestamp(p.get("timestamp", "")),
-        content=p.get("content", ""),
-        translation=p.get("translation", ""),
-        page_number=p.get("page_number", 1),
-    )
+    return _to_post_data(posts[post_index], post_index + 1, _source_names(task))
 
 
 @router.get("/stats", response_model=TaskStats)
@@ -205,10 +243,14 @@ async def export_csv(task_id: str):
     from io import StringIO
     output = StringIO()
     writer = csv.writer(output)
-    writer.writerow(["序号", "用户名", "时间", "原文", "中文翻译", "页码"])
-    for i, p in enumerate(posts, 1):
+    names = _source_names(task)
+    writer.writerow(["序号", "来源", "层级", "用户名", "时间", "原文", "中文翻译", "页码"])
+    for i, p in enumerate(order_by_thread(posts), 1):
+        sid = p.get("source", "")
         writer.writerow([
             i,
+            names.get(sid, sid),
+            int(p.get("reply_level", 0) or 0),
             p.get("username", ""),
             _normalize_timestamp(p.get("timestamp", "")),
             p.get("content", ""),

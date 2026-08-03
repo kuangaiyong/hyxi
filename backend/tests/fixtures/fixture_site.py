@@ -9,18 +9,26 @@ import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SITE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tweakers_site")
+FIXTURE_DIR = os.path.dirname(os.path.abspath(__file__))
+SITE_DIR = os.path.join(FIXTURE_DIR, "tweakers_site")
+GROUP_SITE_DIR = os.path.join(FIXTURE_DIR, "group_site")
 
 _PATH_RE = re.compile(r"^/forum/list_messages/\d+/(\d+)/?$")
+# 第二个站点：结构与论坛完全不同（主贴 + 嵌套评论，按批次翻页）
+_GROUP_RE = re.compile(r"^/groups/\d+/batch/(\d+)/?$")
 
 
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         match = _PATH_RE.match(self.path)
-        if not match:
+        group_match = _GROUP_RE.match(self.path)
+        if match:
+            page_file = os.path.join(SITE_DIR, "page_{}.html".format(match.group(1)))
+        elif group_match:
+            page_file = os.path.join(GROUP_SITE_DIR, "batch_{}.html".format(group_match.group(1)))
+        else:
             self.send_error(404)
             return
-        page_file = os.path.join(SITE_DIR, "page_{}.html".format(match.group(1)))
         if not os.path.exists(page_file):
             self.send_error(404)
             return

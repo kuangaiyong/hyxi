@@ -16,8 +16,9 @@ logger = logging.getLogger("hyxi.translator")
 # 批量翻译时每次 LLM 调用处理的帖子数量
 BATCH_SIZE = 5
 
-TRANSLATION_SYSTEM_PROMPT = """你是一位精通荷兰语和中文的新能源光储行业专业翻译专家。
-你的任务是将荷兰语论坛帖子翻译成中文，需要特别注意：
+TRANSLATION_SYSTEM_PROMPT = """你是一位精通荷兰语、英语和中文的新能源光储行业专业翻译专家。
+你的任务是将论坛与社交媒体帖子翻译成中文。源文本可能是荷兰语或英语，同一批次内可能混杂，
+请自动识别语种并统一译为中文；已经是中文的原样返回。需要特别注意：
 
 1. **行业术语准确**：
    - thuisbatterij / thuisaccu → 家用储能电池
@@ -44,15 +45,30 @@ TRANSLATION_SYSTEM_PROMPT = """你是一位精通荷兰语和中文的新能源�
    - 产品名称（如 HYXi Halo）保持原样
    - 保留 URL 链接
 
-4. 输入是一段荷兰语文本，直接输出对应的中文翻译，不要添加任何解释或前缀"""
+4. 输入是一段外文文本，直接输出对应的中文翻译，不要添加任何解释或前缀"""
 
 
 def _strip_numbering(text: str) -> str:
-    """剥掉 LLM 可能带上的「1. 」「[2] 」「3) 」编号前缀。
+    """剥掉 LLM 可能带上的「1. 」「[2]. 」「3) 」「[1]\\n」编号前缀。
 
-    必须带分隔符才算编号，否则会吞掉正文开头的真实数值（如「5 kWh 就够了」）。
+    裸数字必须带分隔符才算编号，否则会吞掉正文开头的真实数值（如「5 kWh 就够了」）；
+    方括号本身就是分隔符，`[1]` 后面直接换行也要剥 —— 请求里的编号就是这个形态，
+    模型经常原样抄回来，不剥就会印进 Excel 和结果页。
     """
-    return re.sub(r'^\[?\d+\]?[\.\)、]\s*', '', text)
+    return re.sub(r'^(?:\[?\d+\]?[\.\)、]|\[\d+\])\s*', '', text)
+
+
+def _has_cjk(text: str) -> bool:
+    return any('一' <= ch <= '鿿' for ch in text)
+
+
+def _looks_untranslated(translation: str, content: str) -> bool:
+    """译文与原文一字不差、且原文本来就不是中文 —— 判定为漏译。
+
+    只在完全相同时才判，避免把「HYXi Halo 5 kWh」这类本就该原样保留的短内容误判。
+    """
+    t, c = translation.strip(), content.strip()
+    return bool(t) and t == c and not _has_cjk(c)
 
 
 class TranslatorService:
@@ -64,14 +80,19 @@ class TranslatorService:
         posts: list,
         params: dict,
         progress: ProgressManager,
+        step_index: int = 1,
     ) -> dict:
-        """执行 LLM 翻译"""
+        """执行 LLM 翻译。
+
+        step_index 不能再写死 1 —— plan 里有多个 collect 步骤时翻译就不在第 2 位了，
+        写死会让前端把进度画到别的步骤上。
+        """
         total = len(posts)
         source_lang = params.get("source_lang", "nl")
         target_lang = params.get("target_lang", "zh-CN")
 
         await progress.emit(task_id, "step_progress", {
-            "step": 1,
+            "step": step_index,
             "progress": 0.0,
             "message": f"正在使用 LLM 翻译 {total} 条帖子 ({source_lang} → {target_lang})...",
         })
@@ -109,7 +130,7 @@ class TranslatorService:
                     texts_for_batch.append(truncated)
 
                 # 构建消息：一次发送多条待翻译文本
-                user_message = "请将以下荷兰语论坛帖子翻译成中文，每条翻译之间用 '---POST_SEPARATOR---' 分隔，保持顺序：\n\n"
+                user_message = "请将以下帖子翻译成中文（荷兰语或英语，逐条识别），每条翻译之间用 '---POST_SEPARATOR---' 分隔，保持顺序：\n\n"
                 for i, text in enumerate(texts_for_batch):
                     user_message += f"[{i + 1}]\n{text}\n\n"
 
@@ -158,7 +179,7 @@ class TranslatorService:
                 translated_count = batch_start + len(batch_indices)
                 pct = translated_count / total_non_empty if total_non_empty > 0 else 1.0
                 await progress.emit(task_id, "step_progress", {
-                    "step": 1,
+                    "step": step_index,
                     "progress": min(pct, 0.99),
                     "message": f"已翻译 {translated_count}/{total_non_empty} 条 ({success_count} 成功, {fail_count} 失败)",
                 })
@@ -167,9 +188,13 @@ class TranslatorService:
                 await asyncio.sleep(1.0)
 
             # ===== 重试失败的翻译 =====
+            # 批内混语种时 LLM 有时会「统一」成一种语言而把另一种原样吐回来。
+            # 译文与原文完全相同且原文非中文 = 漏译，走同一条单条重译队列。
             failed_indices = [
                 i for i, t in enumerate(translations)
-                if t.startswith("[翻译失败") or t.startswith("[翻译为空") or t.startswith("[翻译解析失败")
+                if t.startswith("[翻译失败") or t.startswith("[翻译为空")
+                or t.startswith("[翻译解析失败")
+                or _looks_untranslated(t, posts[i].get("content", ""))
             ]
 
             if failed_indices:
@@ -224,7 +249,7 @@ class TranslatorService:
             posts[i]["translation"] = trans
 
         await progress.emit(task_id, "step_progress", {
-            "step": 1,
+            "step": step_index,
             "progress": 1.0,
             "message": f"LLM 翻译完成: {success_count}/{total} 成功 ({llm.config.model_name})",
         })

@@ -382,6 +382,48 @@ const maxDimCount = computed(() => {
   return Math.max(...dims.map(d => d[1]), 1)
 })
 
+// ===== 按来源对比 =====
+
+const SENTIMENT_COLORS: Record<string, string> = {
+  positive: '#10B981', negative: '#EF4444', neutral: '#94A3B8',
+}
+
+const bySourceRows = computed(() => {
+  const by = data.value?.summary?.by_source
+  if (!by) return []
+  return Object.entries(by).map(([id, b]) => {
+    const total = b.analyzed || 1
+    return {
+      id,
+      name: b.name || id,
+      analyzed: b.analyzed,
+      avg_intensity: b.avg_intensity,
+      distribution: b.distribution,
+      top_dimensions: b.top_dimensions || [],
+      segments: (['positive', 'negative', 'neutral'] as const)
+        .filter(k => (b.distribution[k] || 0) > 0)
+        .map(k => ({
+          label: k,
+          value: b.distribution[k] || 0,
+          pct: (b.distribution[k] || 0) / total * 100,
+          color: SENTIMENT_COLORS[k],
+        })),
+    }
+  })
+})
+
+const crossSourceRows = computed(() => {
+  const cross = data.value?.summary?.cross_source
+  if (!cross) return []
+  return Object.entries(cross)
+    .map(([name, counts]) => ({
+      name,
+      counts,
+      total: Object.values(counts).reduce((a, b) => a + b, 0),
+    }))
+    .sort((a, b) => b.total - a.total)
+})
+
 // ===== 趋势图数据 =====
 
 const trendData = computed(() => {
@@ -620,6 +662,69 @@ function viewPost(idx: number) {
         </div>
       </div>
 
+      <!-- 按来源对比：单来源任务后端不产出 by_source，整块不渲染 -->
+      <div v-if="bySourceRows.length > 1" class="card">
+        <div class="card-header">🌐 按来源对比</div>
+        <p class="text-secondary text-sm mb-4">
+          不同平台的表达语气基线不同，评分是按平台内部的相对水平判断的，跨平台看趋势而非绝对值。
+        </p>
+        <div style="overflow-x: auto;">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>来源</th>
+                <th style="width: 70px; text-align: center;">已分析</th>
+                <th style="width: 200px;">情感分布</th>
+                <th style="width: 80px; text-align: center;">强度均值</th>
+                <th>主要维度</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in bySourceRows" :key="row.id">
+                <td style="font-weight: 500;">{{ row.name }}</td>
+                <td style="text-align: center;">{{ row.analyzed }}</td>
+                <td>
+                  <div style="display: flex; height: 16px; border-radius: 4px; overflow: hidden;">
+                    <div v-for="seg in row.segments" :key="seg.label"
+                      :title="`${seg.label} ${seg.value} 条`"
+                      :style="{ width: seg.pct + '%', background: seg.color }"></div>
+                  </div>
+                  <div class="text-sm text-secondary" style="margin-top: 2px;">
+                    正 {{ row.distribution.positive }} · 负 {{ row.distribution.negative }} · 中 {{ row.distribution.neutral }}
+                  </div>
+                </td>
+                <td style="text-align: center;">{{ row.avg_intensity }}</td>
+                <td class="text-sm text-secondary">
+                  {{ row.top_dimensions.slice(0, 3).map(d => `${d[0]}(${d[1]})`).join('、') || '-' }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div v-if="crossSourceRows.length" style="margin-top: 16px;">
+          <div class="text-sm" style="font-weight: 600; margin-bottom: 8px;">同一维度在各来源的提及次数</div>
+          <div style="overflow-x: auto;">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>维度</th>
+                  <th v-for="row in bySourceRows" :key="row.id" style="text-align: center;">{{ row.name }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="dim in crossSourceRows" :key="dim.name">
+                  <td>{{ dim.name }}</td>
+                  <td v-for="row in bySourceRows" :key="row.id" style="text-align: center;">
+                    {{ dim.counts[row.id] || 0 }}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
       <!-- 趋势图: 情感随时间变化 -->
       <div v-if="trendData.length > 1" class="card">
         <div class="card-header">📈 情感趋势</div>
@@ -803,7 +908,7 @@ function viewPost(idx: number) {
         <!-- 原文 + 翻译 双栏 -->
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
           <div>
-            <div class="form-label">📄 原文（荷兰语）</div>
+            <div class="form-label">📄 原文</div>
             <div style="white-space: pre-wrap; font-size: 13px; line-height: 1.7; max-height: 40vh; overflow-y: auto; padding: 12px; background: #F8FAFC; border-radius: 8px;">
               {{ detailPost?.content || '(无内容)' }}
             </div>

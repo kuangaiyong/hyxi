@@ -142,13 +142,22 @@ class TaskListResponse(BaseModel):
 # ===== 帖子/结果相关 =====
 
 class PostData(BaseModel):
-    """单条帖子数据"""
+    """单条帖子数据。
+
+    存储层始终是扁平数组，replies 只在出口组装 —— 整条处理链有 8 处假设 posts 是
+    扁平的（增量过滤、指纹合并、翻译下标对齐、舆情绝对索引、Excel、切片……）。
+    """
     index: int
     username: str
     timestamp: str
     content: str
     translation: str = ""
     page_number: int
+    source: str = ""
+    source_name: str = ""
+    reply_level: int = 0
+    matched: bool = False  # 搜索命中标记：带出父贴时用来告诉前端高亮哪几条
+    replies: List["PostData"] = Field(default_factory=list)
 
 
 class PostsResponse(BaseModel):

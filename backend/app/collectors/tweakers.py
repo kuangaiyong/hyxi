@@ -25,6 +25,15 @@ class TweakersCollector(Collector):
             "required": True,
             "placeholder": "例如 2336074",
         },
+        {
+            # 由用户在数据源页填写，不是 LLM 能碰的东西 —— collect 步骤只把 source_id
+            # 交给编排层，模型拿不到任何平台参数。留空即官方站点
+            "name": "base_url",
+            "label": "站点地址（可选）",
+            "type": "text",
+            "required": False,
+            "placeholder": f"留空即 {DEFAULT_BASE_URL}；自建镜像或本地验证时才填",
+        },
     ]
 
     def output_path(self, source: Dict[str, Any]) -> str:
@@ -48,8 +57,9 @@ class TweakersCollector(Collector):
             "output_path": output_path,
             "state_file": source.get("state_file")
             or os.path.join(settings.project_root, ".scraper_state.json"),
-            # base_url / pacing 只从 source 取，不从 params 取：params 里混着 LLM 给的值，
-            # 让模型能改抓取目标和请求节奏等于把反爬纪律交给模型
-            "base_url": source.get("base_url") or DEFAULT_BASE_URL,
+            # base_url 来自用户在界面上录入的 source，pacing 完全不可配 ——
+            # 请求节奏是反爬纪律，谁都不能改
+            "base_url": (source.get("base_url") or params.get("base_url")
+                         or DEFAULT_BASE_URL).rstrip("/"),
             "pacing": source.get("pacing") or {"delay_min": 4000, "delay_max": 11000},
         }

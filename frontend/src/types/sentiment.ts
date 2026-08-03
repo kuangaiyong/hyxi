@@ -6,11 +6,22 @@ export interface SentimentResult {
   dimensions: string[]
 }
 
+export interface SourceBreakdown {
+  name: string
+  distribution: Record<string, number>
+  analyzed: number
+  avg_intensity: number
+  top_dimensions: [string, number][]
+}
+
 export interface SentimentSummary {
   sentiment_distribution: Record<string, number>
   sentiment_percentages: Record<string, number>
   avg_intensity: number
   top_dimensions: [string, number][]
+  /** 单来源任务不带这两项 */
+  by_source?: Record<string, SourceBreakdown>
+  cross_source?: Record<string, Record<string, number>>
 }
 
 export interface SentimentData {

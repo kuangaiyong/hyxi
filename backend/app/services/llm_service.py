@@ -102,33 +102,48 @@ class LLMService:
         except Exception:
             return False
 
-    async def parse_intent(self, user_description: str) -> dict:  # 返回 {"plan": [...]}
-        """调用 LLM 解析用户意图，返回执行计划（含自动重试）"""
-        system_prompt = """你是一个 Tweakers.net 论坛数据抓取工具的智能调度器。
+    async def parse_intent(
+        self, user_description: str, sources: Optional[List[Dict]] = None
+    ) -> dict:  # 返回 {"plan": [...]}
+        """调用 LLM 解析用户意图，返回执行计划（含自动重试）。
+
+        sources 由调用方传入（LLMService 保持纯客户端，不自己查库）。模型只看得见
+        数据源清单，看不见平台参数，所以它编不出 thread_id 这类东西。
+        """
+        catalog = "\n".join(
+            f'- source_id="{s["id"]}"，名称「{s["name"]}」，平台 {s.get("collector_name") or s["collector_id"]}'
+            for s in (sources or [])
+        ) or "（当前没有已启用的数据源）"
+
+        system_prompt = f"""你是一个舆情采集平台的智能调度器。
 你可以执行以下操作：
-1. scrape - 抓取帖子（参数：thread_id 帖子ID, headless 是否无头模式默认true）
-2. translate - 翻译帖子内容（参数：source_lang 源语言默认nl, target_lang 目标语言默认zh-CN）
+1. collect - 从一个数据源采集帖子（参数：source_id 数据源ID）
+2. translate - 翻译帖子内容（参数：target_lang 目标语言默认zh-CN）
 3. generate_excel - 生成Excel报告（参数：include_stats 是否包含统计表默认true）
+
+当前可用的数据源：
+{catalog}
 
 请分析用户的自然语言请求，输出一个JSON格式的执行计划。
 输出格式必须是严格的JSON，包含 plan 数组：
-{
+{{
   "plan": [
-    {"action": "scrape", "params": {"thread_id": 2336074, "headless": true}},
-    {"action": "translate", "params": {"source_lang": "nl", "target_lang": "zh-CN"}},
-    {"action": "generate_excel", "params": {"include_stats": true}}
+    {{"action": "collect", "params": {{"source_id": "src_a1b2c3d4"}}}},
+    {{"action": "translate", "params": {{"target_lang": "zh-CN"}}}},
+    {{"action": "generate_excel", "params": {{"include_stats": true}}}}
   ]
-}
+}}
 
 规则：
-- 从用户描述中提取帖子ID（数字），如果用户提到"帖子"、"thread"、"帖子ID"后面的数字
-- 帖子URL形如 https://gathering.tweakers.net/forum/list_messages/{帖子ID}/{页码}，
-  thread_id 只取第一段数字，末尾那段数字是页码不是帖子ID
-- scrape 不接受起始页参数，任何情况下都不要输出 start_page
-- 如果用户没有指定帖子ID，设置为0（后续提示用户补充）
-- 如果用户只要求翻译已有的JSON文件，不要包含 scrape 步骤
-- 如果用户只要求抓取不翻译，不要包含 translate 步骤
-- 默认启用 headless 模式
+- source_id 只能从上面的清单里选，**不得编造**；清单为空时不要输出 collect 步骤
+- 一个 collect 步骤只对应一个数据源。用户说「所有来源」「全部平台」「各个渠道」时，
+  为每一个数据源各生成一个 collect 步骤，按清单顺序排列
+- 用户点名了某个平台或某个来源名称时，只采集匹配的那些
+- 采集参数（帖子ID、抓取节奏、起始页等）由数据源自己带，你不需要也不能指定
+- 用户临时给出了一个新的链接或ID、清单里又没有对应数据源时，输出
+  {{"action": "collect", "params": {{"override": "<用户给的原文>"}}}}，不要硬套一个 source_id
+- 如果用户只要求翻译已有数据，不要包含 collect 步骤
+- 如果用户只要求采集不翻译，不要包含 translate 步骤
 - 翻译使用 LLM 大模型进行专业翻译
 - 输出纯JSON，不要包含markdown代码块标记"""
 

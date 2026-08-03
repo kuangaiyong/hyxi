@@ -67,16 +67,20 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
     ├── app/routers/tasks.py       任务提交/列表/取消/删除/重试 + SSE 进度流
     ├── app/routers/results.py     帖子查询(含搜索)/统计/CSV+JSON+Excel下载 + 舆情触发
     ├── app/routers/schedules.py   定时任务 CRUD + 预设 + 手动触发
+    ├── app/routers/sources.py     数据源 CRUD + 采集器清单 + 凭据录入/清除
     │
     ├── app/services/orchestrator.py    任务编排引擎（核心，含等待队列，全局单例）
     ├── app/services/llm_service.py     LLM API 客户端（_retry_with_backoff 指数退避）
     ├── app/services/llm_utils.py       共享配置加载 (get_llm_service / load_llm_config)
     ├── app/collectors/                 采集器声明（base + 每个来源一个纯声明类）
+    ├── app/services/source_service.py  数据源注册 + 参数校验 + 凭据加解密
+    ├── app/services/crypto.py          Fernet 加解密（密钥没配就拒绝保存，不降级明文）
     ├── app/services/collector_runner.py 驱动 Node 采集脚本（job.json + NDJSON，超时 + 取消清理）
+    ├── app/services/post_tree.py       跨来源索引键 + 出口组树（存储层始终扁平）
     ├── app/services/translator_service.py LLM 翻译（5 条/批 + 失败条目单条重译）
     ├── app/services/sentiment_service.py  LLM 舆情分析（3 条/批，双写 JSON + SQLite）
     ├── app/services/excel_service.py   openpyxl 生成双语 Excel + 舆情报告
-    ├── app/services/storage.py         SQLite 存储层（tasks + sentiment，JSON→DB 迁移）
+    ├── app/services/storage.py         SQLite 存储层（tasks/sentiment/sources/credentials）
     ├── app/services/progress_manager.py SSE 事件广播 (asyncio.Queue pub/sub 单例)
     └── app/services/scheduler_service.py APScheduler（SQLAlchemyJobStore，Asia/Shanghai）
 ```
@@ -129,12 +133,21 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
   "page_number": 1,
   "message_id": "",
   "fingerprint": "a3f8c2d1...",
+  "source": "src_09ee083e",
+  "parent_fingerprint": null,
+  "reply_level": 0,
   "translation": "中文翻译...",
   "_processed": { "translated": true, "sentiment_at": "2026-07-28T20:27:00" }
 }
 ```
 
 `fingerprint` = `SHA256("username|timestamp|content[:100]")` 取前 16 位十六进制，由 Node 端 `makeFingerprint()` 生成，是增量去重和跨文件结果合并的唯一锚点。`timestamp` 落盘始终是荷兰格式 `dd-mm-yyyy HH:MM`，只在 API 出口由 `_normalize_timestamp()` 转 ISO。
+
+**指纹不含来源，Python 侧一律用 `post_tree.post_key()` = `source:fingerprint` 做索引键。** 只用 fingerprint 会让两个平台的同名空内容帖互相覆盖 —— 翻译结果串源、舆情结论盖到别人头上。指纹算法本身**一个字符都不能动**：改了历史数据全部失配，已翻译的帖子会被判成新帖重新付费翻译。历史数据没有 `source` 字段，`post_key()` 缺省填 `tweakers`，完全兼容。
+
+**评论嵌套只在出口组装，存储层永远是扁平数组。** 整条处理链有 8 处假设 posts 是扁平的（增量过滤、`_merge_by_fingerprint`、翻译的下标一一对应、舆情的绝对索引、Excel、`results.py` 切片、Node 端合并）。物理嵌套要给每一处写一对展平/回填函数，且会破坏「顺序以源 JSON 为准」的保证。`post_tree.build_tree()` / `order_by_thread()` 是唯一的组树入口，父贴不在本批数据里的评论按主贴处理，不会被丢掉。
+
+`page_number` 对信息流类来源没有页的含义，`group_feed` 填的是**滚动批次序号**，保证字段非空；它的增量走时间水位线（`incremental_strategy = "watermark"`）而不是页码。
 
 ## API 端点
 
@@ -146,7 +159,7 @@ DELETE /api/v1/tasks/{id}             取消运行中 / force=true 删除已结�
 POST   /api/v1/tasks/{id}/retry       重试终态任务（复用原描述创建新任务，返回新 id）
 GET    /api/v1/tasks/{id}/events      SSE 实时进度流
 
-GET    /api/v1/tasks/{id}/posts        帖子分页查询 (page, page_size≤200, search)
+GET    /api/v1/tasks/{id}/posts        帖子查询（**按主贴分页**，评论在 replies 里）
 GET    /api/v1/tasks/{id}/posts/{idx}  单条帖子详情（0-based）
 GET    /api/v1/tasks/{id}/stats        任务统计
 GET    /api/v1/tasks/{id}/download     Excel 下载
@@ -188,24 +201,27 @@ GET    /api/health                   健康检查
 
 LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐步执行：
 
-1. **scrape** → `node collectors/tweakers.js --job=<path>`，orchestrator 默认注入 `incremental=True`
-   - **入参只有一个 job 文件**，argv 里没有站点参数。job 由 `Collector.build_job()` 生成，字段见 `app/collectors/tweakers.py`；`base_url` / `pacing` 只从 source 取不从 params 取，免得 LLM 能改抓取目标和请求节奏
+1. **collect** → 每个数据源一个步骤，串行执行；`node collectors/<script>.js --job=<path>`
+   - **LLM 只输出 `source_id`**，采集参数（帖子 ID、站点地址、起始页、节奏）全部来自数据源自己，模型碰不到任何一个平台参数
+   - **入参只有一个 job 文件**，argv 里没有站点参数。job 由 `Collector.build_job()` 生成
+   - **`pacing` 完全不可配**——请求节奏是反爬纪律，谁都不能改；`base_url` 是用户可在数据源页填的（自建镜像 / 本地验证），留空即官方站点
    - **进度靠脚本自报**：stdout 上的 NDJSON 行 `{"evt":"progress","current":N,"total":M}`，解析不出 JSON 的行原样当日志转发。不再有 `第 X/Y 页` 文本正则
    - **输出位置由 job 指定**（`Collector.output_path()` 是全项目唯一的文件名来源）
    - `start_page` 是**显示页码**（1-based），不是 URL 里那个页码；两者差一位，见下方「常见陷阱」
-   - **起始页不由 LLM 决定**：prompt 里已删掉 `start_page` 参数，`orchestrator._resolve_start_page()` 只认用户描述里的显式指令（`从第 N 页开始`、`start_page: N`），其余一律 1，LLM 若仍输出该参数会被忽略并打 warning 日志。这么设计是因为抓取循环只前进不回补，起始页给大了就是永久丢数据，而默认 1 能让「所有页面 / 全部 / 整个帖子」等所有措辞都自动落到正确值
-2. **translate** → LLM 批量翻译（5 条/次），跳过 `_processed.translated == true` 且已有 `translation` 的帖子；完成后按 fingerprint 合并回原始顺序并写回根目录 JSON
-3. **generate_excel** → openpyxl 生成双语 Excel（sheet「论坛帖子翻译」+ 可选统计表）
+   - **起始页不由 LLM 决定**：`orchestrator._resolve_start_page()` 只认用户描述里的显式指令（`从第 N 页开始`、`start_page: N`），其余一律 1。抓取循环只前进不回补，起始页给大了就是永久丢数据
+   - **要采哪些来源也不由 LLM 最终决定**：`_resolve_sources()` 在描述里出现「所有来源 / 全部平台 / 各渠道」时**无条件展开为全部已启用来源**，不看模型给了什么；模型编造的 `source_id` 被忽略并打 warning；一个有效来源都没给出时全采。来源一多模型很容易只挑一个，那是静默漏采——报告看起来完整、实际缺半个平台的声音，比任务失败糟得多。用户临时贴的新链接（`params.override`）**直接失败并提示去数据源页注册**，绝不拿已注册的源顶替
+2. **translate** → LLM 批量翻译（5 条/次），跳过 `_processed.translated == true` 且已有 `translation` 的帖子；完成后按 `post_key` 合并回原始顺序，并**按来源拆回各自的落盘文件**（整锅写回任何一个文件都会污染别的来源）
+3. **generate_excel** → openpyxl 生成 Excel：DFS 顺序（主贴 → 其评论 → 下一主贴）、「来源」「层级」两列、评论行加 `└─ ` 前缀与浅底
 
-translate 和 generate_excel 在 context 里没有 posts 时会**自动从 `tweakers_thread_{id}.json` 兜底加载**，所以可以只提交「翻译已有数据」这类任务。thread_id 推导顺序见 `_extract_thread_id()`：plan 的 scrape 步骤 → 描述里 5 位以上的数字。`results.py:_load_posts_from_json()` 还多一层兜底：扫描根目录最新的 `tweakers_thread_*.json`。
+translate 和 generate_excel 在 context 里没有 posts 时会**从各数据源已落盘的 JSON 兜底加载**（`_load_posts_from_sources()`），所以可以只提交「翻译已有数据」这类任务。不再有 `_extract_thread_id()` 那套「从描述里抠 5 位数字」的猜测，也不再 glob `tweakers_thread_*.json`。
 
-**舆情分析不在流水线内**，由结果页按钮触发，增量粒度是 `_processed.sentiment_at` 为空的帖子。
+**舆情分析不在流水线内**，由结果页按钮触发，增量粒度是 `_processed.sentiment_at` 为空的帖子。跨来源分组（`by_source` / `cross_source`）走**纯 Python**，不需要 LLM 感知来源；prompt 里只给每条帖子标 `[来源: xxx]` 并说明「按平台内部的相对水平判断」，**绝不描述某个平台的情感先验**——那会污染的正是我们想比较的那个维度。评论会带上父贴前 200 字作 `[回复上文: ...]`，否则「+1」「same here」全被判成 neutral 噪音。
 
 **并发控制**：`max_concurrent_tasks` 超限时新任务进 `_task_queue` 排队，前一个任务在 `_run_with_queue` 结束后调 `_process_queue()` 自动出队执行，不会直接失败。
 
 ## 测试
 
-**99 个测试，必须全部 PASSED**（本机实测 `99 passed in 9.68s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**146 个测试，必须全部 PASSED**（本机实测 `146 passed in 47.05s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
@@ -236,7 +252,8 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 - **舆情按 task_id 命名但跨任务复用**：`get_sentiment()` 先查本任务，查不到则 fallback 到最新一条舆情数据；`_find_sentiment_file()` 还会用「帖子总数匹配」猜哪个文件对应当前数据
 - **舆情双写**：结果同时写 SQLite 和 JSON 文件；但 `/sentiment/download` 只读 JSON 文件，不读 DB
 - **LLM 重试**：统一走 `_retry_with_backoff` 指数退避（3 次，1s/2s/4s），429/5xx 自动重试
-- **翻译用 LLM 而非 Google Translate**：5 条/批 + `---POST_SEPARATOR---` 切分，解析失败的条目再单条重译
+- **翻译用 LLM 而非 Google Translate**：5 条/批 + `---POST_SEPARATOR---` 切分，解析失败的条目再单条重译。源文本可能是荷兰语或英语且批内混杂，**「译文与原文一字不差且原文非中文」判为漏译**，走同一条单条重译队列
+- **舆情维度是封闭集合**：`DEFAULT_DIMENSIONS` 那 14 个。`_normalize_dimensions()` 把 LLM 返回的标签对齐回去（实测它会把 `认证/合规(如Synergrid)` 简写成 `认证/合规`，于是同一维度在 `top_dimensions` 和 `cross_source` 里各占一行），对不上的直接丢弃。维度表的全部价值就在于它封闭，一碎成近义标签跨来源对比就废了
 - **原子写入**：JSON 先写 `.tmp` 再 `os.replace()`（仅 tasks.json 回退路径有此保护，其他 JSON 是直接覆写）
 - **深色模式**：CSS 变量 + `[data-theme="dark"]`，首次跟随系统偏好，之后 localStorage 记忆
 - **响应式**：≤768px 侧边栏收缩为图标模式，≤480px 进一步精简
@@ -260,13 +277,19 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 
 ## 常见陷阱
 
-- **`result` 为 None 时 `.get()` 崩溃（现存 bug，已实测复现）**：`task.get("result", {}).get("posts")` 在 `result` 键存在但值为 `None` 时返回 `None` 而非 `{}`。`create_task()` 明确写入 `"result": None`，所以**任何未成功完成的任务**访问这几个端点都会 500 + `AttributeError`：`results.py:91`（/posts）、`152`（/stats）、`198`（/export/csv）、`230`（/export/json）。正确写法是同文件 `129-130` / `180-181` 用的 `(task.get("result") or {}).get(...)`
+- **`task["result"]` 可能是 `None`**：`create_task()` 明确写入 `"result": None`，所以 `task.get("result", {}).get(...)` 在未成功完成的任务上会 500。`results.py` 现已统一用 `(task.get("result") or {}).get(...)`，新增读取处照此写
+- **改数据源的 SQL 不能用 `INSERT OR REPLACE`**：SQLite 的 REPLACE 是「删旧行再插新行」，在 `foreign_keys=ON` 下会触发 `credentials` 的 `ON DELETE CASCADE` —— 界面上改个名字或点一下停用，凭据就被静默删光。`save_source()` 用的是 `ON CONFLICT(id) DO UPDATE`，别改回去
+- **422 报文默认会回显提交值**：FastAPI 把 pydantic 的 `input` 字段序列化进 `detail`，密码超长这一种情况就够让明文进响应体、再被前端拦截器打进浏览器控制台。`main.py` 注册了 `RequestValidationError` handler 统一剔掉 `input`，新增敏感字段不用额外处理
 - **`_persist()` 永远不会删行**：`_save_tasks()` 在 SQLite 分支只对 `self.tasks` 里**剩余**的任务逐条 upsert，从不发 DELETE。所以任何"从 `self.tasks` 移除条目"的新逻辑都必须自己显式调 `db_delete_task()`，否则残留行会在下次启动被 `_load_tasks()` 读回来（`delete_task()` 曾因此让删除的任务重启后复活，已修）。JSON 回退分支是全量覆写，无此问题
 - **`storage.DB_PATH` 是 import 时算好的常量**：测试里只改 `settings.data_dir` **不会**改变 DB 位置，必须一并重定向 `storage.DB_PATH`，否则测试会写进真实的 `backend/data/hyxi.db`。`tests/test_core.py` 的 `_create_orchestrator()` 已这么做；`tests/test_api.py` 则是靠在 import 前改 `data_dir` 生效 —— 新增测试文件时注意这个先后顺序
 - **爬虫退出码是契约**：`0` 完整 / `1` 硬失败（无可用数据）/ `2` 部分完成（数据已落盘，可增量续抓）。残缺时 `total_pages` 保留站点声明的真值**不再被截断点覆盖**，输出 JSON 带 `complete: false` + `stop_reason`，原因同时写 stderr 并被 `CollectorRunner` 拼进任务的 `error_message`。退出码非 0 一律让抓取步骤失败——残缺数据继续跑翻译→Excel→舆情，产出的是一份看起来完整、实际有偏的报告，比任务失败糟得多；续抓走 `POST /api/v1/tasks/{id}/retry`
 - **「第一页零帖子」也算硬失败**：全量抓取时第一页一条都提不出来（且没有历史数据可依），脚本直接抛错而不是写一份 `complete: true` 的空结果。这不是假想场景 —— IP 被封时页面返回 200 外壳、DOM 里没有任何 `.message`，改造前正是靠这条路径写出「0 条帖子、抓取成功」，下游照常翻译 0 条并导出空 Excel。站点改类名导致提取器失效时也是同一条路径
-- **爬虫 URL 页码有偏移**：`/list_messages/{id}/0` 是第 1 页，`/1` 是第 2 页（`displayToUrl` / `urlToDisplay`）
-- **增量抓取从 `maxPage + 1` 开始**：已抓过的最后一页后来新增的回帖会被永久漏掉，fingerprint 去重救不了（那一页不会再访问）。要补全就把 job 里的 `incremental` 置 false 跑全量
+- **爬虫 URL 页码有偏移**：`/list_messages/{id}/0` 是第 1 页，`/1` 是第 2 页（`displayToUrl` / `urlToDisplay`）；`group_feed` 的 `/batch/{n}` 同理差一位
+- **本地 fixture 站点是唯一能跑通的验证手段**：Tweakers 出口 IP 被封，`backend/tests/fixtures/fixture_site.py` 同时挂论坛（`/forum/list_messages/...`）和小组（`/groups/{id}/batch/{n}`）两个站点。跑的仍是真 Chrome、真 HTTP、真子进程、真 DOM 提取，只是被抓的站点换成本地的。要把数据源指过去就在数据源页填 `base_url`
+- **增量抓取从 `maxPage + 1` 开始**（Tweakers）：已抓过的最后一页后来新增的回帖会被永久漏掉，fingerprint 去重救不了（那一页不会再访问）。要补全就把 job 里的 `incremental` 置 false 跑全量
+- **采集脚本必须「读旧 + 合并」再落盘，绝不能只写这一轮抓到的**：落盘文件同时承载 `translation` 和 `_processed` 标记，整体覆盖等于把已翻译的帖子重新变成新帖，下一轮再付一次翻译钱、舆情也重算一遍。`group_feed.js` 曾漏掉这段（信息流没有页码可续，很容易写成「全量重扫 + 覆盖」），已修并有回归测试 `TestGroupFeedCollectorEndToEnd::test_incremental_rerun_keeps_translations`
+- **`/posts` 的 `index` 是扁平存储数组里的绝对位置，不是页内序号**：`SentimentView` 用 `index - 1` 反查帖子，而舆情结果数组的下标来自 `enumerate(all_posts)`。一页只保证 `page_size` 个**主贴**，带上评论后条目数会超出，按页内计数编号会让相邻两页的 index 区间重叠、详情弹窗显示错帖子
+- **删数据源不能让历史任务结果变空白**：`task["result"]["sources"]` 里存了当时的 `output_path`，来源从注册表消失后 `results.py` 照原路读文件兜底
 - **爬虫必须通过 `node` 子进程调用**，不能 import
 - **日志有两套命名空间**：`logging_config.get_logger()` 用全局 `_logger` 缓存，**第一个调用者的 name 定死了整个 logger**（实际是 orchestrator 的 `app.services.orchestrator`）；其余 service 用 `logging.getLogger("hyxi.xxx")`，拿不到那些 handler。加日志时注意实际输出去向
 - **Excel 列名 `chr(64 + col)` 仅支持 26 列以内**

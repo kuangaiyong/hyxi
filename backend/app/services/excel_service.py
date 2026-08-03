@@ -10,6 +10,7 @@ from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.chart import PieChart, Reference
 from openpyxl.utils import get_column_letter
 from app.config import settings
+from app.services.post_tree import order_by_thread
 from app.services.progress_manager import ProgressManager
 
 
@@ -26,6 +27,8 @@ THIN_BORDER = Border(
 CONTENT_ALIGN = Alignment(vertical="top", wrap_text=True)
 CENTER_ALIGN = Alignment(horizontal="center", vertical="top")
 ALT_FILL = PatternFill(start_color="F2F7FB", end_color="F2F7FB", fill_type="solid")
+
+
 
 
 def _star_level(value) -> int:
@@ -64,12 +67,20 @@ class ExcelService:
         posts: list,
         params: dict,
         progress: ProgressManager,
+        step_index: int = 2,
+        sources: Optional[dict] = None,
     ) -> dict:
-        """生成 Excel"""
+        """生成 Excel。
+
+        step_index 不能写死 2 —— plan 里有多个 collect 步骤时 Excel 就不在第 3 位了。
+        sources 是 {source_id: {"name": ...}}，用来把来源列渲染成人看得懂的名字。
+        """
         include_stats = params.get("include_stats", True)
+        source_names = {sid: m.get("name", sid) for sid, m in (sources or {}).items()}
+        posts = order_by_thread(posts)
 
         await progress.emit(task_id, "step_progress", {
-            "step": 2,
+            "step": step_index,
             "progress": 0.0,
             "message": "正在生成 Excel 报告...",
         })
@@ -81,8 +92,8 @@ class ExcelService:
         ws.title = "论坛帖子翻译"
 
         headers = [
-            ("序号", 6), ("用户名", 16), ("发布时间", 18),
-            ("原文（荷兰语）", 55), ("中文翻译", 55), ("页码", 6),
+            ("序号", 6), ("来源", 20), ("层级", 6), ("用户名", 16), ("发布时间", 18),
+            ("原文", 55), ("中文翻译", 55), ("页码", 6),
         ]
         for col, (header, width) in enumerate(headers, 1):
             cell = ws.cell(row=1, column=col, value=header)
@@ -96,11 +107,17 @@ class ExcelService:
 
         for idx, post in enumerate(posts):
             row = idx + 2
-            fill = ALT_FILL if idx % 2 == 1 else PatternFill()
+            level = int(post.get("reply_level", 0) or 0)
+            # 回复行统一浅底，比隔行底纹更能一眼看出层级；不用 openpyxl 的分组，
+            # 各家查看器对 outline 的行为不一致
+            fill = ALT_FILL if (level > 0 or idx % 2 == 1) else PatternFill()
+            sid = post.get("source", "")
 
             values = [
                 idx + 1,
-                post.get("username", ""),
+                source_names.get(sid, sid),
+                level,
+                ("　" * level + "└─ " if level else "") + post.get("username", ""),
                 post.get("timestamp", ""),
                 post.get("content", ""),
                 post.get("translation", ""),
@@ -110,13 +127,13 @@ class ExcelService:
                 cell = ws.cell(row=row, column=col, value=value)
                 cell.border = THIN_BORDER
                 cell.fill = fill
-                if col in (1, 6):
+                if col in (1, 3, 8):
                     cell.alignment = CENTER_ALIGN
                     cell.font = Font(name="Arial", size=10)
-                elif col == 2:
+                elif col == 4:
                     cell.font = Font(name="Arial", size=10, bold=True)
                     cell.alignment = CONTENT_ALIGN
-                elif col in (4, 5):
+                elif col in (6, 7):
                     cell.font = Font(name="Arial", size=10)
                     cell.alignment = CONTENT_ALIGN
                 else:
@@ -126,7 +143,7 @@ class ExcelService:
             ws.row_dimensions[row].height = max(60, min(250, len(post.get("content", "")) * 0.4))
 
         await progress.emit(task_id, "step_progress", {
-            "step": 2, "progress": 0.5, "message": "帖子表已生成...",
+            "step": step_index, "progress": 0.5, "message": "帖子表已生成...",
         })
 
         # ===== Sheet 2: 统计信息 =====
@@ -192,7 +209,7 @@ class ExcelService:
         _save_workbook(wb, output_path)
 
         await progress.emit(task_id, "step_progress", {
-            "step": 2,
+            "step": step_index,
             "progress": 1.0,
             "message": f"Excel 已保存: {output_name}",
         })

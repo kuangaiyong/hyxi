@@ -11,6 +11,8 @@ from app.models import LLMConfig, TaskStatus, PlanStep
 from app.config import settings
 from app.logging_config import get_logger
 from app.collectors import get_collector
+from app.services import source_service
+from app.services.post_tree import build_tree, post_key
 from app.services.llm_service import LLMService
 from app.services.collector_runner import CollectorRunner
 from app.services.translator_service import TranslatorService
@@ -198,9 +200,16 @@ class TaskOrchestrator:
                 "message": "正在调用 LLM 解析任务意图...",
             })
 
-            plan_data = await llm_service.parse_intent(task["description"])
+            enabled_sources = source_service.list_sources(enabled_only=True)
+            for s in enabled_sources:
+                s["collector_name"] = get_collector(s["collector_id"]).display_name
+
+            plan_data = await llm_service.parse_intent(task["description"], enabled_sources)
 
             plan = [PlanStep(**s) for s in plan_data.get("plan", [])]
+            plan, source_warnings = _resolve_sources(task, plan, enabled_sources)
+            for w in source_warnings:
+                await self._task_log(task_id, "warning", w)
             task["plan"] = [s.model_dump() for s in plan]
             self._persist()
 
@@ -236,44 +245,61 @@ class TaskOrchestrator:
                 })
 
                 try:
-                    if step.action == "scrape":
-                        # 增量模式：默认开启
-                        step.params.setdefault("incremental", True)
-                        ignored_start = _resolve_start_page(task, step.params)
+                    if step.action == "collect":
+                        source = source_service.get_source(step.params["source_id"])
+                        if not source:
+                            raise Exception(f"数据源已被删除: {step.params['source_id']}")
+                        collector = get_collector(source["collector_id"])
+                        source["params"] = dict(source.get("params") or {})
+                        source["params"].setdefault("incremental", True)
+                        ignored_start = _resolve_start_page(task, source["params"])
                         if ignored_start is not None:
                             await self._task_log(
                                 task_id, "warning",
                                 f"忽略 LLM 给出的 start_page={ignored_start}，"
-                                f"改为从第 {step.params['start_page']} 页开始",
+                                f"改为从第 {source['params']['start_page']} 页开始",
                             )
-                        collector = get_collector("tweakers")
                         result = await CollectorRunner.execute(
-                            task_id, collector,
-                            {"id": collector.id, "params": step.params},
-                            progress_manager, idx,
+                            task_id, collector, source, progress_manager, idx,
                         )
-                        context["posts"] = collector.normalize(result)
-                        context["thread_id"] = step.params.get("thread_id")
-                        context["total_pages"] = result.get("total_pages", 0)
-                        context["raw_json"] = result
+                        posts = collector.normalize(result)
+                        for p in posts:
+                            p["source"] = source["id"]
+                        context.setdefault("posts", []).extend(posts)
+                        context.setdefault("sources", {})[source["id"]] = {
+                            "name": source["name"],
+                            "collector_id": source["collector_id"],
+                            "output_path": collector.output_path(source),
+                            "total_pages": result.get("total_pages", 0),
+                            "post_count": len(posts),
+                        }
+                        context["total_pages"] = (
+                            context.get("total_pages", 0) + result.get("total_pages", 0)
+                        )
+                        await self._task_log(
+                            task_id, "info",
+                            f"来源「{source['name']}」采集到 {len(posts)} 条帖子",
+                        )
 
                     elif step.action == "translate":
                         posts = context.get("posts", [])
-                        # 如果没有 scrape 步骤，从已有 JSON 加载
+                        # 没有 collect 步骤时，从各来源已落盘的 JSON 兜底加载
                         if not posts:
-                            thread_id = step.params.get("thread_id") or _extract_thread_id(task)
-                            json_path = _thread_json_path(thread_id)
-                            if os.path.exists(json_path):
-                                await self._task_log(task_id, "info", f"从已有文件加载数据: {json_path}")
-                                with open(json_path, "r", encoding="utf-8") as f:
-                                    loaded = json.load(f)
-                                posts = loaded.get("posts", [])
-                                context["thread_id"] = thread_id
-                                context["total_pages"] = loaded.get("total_pages", 0)
-                            else:
-                                raise Exception(f"没有可翻译的帖子数据，请先执行抓取步骤。找不到文件: {json_path}")
-                        if not posts:
-                            raise Exception("没有可翻译的帖子数据")
+                            posts, loaded_meta = _load_posts_from_sources(enabled_sources)
+                            if not posts:
+                                raise Exception(
+                                    "没有可翻译的帖子数据，请先执行采集步骤"
+                                    "（各来源的落盘文件都不存在或为空）"
+                                )
+                            await self._task_log(
+                                task_id, "info",
+                                f"从已有文件加载 {len(posts)} 条帖子（{len(loaded_meta)} 个来源）",
+                            )
+                            context["posts"] = posts
+                            context["sources"] = loaded_meta
+                            context["total_pages"] = sum(
+                                m["total_pages"] for m in loaded_meta.values()
+                            )
 
                         # 增量：过滤已翻译的帖子
                         already = [p for p in posts if p.get("_processed", {}).get("translated") and p.get("translation")]
@@ -282,7 +308,7 @@ class TaskOrchestrator:
                             await self._task_log(task_id, "info", f"增量翻译: {len(already)} 条已翻译跳过, {len(pending)} 条待翻译")
                         if pending:
                             result = await TranslatorService.execute(
-                                task_id, pending, step.params, progress_manager
+                                task_id, pending, step.params, progress_manager, idx
                             )
                             for p in result.get("posts", []):
                                 p.setdefault("_processed", {})["translated"] = True
@@ -290,27 +316,21 @@ class TaskOrchestrator:
                         else:
                             context["posts"] = already
                             await self._task_log(task_id, "info", "所有帖子已翻译，跳过")
-                        # 保存回 JSON
-                        tid = context.get("thread_id") or _extract_thread_id(task)
-                        if tid:
-                            self._save_translated_json(tid, context["posts"])
+                        self._save_translated_json(context.get("sources", {}), context["posts"])
 
                     elif step.action == "generate_excel":
                         posts = context.get("posts", [])
                         if not posts:
-                            # 同样从已有 JSON 加载
-                            thread_id = step.params.get("thread_id") or _extract_thread_id(task)
-                            json_path = _thread_json_path(thread_id)
-                            if os.path.exists(json_path):
-                                with open(json_path, "r", encoding="utf-8") as f:
-                                    loaded = json.load(f)
-                                posts = loaded.get("posts", [])
-                                context["thread_id"] = thread_id
-                                context["total_pages"] = loaded.get("total_pages", 0)
+                            posts, loaded_meta = _load_posts_from_sources(enabled_sources)
+                            context["sources"] = loaded_meta
+                            context["total_pages"] = sum(
+                                m["total_pages"] for m in loaded_meta.values()
+                            )
                         if not posts:
                             raise Exception("没有帖子数据可生成 Excel")
                         result = await ExcelService.execute(
-                            task_id, posts, step.params, progress_manager
+                            task_id, posts, step.params, progress_manager, idx,
+                            context.get("sources", {}),
                         )
                         context["excel_path"] = result.get("file_path", "")
                         context["excel_name"] = result.get("file_name", "")
@@ -343,12 +363,24 @@ class TaskOrchestrator:
                     raise
 
             # ===== 汇总结果 =====
+            sources_meta = context.get("sources", {})
             task["result"] = {
-                "thread_id": context.get("thread_id"),
                 "total_posts": len(context.get("posts", [])),
                 "total_pages": context.get("total_pages", 0),
                 "excel_name": context.get("excel_name", ""),
                 "excel_path": context.get("excel_path", ""),
+                # 记下 output_path：用户之后在数据源页删掉这个来源，历史任务的结果
+                # 也还能照原路读回来，而不是静默变成「没有数据」
+                "sources": [
+                    {
+                        "id": sid,
+                        "name": m["name"],
+                        "collector_id": m["collector_id"],
+                        "output_path": m["output_path"],
+                        "post_count": m["post_count"],
+                    }
+                    for sid, m in sources_meta.items()
+                ],
             }
             task["status"] = TaskStatus.COMPLETED
             self._persist()
@@ -379,13 +411,21 @@ class TaskOrchestrator:
             if llm_service:
                 await llm_service.close()
 
-    def _save_translated_json(self, thread_id: int, posts: list):
-        """保存带翻译的帖子数据到 JSON 文件"""
-        json_path = _thread_json_path(thread_id)
-        if os.path.exists(json_path):
+    def _save_translated_json(self, sources_meta: dict, posts: list):
+        """把翻译结果按来源拆回各自的落盘文件。
+
+        多来源之后 posts 是跨源拼起来的，整锅写回任何一个文件都会污染别的来源。
+        """
+        for source_id, meta in sources_meta.items():
+            json_path = meta.get("output_path")
+            if not json_path or not os.path.exists(json_path):
+                continue
+            mine = [p for p in posts if p.get("source", source_id) == source_id]
+            if not mine:
+                continue
             with open(json_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            data["posts"] = posts
+            data["posts"] = mine
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -460,14 +500,26 @@ class TaskOrchestrator:
 
         async def _run():
             try:
-                # 构建指纹→绝对索引映射（用于合并）
+                # 构建 source:fingerprint → 绝对索引映射（用于合并）。
+                # 键必须带来源，只用 fingerprint 会跨来源碰撞
                 fp_to_idx = {}
                 for i, p in enumerate(all_posts):
-                    fp = p.get("fingerprint")
-                    if fp:
-                        fp_to_idx[fp] = i
+                    if p.get("fingerprint"):
+                        fp_to_idx[post_key(p)] = i
 
-                await SentimentService.analyze(task_id, pending_posts, progress_manager, existing_results, fp_to_idx)
+                # 来源名与父贴映射：让 prompt 能标注来源、给评论带上父贴上下文
+                source_names = {s["id"]: s["name"] for s in source_service.list_sources()}
+                by_key = {post_key(p): p for p in all_posts}
+                _roots, children = build_tree(all_posts)
+                parent_by_key = {}
+                for parent_k, kids in children.items():
+                    for child in kids:
+                        parent_by_key[post_key(child)] = by_key[parent_k]
+
+                await SentimentService.analyze(
+                    task_id, pending_posts, progress_manager, existing_results, fp_to_idx,
+                    source_names, parent_by_key, all_posts,
+                )
                 await progress_manager.emit(task_id, "sentiment_complete", {
                     "task_id": task_id,
                     "status": "completed",
@@ -488,19 +540,107 @@ class TaskOrchestrator:
 orchestrator = TaskOrchestrator()
 
 
-def _thread_json_path(thread_id) -> str:
-    """帖子数据的落盘位置。文件名只有采集器声明这一个来源，调用方不再自己拼。"""
-    return get_collector("tweakers").output_path({"params": {"thread_id": thread_id}})
+def _load_posts_from_sources(sources: List[dict]):
+    """从各来源已落盘的 JSON 兜底加载，返回 (posts, sources_meta)。
+
+    支持「只翻译已有数据」这类不带 collect 步骤的任务。每条帖子补上 source 标记，
+    否则跨源合并后分不清谁是谁。
+    """
+    posts: List[dict] = []
+    meta: Dict[str, dict] = {}
+    for source in sources:
+        collector = get_collector(source["collector_id"])
+        try:
+            path = collector.output_path(source)
+        except ValueError:
+            continue
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        mine = loaded.get("posts", [])
+        for p in mine:
+            p.setdefault("source", source["id"])
+        posts.extend(mine)
+        meta[source["id"]] = {
+            "name": source["name"],
+            "collector_id": source["collector_id"],
+            "output_path": path,
+            "total_pages": loaded.get("total_pages", 0),
+            "post_count": len(mine),
+        }
+    return posts, meta
 
 
 def _merge_by_fingerprint(source_posts: list, translated: list) -> list:
-    """把翻译结果按指纹合回源列表。
+    """把翻译结果按 source:fingerprint 合回源列表。
 
     顺序必须以源 JSON 为准：合并结果会被写回源文件，一旦按「已翻译+待翻译」的
     分区序落盘，原始楼层顺序就再也还原不回来了。
+    键带来源是因为 fingerprint 不含来源，跨源合并时会碰撞（空内容帖尤其危险）。
     """
-    fp_to_post = {p.get("fingerprint"): p for p in translated if p.get("fingerprint")}
-    return [fp_to_post.get(p.get("fingerprint"), p) for p in source_posts]
+    by_key = {post_key(p): p for p in translated if p.get("fingerprint")}
+    return [by_key.get(post_key(p), p) for p in source_posts]
+
+
+_ALL_SOURCES_PATTERNS = (
+    "所有来源", "全部来源", "各来源", "各个来源", "所有数据源", "全部数据源",
+    "所有平台", "全部平台", "各平台", "各个平台", "所有渠道", "全部渠道", "各渠道",
+)
+
+
+def _resolve_sources(task: dict, plan: List[PlanStep], sources: List[dict]):
+    """确定性地敲定要采哪些来源，返回 (修正后的 plan, 告警列表)。
+
+    照搬 _resolve_start_page 的路子：LLM 负责理解，后端负责保证。来源一多模型很容易
+    只挑一个，那是静默漏采 —— 报告看起来完整，实际缺了半个平台的声音，比任务失败糟得多。
+    所以用户说「所有来源」时无条件展开为全部已启用来源，不看模型给了什么。
+    """
+    warnings: List[str] = []
+    valid_ids = {s["id"] for s in sources}
+    collect_idx = [i for i, s in enumerate(plan) if s.action == "collect"]
+    if not collect_idx:
+        return plan, warnings
+
+    desc = task.get("description", "")
+    wants_all = any(p in desc for p in _ALL_SOURCES_PATTERNS)
+
+    picked = []
+    for i in collect_idx:
+        sid = plan[i].params.get("source_id")
+        if sid in valid_ids:
+            if sid not in picked:
+                picked.append(sid)
+        elif plan[i].params.get("override"):
+            # 用户临时贴了个新链接。不能拿已注册的来源顶替 —— 那是答非所问，
+            # 而报告里看不出来。宁可失败并告诉他去哪补。
+            raise Exception(
+                f"「{plan[i].params['override']}」还不是已注册的数据源。"
+                "请先到「数据源」页把它加进来，再重新提交任务。"
+            )
+        elif sid is not None:
+            warnings.append(f"忽略 LLM 编造的数据源 source_id={sid}（不在已启用清单里）")
+
+    if wants_all:
+        missing = [s["id"] for s in sources if s["id"] not in picked]
+        if missing:
+            names = "、".join(s["name"] for s in sources if s["id"] in missing)
+            warnings.append(f"用户要求全部来源，补上被 LLM 漏掉的：{names}")
+        picked = [s["id"] for s in sources]
+    elif not picked:
+        # 模型一个有效来源都没给出，又不是「所有来源」—— 全采比静默不采安全
+        picked = [s["id"] for s in sources]
+        if picked:
+            warnings.append("LLM 未指定有效数据源，按全部已启用来源执行")
+
+    if not picked:
+        raise Exception("没有已启用的数据源，请先到「数据源」页注册至少一个来源")
+
+    name_of = {s["id"]: s["name"] for s in sources}
+    rebuilt = [PlanStep(action="collect", params={"source_id": sid, "source_name": name_of[sid]})
+               for sid in picked]
+    rebuilt += [s for s in plan if s.action != "collect"]
+    return rebuilt, warnings
 
 
 def _resolve_start_page(task: dict, params: dict) -> Optional[int]:
@@ -524,19 +664,3 @@ def _resolve_start_page(task: dict, params: dict) -> Optional[int]:
     return ignored if ignored is not None and ignored != resolved else None
 
 
-def _extract_thread_id(task: dict) -> int:
-    """从任务描述或计划中提取帖子ID"""
-    import re
-    desc = task.get("description", "")
-    plan = task.get("plan", [])
-
-    # 先从 plan 中找
-    for step in plan:
-        if step.get("action") == "scrape":
-            tid = step.get("params", {}).get("thread_id")
-            if tid:
-                return tid
-
-    # 从描述中提取
-    match = re.search(r"(\d{5,})", desc)
-    return int(match.group(1)) if match else 0

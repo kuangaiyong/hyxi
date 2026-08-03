@@ -170,12 +170,16 @@ async function main() {
 
     // ===== 人工授权模式：开有头浏览器让人自己过验证，只落会话不采数据 =====
     if (CONFIG.mode === 'login_only') {
-        const ok = await waitForManualLogin(page, {
+        const outcome = await waitForManualLogin(page, {
             ...authOpts, maxWaitMs: CONFIG.manualLoginTimeout,
         });
-        if (!ok) {
-            await browser.close();
-            needManualAuth('等待人工登录超时（5 分钟）');
+        if (outcome !== 'ok') {
+            await browser.close().catch(() => {});
+            // 分钟数从实际配置算，别写死：这句会变成界面上的失败提示，
+            // 和页面倒计时对不上会让用户以为超时判定出了错
+            needManualAuth(outcome === 'closed'
+                ? '浏览器窗口被关闭，授权未完成'
+                : `等待人工登录超时（${Math.round(CONFIG.manualLoginTimeout / 60000)} 分钟）`);
         }
         await saveStorageState(context, CONFIG.stateFile);
         await browser.close();

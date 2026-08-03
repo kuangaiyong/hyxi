@@ -76,6 +76,18 @@ def mark_authorized(source_id: str) -> None:
         storage.save_source(source)
 
 
+def clear_authorization(source_id: str) -> None:
+    """会话失效时把授权时间抹掉，让徽标翻回「需重新授权」。
+
+    与 mark_authorized 对称。少了它，界面会在会话过期后一直显示「会话正常」——
+    而采集恰恰正因为会话失效在失败，用户被指向错误的排查方向。
+    """
+    source = storage.get_source(source_id)
+    if source and source.get("last_auth_at"):
+        source["last_auth_at"] = None
+        storage.save_source(source)
+
+
 # ===== 人工授权 =====
 
 _authorizing: set = set()
@@ -103,7 +115,7 @@ def start_authorization(source_id: str, source: dict) -> None:
         try:
             await progress_manager.emit(channel, "log", {
                 "level": "info",
-                "message": "正在打开浏览器，请在弹出的窗口里完成登录（5 分钟内）…",
+                "message": "正在后端所在机器上打开浏览器窗口，请在窗口里完成登录…",
             })
             collector = get_collector(source["collector_id"])
             job_source = dict(source)

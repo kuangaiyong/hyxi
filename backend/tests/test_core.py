@@ -1976,3 +1976,169 @@ class TestFacebookLoginEndToEnd:
         assert "password" not in json.dumps(job).lower()
         # 命令行只有脚本路径和 --job=
         assert collector.script_path().endswith("facebook_group.js")
+
+
+class TestSessionStateReflectsReality:
+    """会话失效后，界面上的「会话正常」徽标必须翻回去。
+
+    last_auth_at 只在授权成功时写入。若没有任何地方清除它，会话过期后界面会一直显示
+    「会话正常」—— 而采集恰恰正因为会话失效在失败，用户被指向错误的排查方向。
+    退出码 3 是脚本对「这个会话不管用了」的权威判定，直接拿来用，不去猜会话文件的有效期。
+    """
+
+    GROUP_ID = "2407063016436085"
+
+    def setup_method(self):
+        import app.services.storage as storage_module
+
+        self.tmpdir = tempfile.mkdtemp()
+        self.output = os.path.join(self.tmpdir, "fb_out.json")
+        self.state = os.path.join(self.tmpdir, "session.json")
+        # DB_PATH 是 import 时算好的常量，不重定向就会写进真实的 backend/data/hyxi.db
+        self._orig_db = storage_module.DB_PATH
+        storage_module.DB_PATH = os.path.join(self.tmpdir, "hyxi.db")
+        storage_module.init_db()
+
+    def teardown_method(self):
+        import app.services.storage as storage_module
+
+        storage_module.DB_PATH = self._orig_db
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _skip_unless_ready(self):
+        import pytest
+        from app.config import settings
+
+        if not _HAS_NODE:
+            pytest.skip("未安装 node")
+        if not os.path.exists(
+            os.path.join(settings.project_root, "node_modules", "playwright", "package.json")
+        ):
+            pytest.skip("项目根目录未安装 playwright")
+
+    def _collect(self, source: dict, base_url: str, username: str, password: str):
+        import asyncio
+        from app.collectors import get_collector
+        from app.services.collector_runner import CollectorRunner
+        from app.services.progress_manager import ProgressManager
+
+        collector = type(get_collector("facebook_group"))()
+        collector.output_path = lambda s: self.output
+        job_source = dict(source)
+        job_source["params"] = {
+            **source["params"],
+            "base_url": base_url,
+            "headless": True,
+            "incremental": False,
+        }
+        job_source["state_file"] = self.state
+        job_source["pacing"] = {"delay_min": 200, "delay_max": 400}
+
+        os.environ["HYXI_CRED_USERNAME"] = username
+        os.environ["HYXI_CRED_PASSWORD"] = password
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(
+                CollectorRunner.execute("badge-e2e", collector, job_source, ProgressManager())
+            )
+        finally:
+            loop.close()
+            os.environ.pop("HYXI_CRED_USERNAME", None)
+            os.environ.pop("HYXI_CRED_PASSWORD", None)
+
+    def _authorized_source(self):
+        from app.services import source_service
+
+        source = source_service.create_source(
+            collector_id="facebook_group",
+            name="FB 会话状态回归",
+            params={"group_id": self.GROUP_ID, "max_batches": 1},
+        )
+        source_service.mark_authorized(source["id"])
+        assert source_service.get_source(source["id"])["last_auth_at"], "前置条件：先有一次成功授权"
+        return source
+
+    def test_manual_auth_required_clears_last_auth_at(self):
+        """撞上两步验证 → 会话状态必须翻回「需重新授权」"""
+        self._skip_unless_ready()
+        import pytest
+        from app.services import source_service
+        from app.services.collector_runner import ManualAuthRequired
+
+        sys.path.insert(0, _FIXTURES_DIR)
+        import login_site
+
+        source = self._authorized_source()
+        with login_site.LoginSite() as base_url:
+            with pytest.raises(ManualAuthRequired):
+                self._collect(source, base_url, login_site.TWO_FACTOR_USER, "任意密码")
+
+        assert source_service.get_source(source["id"])["last_auth_at"] is None, (
+            "会话已经不管用了，界面上却还会显示「会话正常」"
+        )
+
+    def _authorize(self, source: dict, base_url: str, timeout_ms: int):
+        """跑一轮人工授权（login_only）。超时上限可配就是为了在验证里跑短一点"""
+        import asyncio
+        from app.collectors import get_collector
+        from app.services.collector_runner import CollectorRunner
+        from app.services.progress_manager import ProgressManager
+
+        collector = type(get_collector("facebook_group"))()
+        collector.output_path = lambda s: self.output
+        job_source = dict(source)
+        job_source["params"] = {**source["params"], "base_url": base_url}
+        job_source["state_file"] = self.state
+        job_source["mode"] = "login_only"
+        job_source["manual_login_timeout_ms"] = timeout_ms
+
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(
+                CollectorRunner.execute("auth-e2e", collector, job_source, ProgressManager())
+            )
+        finally:
+            loop.close()
+
+    def test_manual_auth_timeout_reports_configured_duration(self):
+        """人工授权等到超时 → 退出码 3，且提示里的时长必须按实际配置算。
+
+        这句话会原样变成界面上的失败提示，而页面同时在跑一个按同一配置走的倒计时。
+        写死「5 分钟」会让两者对不上，用户以为超时判定坏了。
+        """
+        self._skip_unless_ready()
+        import pytest
+        from app.services import source_service
+        from app.services.collector_runner import ManualAuthRequired
+
+        sys.path.insert(0, _FIXTURES_DIR)
+        import login_site
+
+        source = self._authorized_source()
+        with login_site.LoginSite() as base_url:
+            with pytest.raises(ManualAuthRequired) as exc:
+                self._authorize(source, base_url, 5000)
+
+        assert "等待人工登录超时" in exc.value.reason
+        assert "5 分钟" not in exc.value.reason, (
+            f"时长写死了，没跟着配置走: {exc.value.reason}"
+        )
+        assert source_service.get_source(source["id"])["last_auth_at"] is None, (
+            "授权超时也意味着会话没拿到，徽标必须翻回「需重新授权」"
+        )
+
+    def test_successful_collect_keeps_last_auth_at(self):
+        """反向保证：采集成功时不能把授权时间抹掉，否则徽标会反过来误报失效"""
+        self._skip_unless_ready()
+        from app.services import source_service
+
+        sys.path.insert(0, _FIXTURES_DIR)
+        import login_site
+
+        source = self._authorized_source()
+        before = source_service.get_source(source["id"])["last_auth_at"]
+        with login_site.LoginSite() as base_url:
+            data = self._collect(source, base_url, login_site.GOOD_USER, login_site.GOOD_PASSWORD)
+
+        assert data["complete"] is True, data.get("stop_reason")
+        assert source_service.get_source(source["id"])["last_auth_at"] == before

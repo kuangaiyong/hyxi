@@ -130,7 +130,12 @@ async def authorize_source(source_id: str):
         raise HTTPException(status_code=409, detail="该数据源正在授权中")
 
     source_service.start_authorization(source_id, source)
-    return {"message": "已打开浏览器，请在弹出的窗口里完成登录", "channel": _auth_channel(source_id)}
+    # 窗口弹在**运行后端的那台机器**的桌面上，不是调用方的浏览器里。
+    # 后端跑在无桌面服务器上时这个入口就用不了，说清楚才不会变成「点了没反应」
+    return {
+        "message": "已在后端所在机器的桌面上打开浏览器窗口，请在窗口里完成登录",
+        "channel": _auth_channel(source_id),
+    }
 
 
 @router.get("/sources/{source_id}/authorize/events")

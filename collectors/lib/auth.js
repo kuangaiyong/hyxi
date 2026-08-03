@@ -122,9 +122,20 @@ async function waitForManualLogin(page, { entryUrl, selectors, timeout, gotoPage
     const deadline = Date.now() + maxWaitMs;
     let reported = 0;
     while (Date.now() < deadline) {
-        if (await page.$(selectors.loggedIn)) {
+        // 人随时可能直接关掉窗口放弃授权 —— 界面上第四步还就是叫他关窗口。
+        // 不接住的话 page.$ 会抛「Target page, context or browser has been closed」
+        // 并以退出码 1 冒到界面上，用户看到的是一段 Playwright 堆栈而不是「授权没完成」
+        if (page.isClosed()) return 'closed';
+        let landed;
+        try {
+            landed = await page.$(selectors.loggedIn);
+        } catch (e) {
+            if (page.isClosed() || /has been closed/i.test(e.message)) return 'closed';
+            throw e;
+        }
+        if (landed) {
             log('   检测到登录成功');
-            return true;
+            return 'ok';
         }
         const left = Math.round((deadline - Date.now()) / 1000);
         if (left <= reported - 15 || reported === 0) {
@@ -133,7 +144,7 @@ async function waitForManualLogin(page, { entryUrl, selectors, timeout, gotoPage
         }
         await new Promise(r => setTimeout(r, 2000));
     }
-    return false;
+    return 'timeout';
 }
 
 module.exports = {

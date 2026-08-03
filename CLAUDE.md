@@ -133,7 +133,13 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 登录后落地页分四种，处置完全不同，混成一个「登录失败」会让用户无从下手：成功 / `checkpoint`（URL 含 `/checkpoint/`）/ `two_factor`（出现验证码输入框）/ `bad_credentials`。**非成功一律 `emit('need_manual_auth')` + 退出码 3**，`CollectorRunner` 转成 `ManualAuthRequired`，orchestrator 把它的消息原样写进 `error_message` —— 那句话本身就是给用户看的人话（「数据源「X」需要人工重新授权：……请到「数据源」页点「人工登录」」），**别再包一层技术描述把它埋掉**。
 
-`POST /api/v1/sources/{id}/authorize` 走 `mode: "login_only"` + `headless: false`：开有头 Chrome 让人自己过两步验证，轮询到登录成功或超时（默认 5 分钟，`manual_login_timeout_ms` 可配），成功即存会话 + `mark_authorized()`。进度走 `progress_manager` 的 `auth_{source_id}` 频道。**这是「撞上验证就交给人，不硬闯」既有姿态的落点，不是绕过验证码。**
+`POST /api/v1/sources/{id}/authorize` 走 `mode: "login_only"` + `headless: false`：开有头 Chrome 让人自己过两步验证，轮询到登录成功或超时（默认 10 分钟，`manual_login_timeout_ms` 可配），成功即存会话 + `mark_authorized()`。进度走 `progress_manager` 的 `auth_{source_id}` 频道。**这是「撞上验证就交给人，不硬闯」既有姿态的落点，不是绕过验证码。**
+
+**窗口弹在运行后端的那台机器的桌面上**，不在调用方的浏览器里。当前后端与用户同在一个 RDP 会话所以看得见；后端搬去无桌面服务器后这个入口即失效，前端面板第一步就是在说这件事。前端倒计时 `AUTH_TIMEOUT_SECONDS` 与后端 `manual_login_timeout_ms` 是两份独立常量，**改一边必须改另一边**，否则页面会在脚本还在等的时候先归零（或反过来）。超时提示里的分钟数由 `CONFIG.manualLoginTimeout` 算出，别写死。
+
+**人中途关掉那个窗口是正常动作**（面板第四步本来就叫他关），`waitForManualLogin()` 因此返回 `'ok' | 'closed' | 'timeout'` 三态：不接住 `page.$` 会抛 `Target page, context or browser has been closed` 并以退出码 1 把一段 Playwright 堆栈送到界面上。`closed` 走的是和超时一样的退出码 3，给出「浏览器窗口被关闭，授权未完成」。
+
+**`last_auth_at` 必须两头都写**：`mark_authorized()` 在授权成功时写入，`clear_authorization()` 在退出码 3 落地时清空（清在 `CollectorRunner` 里，因为采集和人工授权超时两条路都要翻徽标）。只写不清会让界面在会话过期后一直显示「会话正常」——而采集恰恰正因会话失效在失败，用户被指向错误的排查方向。回归测试见 `TestSessionStateReflectsReality`。
 
 > ⚠️ **Facebook 服务条款禁止自动化登录与抓取，账号可能被封。用专用小号，不要复用任何有价值的账号。**
 
@@ -152,6 +158,20 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 `tests/fixtures/login_site.py` 已按上述结论复刻：302 跳转、随机 id、0×0 的 submit、以及那个会抢走点击的「显示密码」图标 —— 测的就是真实路径上的坑。
 
 **尚未验证的一段**：过完人机验证之后的小组页 DOM（`post` / `author` / `time` / `body` 那几个选择器）还没见过真实页面，目前仍是推测。选择器失配时有「第一批零帖子即硬失败」兜住，不会写出看起来完整的空结果，但要真正采到数据必须先完成一次人工授权、再照着真实 DOM 校准。
+
+### 已排除的三条路（核实过，不要再重复讨论）
+
+「能不能把 Facebook 登录搬进我们自己的页面里，人工输密码，这样就合规了」——方向对，但三种落法全部走不通，逐条核实过：
+
+| 思路 | 判定 | 依据 |
+|---|---|---|
+| iframe 内嵌 facebook.com 登录页 | **技术上不可能** | 本机实测 `HEAD https://www.facebook.com/login/` → `X-Frame-Options: DENY`。浏览器强制执行，无绕过手段 |
+| 自建仿 Facebook 登录表单代收密码 | **可行但绝不做** | 密码会多经过前端 JS、请求体、后端内存、日志、422 报文——本项目已为此踩过坑（FastAPI 默认回显提交值，实测漏过明文密码，靠 `main.py` 的 `RequestValidationError` handler 才堵上）。形态上即钓鱼，且照样过不了 Arkose |
+| 官方 Graph API + OAuth | **已不存在** | Graph API v19.0 changelog：`publish_to_groups`、`groups_access_member_info`、Groups API 于 **2024-04-22 移除**。不是「需审核」，是「已删除」 |
+
+于是落点是「本机真实窗口 + 页面内引导」：不搬画面，把「在系统页面里」落在发起、分步引导与状态回显上。**合法性不因「谁输的密码」而改变**——ToS 限制的是自动化采集内容本身；人工授权去掉的是「自动化登录」这一项，属实打实的安全改善（系统彻底不接触密码），后续脚本翻页提取仍在同一片灰色地带，上面那条小号警告继续有效。
+
+把真实浏览器画面用 CDP `Page.startScreencast` 推到页面 canvas（输入经 `Input.dispatch*` 回传）的方案**已评估，暂缓**：唯一不可替代的价值是「后端可部署到无桌面服务器」，而那件事还没发生；代价是 400–500 行跨 Node/Python/前端的新 WebSocket 通道（项目目前零 WS），且在唯一卡点上引入了未验证的不确定性（CDP 转发的输入能否过 Arkose）。**触发条件**：后端真要搬去无桌面机器时再实施。
 
 ## 帖子数据模型
 
@@ -253,7 +273,7 @@ translate 和 generate_excel 在 context 里没有 posts 时会**从各数据源
 
 ## 测试
 
-**159 个测试，必须全部 PASSED**（本机实测 `159 passed in 93s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**161 个测试，必须全部 PASSED**（本机实测 `161 passed in 154s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v

@@ -161,16 +161,31 @@ async function handleDeleteCredential(source: SourcePublic) {
 
 const authorizingId = ref('')
 const authLogs = ref<string[]>([])
+const authRemaining = ref(0)
 let authStream: EventSource | null = null
+let authTimer: ReturnType<typeof setInterval> | undefined
+
+// 与后端 source_service.start_authorization 里的 manual_login_timeout_ms 对齐。
+// 人要过一次人机验证、可能还要去手机上取验证码，对着一个没反应的窗口干等最难受
+const AUTH_TIMEOUT_SECONDS = 10 * 60
+
+const authCountdown = computed(() => {
+  const m = Math.floor(authRemaining.value / 60)
+  const s = authRemaining.value % 60
+  return `${m}:${String(s).padStart(2, '0')}`
+})
 
 function closeAuthStream() {
   authStream?.close()
   authStream = null
+  clearInterval(authTimer)
+  authTimer = undefined
 }
 
 async function handleAuthorize(source: SourcePublic) {
   authorizingId.value = source.id
   authLogs.value = []
+  authRemaining.value = AUTH_TIMEOUT_SECONDS
   try {
     await sourcesApi.authorizeSource(source.id)
   } catch (e: any) {
@@ -179,6 +194,9 @@ async function handleAuthorize(source: SourcePublic) {
     return
   }
   closeAuthStream()
+  authTimer = setInterval(() => {
+    if (authRemaining.value > 0) authRemaining.value--
+  }, 1000)
   authStream = new EventSource(sourcesApi.authorizeEventsUrl(source.id))
   authStream.addEventListener('log', (ev: MessageEvent) => {
     authLogs.value.push(JSON.parse(ev.data).message)
@@ -198,8 +216,11 @@ async function handleAuthorize(source: SourcePublic) {
     await loadData()
   })
   authStream.onerror = () => {
+    // 断流不等于授权失败：后端窗口还开着。不说一声就收掉面板，
+    // 用户会对着桌面上那个 Chrome 窗口不知道该不该继续
     closeAuthStream()
     authorizingId.value = ''
+    toast.error('进度连接中断，请到弹出的窗口确认登录结果，或重新发起授权')
   }
 }
 
@@ -312,10 +333,22 @@ function formatTime(iso: string | null): string {
 
     <!-- 人工登录进度 -->
     <div v-if="authorizingId" class="card">
-      <div class="card-header">🧑 人工登录进行中</div>
+      <div class="card-header">
+        🧑 人工登录进行中
+        <span class="text-sm" style="float: right; font-family: monospace;"
+          :style="{ color: authRemaining <= 60 ? 'var(--error)' : 'var(--text-secondary)' }">
+          剩余 {{ authCountdown }}
+        </span>
+      </div>
+      <ol class="text-sm mb-4" style="padding-left: 20px; line-height: 1.9;">
+        <li>已经弹出一个浏览器窗口 —— 它在<strong>运行后端的那台机器的桌面上</strong>，
+          不是你当前这个浏览器里的标签页。</li>
+        <li>在那个窗口里输入账号和密码。<strong>密码直接输给站点，本系统不经手也不保存。</strong></li>
+        <li><strong>亲手完成人机验证 / 两步验证。</strong>这一步只能由你来，脚本不会做任何绕过尝试。</li>
+        <li>本页提示「授权成功」后即可关闭那个窗口。之后的采集会直接复用会话，不再需要密码。</li>
+      </ol>
       <p class="text-secondary text-sm mb-4">
-        已在服务器上打开一个浏览器窗口，请在里面完成登录（含人机验证 / 两步验证）。
-        登录成功后会话会被保存，之后的采集不再需要密码。10 分钟内未完成即超时。
+        倒计时归零仍未完成即超时，重新点一次「人工登录」即可再来一轮。
       </p>
       <div style="font-family: monospace; font-size: 12px; max-height: 180px; overflow-y: auto;">
         <div v-for="(line, i) in authLogs" :key="i" class="text-secondary">{{ line }}</div>
@@ -370,7 +403,9 @@ function formatTime(iso: string | null): string {
               <template v-if="item.has_credential">
                 <span class="badge badge-completed">已配置</span>
                 <div class="text-secondary">{{ item.credential_username }}</div>
-                <div class="text-secondary">上次授权 {{ formatTime(item.last_auth_at) }}</div>
+                <div v-if="item.last_auth_at" class="text-secondary">
+                  上次授权 {{ formatTime(item.last_auth_at) }}
+                </div>
               </template>
               <template v-else-if="!item.needs_credentials">
                 <span class="text-secondary">无需登录</span>
@@ -378,8 +413,11 @@ function formatTime(iso: string | null): string {
               <template v-else>
                 <span class="badge badge-failed">未配置</span>
               </template>
-              <div v-if="item.needs_credentials" class="text-secondary" style="margin-top: 2px;">
-                {{ item.last_auth_at ? '会话正常' : '需重新授权' }}
+              <!-- 会话失效时 CollectorRunner 会清掉 last_auth_at，所以这里翻转即代表
+                   「该点人工登录了」，是个可操作状态，要比「会话正常」显眼 -->
+              <div v-if="item.needs_credentials" style="margin-top: 2px;">
+                <span v-if="item.last_auth_at" class="text-secondary">会话正常</span>
+                <span v-else style="color: var(--warning, #F59E0B); font-weight: 500;">需重新授权</span>
               </div>
             </td>
             <td style="text-align: center;">

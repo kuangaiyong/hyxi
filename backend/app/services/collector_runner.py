@@ -257,6 +257,16 @@ class CollectorRunner:
             if proc.returncode == EXIT_NEEDS_MANUAL_AUTH:
                 lines = stderr_text.strip().splitlines()
                 reason = auth_reason[0] or (lines[-1][:200] if lines else "需要人工完成登录验证")
+                # 退出码 3 就是脚本对「这个会话不管用了」的权威判定，拿它把授权时间抹掉，
+                # 界面上的「会话正常」才不会在采集正因会话失效而失败时继续显示。
+                # 清在这里而不是各个调用方：采集和人工授权超时两条路都要翻徽标。
+                # 抹不掉也不能盖住下面这句可操作的提示——那是用户唯一能照着做的东西
+                try:
+                    from app.services import source_service
+
+                    source_service.clear_authorization(source_id)
+                except Exception as e:
+                    logger.warning("清除数据源 %s 的授权状态失败: %s", source_id, e)
                 raise ManualAuthRequired(
                     source_id, source.get("name") or source_id, reason
                 )

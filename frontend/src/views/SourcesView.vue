@@ -314,8 +314,8 @@ function formatTime(iso: string | null): string {
     <div v-if="authorizingId" class="card">
       <div class="card-header">🧑 人工登录进行中</div>
       <p class="text-secondary text-sm mb-4">
-        已在服务器上打开一个浏览器窗口，请在里面完成登录（含两步验证 / 安全检查）。
-        登录成功后会话会被保存，之后的采集不再需要密码。5 分钟内未完成即超时。
+        已在服务器上打开一个浏览器窗口，请在里面完成登录（含人机验证 / 两步验证）。
+        登录成功后会话会被保存，之后的采集不再需要密码。10 分钟内未完成即超时。
       </p>
       <div style="font-family: monospace; font-size: 12px; max-height: 180px; overflow-y: auto;">
         <div v-for="(line, i) in authLogs" :key="i" class="text-secondary">{{ line }}</div>

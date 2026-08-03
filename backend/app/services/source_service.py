@@ -108,6 +108,8 @@ def start_authorization(source_id: str, source: dict) -> None:
             collector = get_collector(source["collector_id"])
             job_source = dict(source)
             job_source["mode"] = "login_only"
+            # 人来过一次 Arkose 人机验证、必要时还要去手机上取验证码，5 分钟偏紧
+            job_source.setdefault("manual_login_timeout_ms", 10 * 60 * 1000)
             await CollectorRunner.execute(
                 channel, collector, job_source, progress_manager, 0
             )

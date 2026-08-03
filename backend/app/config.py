@@ -25,13 +25,17 @@ class Settings(BaseSettings):
     enable_docs: bool = True  # 对外暴露时设 TWEAKERS_ENABLE_DOCS=false 关闭 /docs
     # /api/v1/* 的共享密钥，留空则不鉴权（见 app/auth.py）
     api_key: str = ""
+    # 数据源凭据的加密密钥（Fernet），留空则拒绝保存凭据（见 app/services/crypto.py）
+    secret_key: str = ""
 
     # 任务限制
     max_concurrent_tasks: int = 1
     task_timeout_minutes: int = 30
     sse_keepalive_seconds: int = 15
 
-    model_config = {"env_prefix": "TWEAKERS_", "env_file": ".env"}
+    # env_file 锚死在项目根：写相对路径时 pydantic-settings 按 cwd 找，而文档里的启动命令
+    # 先 cd 进 backend，根目录的 .env 会被整个跳过（密钥漏配却毫无提示）
+    model_config = {"env_prefix": "TWEAKERS_", "env_file": os.path.join(project_root, ".env")}
 
 
 settings = Settings()

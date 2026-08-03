@@ -7,3 +7,4 @@ httpx==0.28.0
 python-multipart==0.0.12
 APScheduler==3.11.3
 SQLAlchemy==2.0.51
+cryptography==49.0.0

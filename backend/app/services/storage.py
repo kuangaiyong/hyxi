@@ -35,6 +35,25 @@ CREATE TABLE IF NOT EXISTS sentiment (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS sources (
+    id TEXT PRIMARY KEY,
+    collector_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    params_json TEXT NOT NULL DEFAULT '{}',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_auth_at TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS credentials (
+    source_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL DEFAULT 'password',
+    username TEXT NOT NULL DEFAULT '',
+    secret_enc TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sentiment_created ON sentiment(created_at DESC);
@@ -241,7 +260,130 @@ def get_sentiment(task_id: str) -> Optional[dict]:
         conn.close()
 
 
+# ===== Source / Credential CRUD =====
+
+def save_source(source: dict):
+    """保存/更新数据源。
+
+    必须用 ON CONFLICT DO UPDATE 而不是 INSERT OR REPLACE：REPLACE 是「删旧行再插新行」，
+    在 foreign_keys=ON 下会触发 credentials 的 ON DELETE CASCADE —— 改个名字就把凭据清空了。
+    """
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO sources
+               (id, collector_id, name, params_json, enabled, last_auth_at, created_at)
+               VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(id) DO UPDATE SET
+                   collector_id = excluded.collector_id,
+                   name = excluded.name,
+                   params_json = excluded.params_json,
+                   enabled = excluded.enabled,
+                   last_auth_at = excluded.last_auth_at""",
+            (
+                source["id"],
+                source["collector_id"],
+                source.get("name", ""),
+                json.dumps(source.get("params", {}), ensure_ascii=False),
+                1 if source.get("enabled", True) else 0,
+                _to_iso(source.get("last_auth_at")),
+                _to_iso(source.get("created_at")) or datetime.now().isoformat(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_sources(enabled_only: bool = False) -> List[dict]:
+    """加载数据源列表"""
+    conn = _get_conn()
+    try:
+        sql = "SELECT * FROM sources"
+        if enabled_only:
+            sql += " WHERE enabled = 1"
+        sql += " ORDER BY created_at"
+        return [_row_to_source(r) for r in conn.execute(sql).fetchall()]
+    finally:
+        conn.close()
+
+
+def get_source(source_id: str) -> Optional[dict]:
+    conn = _get_conn()
+    try:
+        row = conn.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
+        return _row_to_source(row) if row else None
+    finally:
+        conn.close()
+
+
+def delete_source(source_id: str) -> bool:
+    """删除数据源。凭据靠外键 ON DELETE CASCADE 一并清掉"""
+    conn = _get_conn()
+    try:
+        cur = conn.execute("DELETE FROM sources WHERE id = ?", (source_id,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def save_credential(source_id: str, kind: str, username: str, secret_enc: str):
+    """保存凭据。secret_enc 必须是已加密的密文，本层不做加密"""
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """INSERT OR REPLACE INTO credentials
+               (source_id, kind, username, secret_enc, created_at) VALUES (?,?,?,?,?)""",
+            (source_id, kind, username, secret_enc, datetime.now().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_credential(source_id: str) -> Optional[dict]:
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM credentials WHERE source_id = ?", (source_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "source_id": row["source_id"],
+            "kind": row["kind"],
+            "username": row["username"],
+            "secret_enc": row["secret_enc"],
+            "created_at": row["created_at"],
+        }
+    finally:
+        conn.close()
+
+
+def delete_credential(source_id: str) -> bool:
+    conn = _get_conn()
+    try:
+        cur = conn.execute("DELETE FROM credentials WHERE source_id = ?", (source_id,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 # ===== Helpers =====
+
+def _row_to_source(row) -> dict:
+    return {
+        "id": row["id"],
+        "collector_id": row["collector_id"],
+        "name": row["name"],
+        "params": json.loads(row["params_json"] or "{}"),
+        "enabled": bool(row["enabled"]),
+        "last_auth_at": row["last_auth_at"],
+        "created_at": row["created_at"],
+    }
+
 
 def _row_to_task(row) -> dict:
     """将 SQLite row 转为任务 dict"""

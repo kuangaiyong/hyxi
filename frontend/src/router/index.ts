@@ -21,6 +21,11 @@ const routes = [
     component: () => import('@/views/SentimentIndexView.vue'),
   },
   {
+    path: '/sources',
+    name: 'Sources',
+    component: () => import('@/views/SourcesView.vue'),
+  },
+  {
     path: '/schedules',
     name: 'Schedules',
     component: () => import('@/views/ScheduleView.vue'),

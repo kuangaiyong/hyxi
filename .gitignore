@@ -12,6 +12,7 @@ backend/data/exports/
 backend/data/hyxi.db*
 backend/data/logs/
 backend/data/jobs/
+backend/data/sessions/
 
 # 依赖
 node_modules/

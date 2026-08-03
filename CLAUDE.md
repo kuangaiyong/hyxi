@@ -89,7 +89,7 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
 
 | 存储 | 用途 |
 |------|------|
-| `backend/data/hyxi.db` | **主存储** — tasks + sentiment 两张表（WAL 模式） |
+| `backend/data/hyxi.db` | **主存储** — tasks / sentiment / sources / credentials 四张表（WAL 模式） |
 | `backend/data/config.json` | LLM API 配置（含明文 API Key，已 gitignore） |
 | `backend/data/tasks.json` | JSON 回退存储（仅 SQLite 不可用时启用） |
 | `backend/data/sentiment_{task_id}.json` | 舆情结果（与 DB 双写） |
@@ -102,6 +102,22 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
 **存储策略**：启动时 `init_db()` 建表，然后 `migrate_from_json()` 在 tasks 表为空时把历史 JSON 迁进来。DB 不可用则整体回退 JSON（`self._db_ready` 开关）。每次任务变更走 `_persist()` → 对所有内存任务逐条 upsert。
 
 定时任务是**双份存储**：调度触发器在 `scheduler.db`，业务配置（description / interval / enabled / history）在 `scheduled_tasks.json`。改定时任务逻辑时两边要同步（`SchedulerService.update()` 就是先写 JSON，再 `remove_job` + `_add_job`）。
+
+## 数据源与凭据
+
+`sources` 表存用户在「数据源」页注册的采集实例（`collector_id` + `params_json`），`credentials` 表存对应的登录凭据，`ON DELETE CASCADE` 挂在 `source_id` 上（`_get_conn()` 里已开 `PRAGMA foreign_keys=ON`，删源即删凭据）。首启时 `seed_default_sources()` 只在 sources 表整体为空时补一条 Tweakers 源 —— 用户删掉就是不想要，不该每次启动又长回来。
+
+密码用 **`cryptography.Fernet` 对称加密**后落 `credentials.secret_enc`，密钥取自 `TWEAKERS_SECRET_KEY`：
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+生成后写进项目根 `.env`（已 gitignore）。**没配密钥时后端拒绝保存凭据并返回 400，不会静默降级成明文落库** —— 平台账号被盗的后果远大于可随时轮换的 LLM key。密钥换了以后旧密文解不开，`decrypt()` 会明说「与保存时的密钥不一致，请重新录入凭据」。
+
+凭据**只进不出**：`SourcePublic` 只回 `has_credential` 和 `credential_username`，任何端点都不会把密码或密文读回去；`get_credential_secret()` 仅供采集器子进程的启动路径调用。`CollectorRunner` 也**不再把命令行 emit 到 SSE 和任务日志**（旧 `ScraperService` 会），密码既不进 argv 也不进 job 文件。
+
+`source_service._validate_params()` 只保留 `Collector.param_fields` 声明过的键 —— params 会原样进 job 文件，放任未知键通过等于给了一条绕过声明往采集脚本塞参数的路。
 
 ## 帖子数据模型
 
@@ -156,6 +172,15 @@ DELETE /api/v1/schedules/{id}        删除
 POST   /api/v1/schedules/{id}/toggle 启用/暂停
 POST   /api/v1/schedules/{id}/run    手动触发
 
+GET    /api/v1/collectors                    可用采集器清单（param_fields 驱动前端表单）
+GET    /api/v1/sources                       数据源列表
+POST   /api/v1/sources                       注册数据源
+GET    /api/v1/sources/{id}                  详情
+PATCH  /api/v1/sources/{id}                  更新（采集器不可换）
+DELETE /api/v1/sources/{id}                  删除（凭据级联删除）
+PUT    /api/v1/sources/{id}/credential       录入凭据（加密落库，只进不出）
+DELETE /api/v1/sources/{id}/credential       清除凭据
+
 GET    /api/health                   健康检查
 ```
 
@@ -196,17 +221,13 @@ translate 和 generate_excel 在 context 里没有 posts 时会**自动从 `twea
 
 ## 前端
 
-Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/src`。已注册路由：`/tasks`（默认）、`/sentiment`、`/schedules`、`/config`、`/tasks/:id/progress`、`/tasks/:id/results`、`/tasks/:id/sentiment`。
+Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/src`。已注册路由：`/tasks`（默认）、`/sentiment`、`/schedules`、`/sources`、`/config`、`/tasks/:id/progress`、`/tasks/:id/results`、`/tasks/:id/sentiment`。
 
 `useSSE.ts` 是唯一的 SSE 消费点：监听 `step_start` / `step_progress` / `step_complete` / `log` / `error` / `task_complete`，收到 `task_complete` 后主动 `disconnect()`。
 
-**生产构建**：`npm run build`（= `vue-tsc -b && vite build`）**当前会失败** —— `SentimentView.vue` 有 6 个真实类型错误（`pending_count` 不在返回类型上、多处 possibly-undefined 索引）。构建请用：
+`SourcesView.vue` 的参数表单**不写死字段**，按 `GET /api/v1/collectors` 回的 `param_fields` 渲染；必填校验以后端 `_validate_params()` 的 400 为准，前端只负责把报文显示出来。加新采集器时前端零改动。
 
-```bash
-cd frontend && npx vite build
-```
-
-要根治得同时补 `types/sentiment.ts` 的返回类型和那几处空值判断。
+**生产构建**：`npm run build`（= `vue-tsc -b && vite build`）。
 
 ## 关键设计决策
 

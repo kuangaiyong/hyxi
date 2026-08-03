@@ -38,6 +38,53 @@ class ConfigTestResult(BaseModel):
     message: str
 
 
+# ===== 数据源 =====
+
+class SourceCreate(BaseModel):
+    """注册一个数据源"""
+    collector_id: str = Field(..., description="采集器 ID", min_length=1)
+    name: str = Field("", description="显示名称", max_length=100)
+    params: Dict = Field(default_factory=dict, description="采集参数，字段由采集器声明")
+    enabled: bool = True
+
+
+class SourceUpdate(BaseModel):
+    """更新数据源，只改传上来的字段"""
+    name: Optional[str] = Field(None, max_length=100)
+    params: Optional[Dict] = None
+    enabled: Optional[bool] = None
+
+
+class SourcePublic(BaseModel):
+    """数据源出口模型。凭据只回「有没有」和用户名，密码与密文都不出后端"""
+    id: str
+    collector_id: str
+    collector_name: str
+    name: str
+    params: Dict = Field(default_factory=dict)
+    enabled: bool
+    needs_credentials: bool
+    has_credential: bool
+    credential_username: str = ""
+    last_auth_at: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class CredentialInput(BaseModel):
+    """录入凭据。只进不出——没有任何端点会把它读回去"""
+    username: str = Field(..., min_length=1, max_length=200)
+    password: str = Field(..., min_length=1, max_length=500)
+
+
+class CollectorInfo(BaseModel):
+    """可用采集器，param_fields 驱动前端表单渲染"""
+    id: str
+    display_name: str
+    needs_credentials: bool
+    incremental_strategy: str
+    param_fields: List[Dict] = Field(default_factory=list)
+
+
 # ===== 任务相关 =====
 
 class TaskStatus(str, Enum):

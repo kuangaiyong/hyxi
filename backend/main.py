@@ -3,8 +3,11 @@
 import os
 import logging
 from contextlib import asynccontextmanager
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from app.auth import require_api_key
 from app.config import settings
 from app.logging_config import get_logger
@@ -12,7 +15,9 @@ from app.routers import config as config_router
 from app.routers import tasks as tasks_router
 from app.routers import results as results_router
 from app.routers import schedules as schedules_router
+from app.routers import sources as sources_router
 from app.services.scheduler_service import scheduler_service
+from app.services.source_service import seed_default_sources
 
 
 @asynccontextmanager
@@ -28,6 +33,11 @@ async def lifespan(app: FastAPI):
             "未设置 TWEAKERS_API_KEY，/api/v1/* 处于无鉴权状态；"
             "任何能访问本端口的人都可覆写 LLM 密钥、导出全部数据，请勿绑定 0.0.0.0"
         )
+    # 与下面的调度器同理：补默认数据源是便利功能，磁盘满或库被占用时不该让整个服务起不来
+    try:
+        seed_default_sources()
+    except Exception:
+        logging.getLogger("hyxi.source").exception("默认数据源初始化失败，服务继续运行")
     # 启动定时任务调度器：调度是附属能力，起不来也不该让整个 API 服务不可用
     try:
         scheduler_service.start()
@@ -56,11 +66,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    """422 报文里剔掉 input —— FastAPI 默认会把提交的原始值原样回显，
+    密码、LLM api_key 这类只进不出的字段会因为一次长度校验失败就整个吐回去"""
+    errors = [{k: v for k, v in e.items() if k != "input"} for e in exc.errors()]
+    return JSONResponse(status_code=422, content=jsonable_encoder({"detail": errors}))
+
+
 _protected = [Depends(require_api_key)]
 app.include_router(config_router.router, dependencies=_protected)
 app.include_router(tasks_router.router, dependencies=_protected)
 app.include_router(results_router.router, dependencies=_protected)
 app.include_router(schedules_router.router, dependencies=_protected)
+app.include_router(sources_router.router, dependencies=_protected)
 
 
 @app.get("/")

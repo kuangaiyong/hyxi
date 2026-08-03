@@ -14,6 +14,7 @@ const pageTitle = computed(() => {
     case 'SentimentIndex': return '舆情分析'
     case 'Sentiment': return '舆情详情'
     case 'Schedules': return '定时任务'
+    case 'Sources': return '数据源'
     default: return 'HYXi 舆情分析'
   }
 })
@@ -50,6 +51,9 @@ onMounted(() => {
         </router-link>
         <router-link to="/schedules">
           <span class="nav-icon">⏰</span> 定时任务
+        </router-link>
+        <router-link to="/sources">
+          <span class="nav-icon">🌐</span> 数据源
         </router-link>
         <router-link to="/config">
           <span class="nav-icon">⚙️</span> LLM 配置

@@ -640,6 +640,36 @@ class TestLoggingConfigEndToEnd:
         assert logger1 is logger2
 
 
+class TestEnvFileAnchoringEndToEnd:
+    """.env 只认项目根那一份 —— 文档里的启动命令先 cd 进 backend，
+    env_file 写相对路径的话根目录配置会被整个跳过，密钥漏配还毫无提示"""
+
+    def test_env_file_is_project_root_not_cwd(self):
+        from app.config import Settings
+
+        env_file = Settings.model_config["env_file"]
+        assert os.path.isabs(env_file)
+        assert env_file == os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            ".env",
+        )
+
+    def test_stray_env_in_cwd_is_ignored(self):
+        """在别处放一份同名 .env 并切过去，配置不能被它带跑"""
+        from app.config import Settings
+
+        tmpdir = tempfile.mkdtemp()
+        original_cwd = os.getcwd()
+        try:
+            with open(os.path.join(tmpdir, ".env"), "w") as f:
+                f.write("TWEAKERS_SECRET_KEY=stray-key-from-cwd\n")
+            os.chdir(tmpdir)
+            assert Settings().secret_key != "stray-key-from-cwd"
+        finally:
+            os.chdir(original_cwd)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 class TestTranslationNumberingStripEndToEnd:
     """翻译结果的编号前缀剥离：不得吞掉正文里的真实数值"""
 

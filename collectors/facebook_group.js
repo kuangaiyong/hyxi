@@ -42,13 +42,18 @@ const CONFIG = {
 // 提取与登录判定都靠选择器。站点改版时提取器返回 0 条，被「第一批零帖子即硬失败」拦住，
 // 不会写出一份看起来完整实际是空的结果。
 const SELECTORS = {
-    // 登录态判定：出现发帖入口即视为已登录
+    // 以下选择器于 2026-08-03 对真实 facebook.com 探测核实过（见 CLAUDE.md）：
+    // 表单元素的 id 是随机的（形如 _R_1h6kqsqppb6amH1_），只能按 name 选；
+    // 登录页上 [data-testid] 和 [name="login"] 都不存在，别再往回加。
     loggedIn: '[role="feed"], [data-pagelet^="GroupsFeed"], [aria-label="创建帖子"], [aria-label="Create a post"]',
-    usernameInput: 'input[name="email"], #email',
-    passwordInput: 'input[name="pass"], #pass',
-    submitButton: 'button[name="login"], [data-testid="royal_login_button"]',
+    usernameInput: 'input[name="email"]',
+    passwordInput: 'input[name="pass"]',
+    // 没有 submitButton：表单靠在密码框按回车提交（原因见 lib/auth.js 的 ensureLogin）
     twoFactorInput: 'input[name="approvals_code"], #approvals_code',
-    loginError: '#error_box, [data-testid="login_error_message"]',
+    // 只认 #error_box。**别加 [role="alert"]** —— 填入密码后页面会冒出一条
+    // aria-live 提示（荷兰语「Je wachtwoord wordt weergegeven」/「你的密码正在显示」），
+    // 那是无障碍朗读用的，不是错误；把它当错误会让每一次正常登录都被判成密码不对。
+    loginError: '#error_box',
     // 内容提取
     post: '[role="article"]',
     comment: '[role="article"] [role="article"]',

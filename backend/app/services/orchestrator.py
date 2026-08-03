@@ -267,7 +267,6 @@ class TaskOrchestrator:
                             # 这条异常的消息本身就是给用户看的人话（含「去哪点哪个按钮」），
                             # 不要再包一层技术描述把它埋掉
                             await self._task_log(task_id, "error", str(e))
-                            task["needs_auth_source_id"] = e.source_id
                             raise
                         posts = collector.normalize(result)
                         for p in posts:

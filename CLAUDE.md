@@ -137,14 +137,20 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 > ⚠️ **Facebook 服务条款禁止自动化登录与抓取，账号可能被封。用专用小号，不要复用任何有价值的账号。**
 
-**`facebook_group.js` 的登录逻辑目前只在本地 fixture（`tests/fixtures/login_site.py`，传统同步表单 + Set-Cookie）上验证过，真站没跑过。** 下面四点是 fixture 覆盖不到、上真站前必须先用有头模式（`headless=False`）人工过一遍的：
+### 真站实测结论（2026-08-03，对 facebook.com 实跑）
 
-1. `ensureLogin()` 里 `Promise.all([waitForLoadState('domcontentloaded'), click(submit)])` 假设点登录会触发整页导航。真站大概率是 AJAX 局部刷新，`waitForLoadState` 会立刻在旧页面上 resolve，`classifyLanding()` 读到的就是提交前的状态
-2. `classifyLanding()` 用 `/\/checkpoint\//` 判安全检查。真站的检查页 / 异常登录提示 URL 形态很多（含同页弹层），大概率覆盖不全，会落到 `unknown` 分支
-3. `SELECTORS` 是对当前 Facebook DOM 的推测。选择器失配时提取那边有「第一批零帖子即硬失败」兜住（不会误报成功），但**登录判定本身会一直落不到 `ok`**，表现为每次都判登录失败
-4. `loggedIn` 判定假设未登录访问 `/groups/{id}` 会看到登录表单。真站对公开小组很可能给未登录用户看只读预览，那样这条判定整个失效
+本机能连通 facebook.com（DNS 57.144.220.1，HTTPS 200），不像 Tweakers 那样被封。以下全是实测，**改登录相关代码前先读这一段，别照着猜再叠选择器**：
 
-改这四处时**先在有头模式下看真实页面长什么样**，而不是照着猜再叠选择器 —— 与「反爬虫姿态」一节的升级路径一致。
+- **未登录访问 `/groups/{id}` 会 302 到 `/login/?next=...`**，是登录墙不是只读预览。所以 `ensureLogin()` 落地时通常已经在登录页上，不必再跳一次
+- **登录表单是 `form#login_form`（`method=post`），输入框 id 是随机的**（形如 `_R_1h6kqsqppb6amH1_`），只能按 `input[name="email"]` / `input[name="pass"]` 选。页面上**没有 `[data-testid]`，也没有 `[name="login"]`**
+- **提交必须靠在密码框按回车，不要点按钮**：`input[type="submit"]` 是 0×0 不可见的；表单里 DOM 顺序第一个 `[role="button"]` 是 24×24 的**「显示密码」图标**——按选择器点过去只会把密码显示出来，表单一次都没提交，而页面看上去毫无变化，极难察觉
+- **`[role="alert"]` 绝不能当登录错误**：密码框一被填入，页面就冒出一条 aria-live 提示（荷兰语 `Je wachtwoord wordt weergegeven`），当成错误会让**每一次正常登录都被判成密码不对**。`loginError` 只认 `#error_box`
+- **提交后不要赌它整页导航**：`waitForLanding()` 轮询到状态确定为止（`classifyLanding()` 对「还停在登录页且没报错」返回 `pending`），导航还是 AJAX 都不影响。当场判死会把提交到落地之间那一段误报成密码错
+- **真实拦截点是 Arkose Labs 人机验证**：落地 URL 为 `/two_step_verification/authentication/?...&flow=pre_authentication`，正文提到 “MatchKey van Arkose Labs”。这不是输个短信码就完事的两步验证，**必须人来过** —— `classifyLanding()` 把它归入 `checkpoint`，脚本以退出码 3 交回给人。破解它属于「明确不做」
+
+`tests/fixtures/login_site.py` 已按上述结论复刻：302 跳转、随机 id、0×0 的 submit、以及那个会抢走点击的「显示密码」图标 —— 测的就是真实路径上的坑。
+
+**尚未验证的一段**：过完人机验证之后的小组页 DOM（`post` / `author` / `time` / `body` 那几个选择器）还没见过真实页面，目前仍是推测。选择器失配时有「第一批零帖子即硬失败」兜住，不会写出看起来完整的空结果，但要真正采到数据必须先完成一次人工授权、再照着真实 DOM 校准。
 
 ## 帖子数据模型
 

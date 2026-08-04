@@ -100,6 +100,7 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
 | `backend/data/scheduler.db` | APScheduler job store |
 | `backend/data/scheduled_tasks.json` | 定时任务业务配置（与 job store 分离） |
 | `backend/data/exports/*.xlsx` | 生成的 Excel |
+| `backend/data/media/{source_id}/*` | 采集时下载的正文图（已 gitignore） |
 | `backend/data/logs/app.log` | 滚动日志（5MB x 3） |
 | `tweakers_thread_{id}.json` | **项目根目录**，抓取的原始帖子数据，也是翻译结果的落盘位置 |
 
@@ -176,6 +177,8 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 - **评论正文是一串并列的 `div[dir="auto"]`，一段一个**（`commentText()`）。`querySelector` 只拿第一段 —— 实测一条 9 段的评论只存下第一段的 71 个字符，原文 811 个，丢了 92%；一轮 42 条评论里 13 条多段，共丢 2792 个字符。**层级限定不能省**：嵌套回复也是 `article`，不加 `closest(sel.post) === root` 就会把子回复的正文并进父评论，父子两条都错。主贴不走这条路（取的是 `[data-ad-comet-preview="message"]` 容器的 textContent，本来就含全部段落），所以主贴段落之间没有换行、评论之间有 —— 这是两条不同的取法，不是 bug
 - **「查看N条回复」/「查看更多评论」目前不点，那部分评论根本没进 DOM**（实测一页上有 26 条这样的回复）。要补齐得循环点击并等加载，会显著增加请求量，与反爬虫姿态需要一并权衡
 - **信息流里混着不是帖子的 `role="article"`**（广告、推荐小组卡片），既没有固定链接也没有正文容器，`flatten()` 用 `isNotAPost()` 把它们丢掉。存下来就是一条四个字段全空的记录 —— 白占一次翻译调用（清理前的落盘数据里有 55 条这种，全被标成「已翻译」），还会在结果页显示成一条什么都没有的帖子。**判据是 id 和正文全都没有**：纯图片帖有 id 没正文、正文没渲染出来的帖子有正文没 id，两种都是真帖子，不能误伤
+- **正文图是 `<img>`，host 在 `scontent-*.xx.fbcdn.net` 上，渲染尺寸几百像素**（实测 367×795 这个量级，`alt` 是 Facebook 自动生成的「可能是包含下列内容的图片：…」）。界面图标是 `data:image/svg+xml`（16~18px）、emoji 在 `static.xx.fbcdn.net`，按 host 一刀就切干净；**头像是 `<svg><image>` 不是 `img`**，压根不会被 `querySelectorAll('img')` 选中。尺寸下限是第二道保险
+- **图片不必额外滚动去凑**：实测滚到底后逐个主贴 `scrollIntoView`，原有 15 个主贴的图片数**一张没变**（1→1、0→0），多出来的全是新滚出来的帖子 —— 也就是说「这条没图」是真没图，不是懒加载没触发
 - **真实 `message_id` 实测全是 16 位纯数字**。`p1` / `c1` 这种前缀式 id 只有 fixture 站点会生成 —— 落盘数据里出现它就说明某次测试写进了真实文件（发生过 3 条）
 
 实测证据（真 facebook.com 小组 `2407063016436085`）：2 批时 41 条 = 19 主贴 + 22 评论；3 批时 76 条 = 34 主贴 + 42 评论，**时间 / 作者 / `message_id` 无一为空，四字段全空 0 条，含展开/收起标记 0 条，指纹重复 0 组**；**保留结果再跑一次增量：提取 16 条、新增 0 条** —— 展开是确定性的，指纹跨进程稳定。
@@ -269,6 +272,8 @@ DELETE /api/v1/sources/{id}/credential       清除凭据
 POST   /api/v1/sources/{id}/authorize        人工登录（开有头浏览器让人过 2FA）
 GET    /api/v1/sources/{id}/authorize/events 人工登录 SSE 进度流
 
+GET    /api/v1/media/{path}          回读采集下来的正文图（受同一套密钥保护）
+
 GET    /api/health                   健康检查
 ```
 
@@ -296,7 +301,7 @@ translate 和 generate_excel 在 context 里没有 posts 时会**从各数据源
 
 ## 测试
 
-**171 个测试，必须全部 PASSED**（本机实测 `171 passed in 242s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**176 个测试，必须全部 PASSED**（本机实测 `176 passed in 255s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
@@ -364,6 +369,7 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 - **本地 fixture 站点是唯一能跑通的验证手段**：Tweakers 出口 IP 被封，`backend/tests/fixtures/fixture_site.py` 同时挂论坛（`/forum/list_messages/...`）和小组（`/groups/{id}/batch/{n}`）两个站点。跑的仍是真 Chrome、真 HTTP、真子进程、真 DOM 提取，只是被抓的站点换成本地的。要把数据源指过去就在数据源页填 `base_url`
 - **增量抓取从 `maxPage + 1` 开始**（Tweakers）：已抓过的最后一页后来新增的回帖会被永久漏掉，fingerprint 去重救不了（那一页不会再访问）。要补全就把 job 里的 `incremental` 置 false 跑全量
 - **采集脚本必须「读旧 + 合并」再落盘，绝不能只写这一轮抓到的**：落盘文件同时承载 `translation` 和 `_processed` 标记，整体覆盖等于把已翻译的帖子重新变成新帖，下一轮再付一次翻译钱、舆情也重算一遍。`group_feed.js` 曾漏掉这段（信息流没有页码可续，很容易写成「全量重扫 + 覆盖」），已修并有回归测试 `TestGroupFeedCollectorEndToEnd::test_incremental_rerun_keeps_translations`
+- **正文图只存相对路径，`<img>` 靠 `?api_key=` 过鉴权**：`/api/v1/media/{path}` 不能用 `StaticFiles` 挂载 —— `<img>` 没法自定义请求头，只能复用 `require_api_key` 为 SSE 开的 query 参数口子。**路径穿越必须挡**：`data/config.json` 里是明文 LLM API Key。裸的 `../` 通常在客户端就被规范化掉，但 `%2e%2e%2f` 会被框架解码后原样送进 `rel_path` —— 实测确认过，拿裸 `../` 当测试用例等于什么都没测（把校验整段禁用，那版照样绿）
 - **存储顺序不是时间顺序，求时间区间必须排序取极值**：信息流按时间倒序渲染，增量又往后追加，落盘数组的首尾和最早/最晚毫无关系。`/stats` 曾直接取 `timestamps[0]` / `[-1]`，实测显示成「开始 2026-07-28、结束 2026-07-10」——开始比结束晚 18 天，还把跨 5～8 月的数据缩成 7 月里的 18 天。排序也**必须先 `_normalize_timestamp()` 转 ISO**：落盘的 `dd-mm-yyyy` 按字符串排是按「日」排先，`01-07` 会排到 `28-06` 前面
 - **`/posts` 的响应里评论挂在主贴的 `replies` 下，按 index 建索引时必须递归展开**：`SentimentView.loadPosts()` 曾只遍历顶层 `posts`，把全部评论漏在外面 —— 实测 88 条里 42 条是评论，情感趋势图只画了 35 条（该 73 条），详情弹窗点评论行也取不到帖子。舆情结果的下标来自扁平数组，评论一样占位
 - **`/posts` 的 `index` 是扁平存储数组里的绝对位置，不是页内序号**：`SentimentView` 用 `index - 1` 反查帖子，而舆情结果数组的下标来自 `enumerate(all_posts)`。一页只保证 `page_size` 个**主贴**，带上评论后条目数会超出，按页内计数编号会让相邻两页的 index 区间重叠、详情弹窗显示错帖子

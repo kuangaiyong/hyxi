@@ -729,6 +729,74 @@ class TestStatsTimeRangeEndToEnd:
         assert stats["time_range_start"] <= stats["time_range_end"], "开始晚于结束"
 
 
+class TestMediaEndpointEndToEnd:
+    """正文图回读端点 —— 鉴权 + 路径穿越"""
+
+    @classmethod
+    def setup_class(cls):
+        import app.config as cfg
+
+        cls.cfg = cfg
+        cls.tmpdir = tempfile.mkdtemp()
+        cls._old_dir = cfg.settings.data_dir
+        cls._old_key = cfg.settings.api_key
+        cfg.settings.data_dir = cls.tmpdir
+        cfg.settings.api_key = ""
+
+        os.makedirs(os.path.join(cls.tmpdir, "media", "src_a"), exist_ok=True)
+        with open(os.path.join(cls.tmpdir, "media", "src_a", "pic.png"), "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
+        # 采集器落图的目录旁边就是明文存着 LLA API Key 的 config.json
+        with open(os.path.join(cls.tmpdir, "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"api_key": "sk-must-not-leak"}, f)
+
+        from main import app
+        cls.client = TestClient(app)
+
+    @classmethod
+    def teardown_class(cls):
+        cls.cfg.settings.data_dir = cls._old_dir
+        cls.cfg.settings.api_key = cls._old_key
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def test_serves_existing_image(self):
+        resp = self.client.get("/api/v1/media/src_a/pic.png")
+        assert resp.status_code == 200
+        assert resp.content.startswith(b"\x89PNG")
+
+    def test_missing_file_is_404(self):
+        assert self.client.get("/api/v1/media/src_a/nope.png").status_code == 404
+
+    def test_path_traversal_is_blocked(self):
+        """`../../config.json` 里是明文 LLM API Key —— 穿越出去就等于把它送人。
+
+        不回 403 而回 404：403 等于承认那个位置有东西。
+
+        **必须用 URL 编码形式**：裸的 `../` 会被 httpx 在客户端就规范化掉，根本到不了
+        端点，拿它当用例等于什么都没测（实测把校验整段禁用，裸 `../` 那版照样绿）。
+        `%2e%2e%2f` 才会被框架解码后原样交到 rel_path 手里。
+        """
+        for evil in (
+            "%2e%2e%2fconfig.json",
+            "..%2fconfig.json",
+            "src_a%2f..%2f..%2fconfig.json",
+            "src_a/..%2f..%2fconfig.json",
+        ):
+            resp = self.client.get(f"/api/v1/media/{evil}")
+            assert resp.status_code == 404, evil
+            assert b"sk-must-not-leak" not in resp.content, evil
+
+    def test_requires_api_key_when_configured(self):
+        """<img> 带不了请求头，所以必须支持 ?api_key=（与 SSE 同一个口子）"""
+        self.cfg.settings.api_key = "s3cr3t"
+        try:
+            assert self.client.get("/api/v1/media/src_a/pic.png").status_code == 401
+            ok = self.client.get("/api/v1/media/src_a/pic.png?api_key=s3cr3t")
+            assert ok.status_code == 200
+        finally:
+            self.cfg.settings.api_key = ""
+
+
 class TestApiKeyAuthEndToEnd:
     """共享密钥认证 — 未配置时放行，配置后拦截"""
 

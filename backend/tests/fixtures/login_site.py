@@ -10,11 +10,17 @@
   其余                        → 登录失败（#error_box）
 """
 
+import base64
 import os
 import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote
+
+# 1×1 PNG。图片必须真的返回 —— 404 的话浏览器按 alt 文本渲染，尺寸过滤就测不成了
+_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
 
 GOOD_USER = "ok@example.com"
 GOOD_PASSWORD = "correct-horse-battery"
@@ -70,6 +76,9 @@ _REG_PAGE = """<html><head><meta charset="utf-8"><title>注册</title></head><bo
 #     点开后按钮文字变成「收起」，同样会被 textContent 吃进正文。最后一条主贴复刻这一幕。
 #   - 信息流里混着不是帖子的 article（广告 / 推荐小组卡片），既没有固定链接也没有
 #     正文容器。中间那条 role=article 就是它，提取器必须把它丢掉而不是存成空帖。
+#   - **正文图是 <img>、host 在 scontent 上、渲染尺寸几百像素**；界面图标是
+#     data:image/svg+xml、emoji 在 static.xx.fbcdn.net，而**头像是 <svg><image>
+#     不是 img**。第一条主贴把这四种都摆上了：只有 scontent 上那张 400×300 该被抓走。
 #   - **评论的多段正文是一串并列的 div[dir=auto]，一段一个**（实测一条评论有 9 段），
 #     querySelector 只拿第一段。第一条评论复刻成 3 段，并在它里面再嵌一条回复 ——
 #     嵌套回复也是 article，取多段时必须限定在本条评论这一层，否则会把子回复的
@@ -77,11 +86,17 @@ _REG_PAGE = """<html><head><meta charset="utf-8"><title>注册</title></head><bo
 _FEED_PAGE = """<html><head><meta charset="utf-8"><title>小组</title></head><body>
 <div role="feed">
   <div role="article">
-    <a href="/groups/2407063016436085/user/11/" aria-label="Marieke_V"></a>
+    <a href="/groups/2407063016436085/user/11/" aria-label="Marieke_V"
+       ><svg width="40" height="40"><image href="/media/scontent/avatar11.png"
+         width="40" height="40" /></svg></a>
     <a href="/groups/2407063016436085/user/11/">Marieke_V</a>
     <a href="/groups/2407063016436085/posts/9001/" aria-label="6天"
        data-tip="2026年5月28日周三17:54"><span>6天</span></a>
     <div data-ad-comet-preview="message">Na drie maanden met de HYXi Halo ben ik echt tevreden.</div>
+    <img src="/media/scontent/halo-installatie.png" width="400" height="300"
+         alt="可能是包含下列内容的图片：热水器" />
+    <img src="/media/scontent/emoji.png" width="16" height="16" alt="👍" />
+    <img src="/media/static/banner.png" width="400" height="300" alt="站点横幅" />
     <div role="article">
       <a href="/groups/2407063016436085/user/22/" aria-label="Joost1988"></a>
       <a href="/groups/2407063016436085/user/22/">Joost1988</a>
@@ -167,6 +182,15 @@ class _Handler(BaseHTTPRequestHandler):
         self.server.request_languages.append(self.headers.get("Accept-Language") or "")
 
     def do_GET(self):
+        # 图片放在 _record_lang() 之前：浏览器取子资源时不发 Accept-Language，
+        # 记进去会让「界面语言是中文」那条断言看到一堆空串
+        if self.path.startswith("/media/"):
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(_PNG)))
+            self.end_headers()
+            self.wfile.write(_PNG)
+            return
         self._record_lang()
         if self.path.startswith("/login"):
             self._send(_LOGIN_PAGE.format(error=""))

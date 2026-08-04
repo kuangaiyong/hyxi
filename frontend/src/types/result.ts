@@ -10,6 +10,8 @@ export interface PostData {
   reply_level: number
   /** 搜索命中标记：命中评论时父贴会被一起带出来，靠这个区分谁才是命中项 */
   matched: boolean
+  /** 正文图，相对 data/media 的路径；渲染时拼成 /api/v1/media/<path>?api_key=… */
+  images: string[]
   replies: PostData[]
 }
 

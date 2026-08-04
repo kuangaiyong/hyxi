@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useTaskStore } from '@/stores/task'
 import { useToast } from '@/composables/useToast'
 import { downloadFile } from '@/utils/download'
+import PostContent from '@/components/PostContent.vue'
 import type { PostData } from '@/types/result'
 
 const route = useRoute()
@@ -15,25 +16,55 @@ const downloading = ref('')
 
 const currentPage = ref(1)
 const pageSize = 50
-const showDetail = ref(false)
-const detailPost = ref<any>(null)
 const searchText = ref('')
 const isSearching = ref(false)
+
+/** 双语 / 只看译文 / 只看原文 */
+const viewMode = ref<'bilingual' | 'zh' | 'orig'>('bilingual')
+/** 展开了全部回复的主贴（按 source+index 记） */
+const openThreads = ref<Set<string>>(new Set())
+const zoomUrl = ref('')
+
+// 一个主贴默认只展开这么多条回复，其余折叠 —— 十几条回复平铺会把整页撑开
+const REPLY_PREVIEW = 3
 
 const totalPages = computed(() =>
   Math.ceil(taskStore.postsTotal / taskStore.pageSize)
 )
 
-/** 后端按主贴分页并把评论挂在 replies 里，表格渲染成一行一条，靠 reply_level 缩进 */
-const flatPosts = computed(() => {
-  const out: PostData[] = []
-  const walk = (p: PostData) => {
-    out.push(p)
-    ;(p.replies || []).forEach(walk)
-  }
-  taskStore.posts.forEach(walk)
-  return out
-})
+const threadKey = (p: PostData) => `${p.source}:${p.index}`
+
+/**
+ * 后端按主贴分页、评论挂在 replies 里。这里把每个主贴的后代**展平成带层级的列表**，
+ * 卡片内用缩进渲染 —— 比递归组件简单，而嵌套最多也就两三层。
+ */
+const threads = computed(() =>
+  taskStore.posts.map((root) => {
+    const replies: PostData[] = []
+    const walk = (p: PostData) => {
+      ;(p.replies || []).forEach((c) => {
+        replies.push(c)
+        walk(c)
+      })
+    }
+    walk(root)
+    return { root, replies }
+  })
+)
+
+function visibleReplies(t: { root: PostData; replies: PostData[] }): PostData[] {
+  if (openThreads.value.has(threadKey(t.root))) return t.replies
+  // 搜索命中的评论必须露出来，否则用户搜到了却看不见
+  if (t.replies.some((r) => r.matched)) return t.replies
+  return t.replies.slice(0, REPLY_PREVIEW)
+}
+
+function toggleThread(root: PostData) {
+  const key = threadKey(root)
+  const next = new Set(openThreads.value)
+  next.has(key) ? next.delete(key) : next.add(key)
+  openThreads.value = next
+}
 
 onMounted(async () => {
   taskStore.currentTaskId = taskId.value
@@ -74,16 +105,6 @@ async function handleDownload(kind: 'excel' | 'csv' | 'json') {
   } finally {
     downloading.value = ''
   }
-}
-
-function viewDetail(post: any) {
-  detailPost.value = post
-  showDetail.value = true
-}
-
-function formatContent(text: string, maxLen = 200): string {
-  if (!text) return ''
-  return text.length > maxLen ? text.slice(0, maxLen) + '...' : text
 }
 
 function getStatusText(): string {
@@ -225,45 +246,68 @@ function getStatusText(): string {
             @click="handleSearchClear"
           >清除</button>
         </div>
-        <span class="text-sm text-secondary">共 {{ taskStore.postsTotal }} 个主贴</span>
+        <div class="flex items-center gap-2">
+          <div class="mode-switch">
+            <button
+              v-for="m in ([['bilingual', '双语'], ['zh', '只看译文'], ['orig', '只看原文']] as const)"
+              :key="m[0]"
+              :class="{ active: viewMode === m[0] }"
+              @click="viewMode = m[0]"
+            >{{ m[1] }}</button>
+          </div>
+          <span class="text-sm text-secondary">共 {{ taskStore.postsTotal }} 个主贴</span>
+        </div>
       </div>
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th class="col-narrow">#</th>
-            <th class="col-medium">来源</th>
-            <th class="col-medium">用户</th>
-            <th class="col-medium">时间</th>
-            <th class="col-wide">原文</th>
-            <th class="col-wide">中文翻译</th>
-            <th class="col-narrow">页</th>
-          </tr>
-        </thead>
-        <tbody>
-          <!-- 评论跟着父贴走：分页粒度是主贴，一个主贴的评论不会被切在两页之间 -->
-          <template v-for="post in flatPosts" :key="post.source + post.index">
-            <tr
-              @click="viewDetail(post)"
-              style="cursor: pointer;"
-              :style="{
-                background: post.matched ? 'var(--warning-bg, #FEF3C7)' : undefined,
-              }"
+
+      <!-- 线程卡片：一个主贴一张卡，评论缩进挂在下面。
+           分页粒度是主贴，所以一个主贴的评论不会被切在两页之间 -->
+      <div class="thread-list">
+        <article
+          v-for="t in threads"
+          :key="threadKey(t.root)"
+          class="thread"
+          :class="{ hit: t.root.matched }"
+        >
+          <header class="thread-head">
+            <span class="badge-source">{{ t.root.source_name }}</span>
+            <strong>{{ t.root.username }}</strong>
+            <span class="text-sm text-secondary">{{ t.root.timestamp }}</span>
+            <span class="grow" />
+            <span class="text-sm text-secondary">#{{ t.root.index }}</span>
+            <span v-if="t.replies.length" class="reply-count">💬 {{ t.replies.length }}</span>
+          </header>
+
+          <PostContent :post="t.root" :mode="viewMode" @zoom="zoomUrl = $event" />
+
+          <div v-if="t.replies.length" class="replies">
+            <div
+              v-for="r in visibleReplies(t)"
+              :key="threadKey(r)"
+              class="reply"
+              :class="{ hit: r.matched }"
+              :style="{ marginLeft: Math.min(r.reply_level - 1, 3) * 18 + 'px' }"
             >
-              <td class="col-narrow">{{ post.index }}</td>
-              <td class="col-medium text-sm text-secondary">{{ post.source_name }}</td>
-              <td class="col-medium">
-                <span v-if="post.reply_level" class="text-secondary"
-                  :style="{ paddingLeft: (post.reply_level - 1) * 14 + 'px' }">└─ </span>
-                <strong>{{ post.username }}</strong>
-              </td>
-              <td class="col-medium text-sm text-secondary">{{ post.timestamp }}</td>
-              <td class="col-wide">{{ formatContent(post.content) }}</td>
-              <td class="col-wide">{{ formatContent(post.translation) }}</td>
-              <td class="col-narrow">{{ post.page_number }}</td>
-            </tr>
-          </template>
-        </tbody>
-      </table>
+              <div class="reply-head">
+                <strong>{{ r.username }}</strong>
+                <span class="text-sm text-secondary">{{ r.timestamp }}</span>
+                <span class="grow" />
+                <span class="text-sm text-secondary">#{{ r.index }}</span>
+              </div>
+              <PostContent :post="r" :mode="viewMode" @zoom="zoomUrl = $event" />
+            </div>
+
+            <button
+              v-if="t.replies.length > REPLY_PREVIEW && !t.replies.some((r) => r.matched)"
+              class="more-replies"
+              @click="toggleThread(t.root)"
+            >
+              {{ openThreads.has(threadKey(t.root))
+                ? '收起回复 ▴'
+                : `展开其余 ${t.replies.length - REPLY_PREVIEW} 条回复 ▾` }}
+            </button>
+          </div>
+        </article>
+      </div>
 
       <!-- 分页控件 -->
       <div class="flex items-center justify-between" style="padding: 12px 16px; border-top: 1px solid var(--border-light);">
@@ -294,33 +338,103 @@ function getStatusText(): string {
       <p>暂无结果数据，等待任务完成...</p>
     </div>
 
-    <!-- 帖子详情弹窗 -->
-    <div v-if="showDetail" class="modal-overlay" @click.self="showDetail = false">
-      <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="post-detail-title">
-        <div class="modal-header">
-          <h3 id="post-detail-title">📝 帖子详情 #{{ detailPost?.index }}</h3>
-          <button class="btn btn-sm btn-outline" @click="showDetail = false">✕</button>
-        </div>
-        <div class="flex items-center gap-4 mb-4 text-sm text-secondary">
-          <span><strong>{{ detailPost?.username }}</strong></span>
-          <span>{{ detailPost?.timestamp }}</span>
-          <span>第 {{ detailPost?.page_number }} 页</span>
-        </div>
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
-          <div>
-            <div class="form-label">原文</div>
-            <div style="white-space: pre-wrap; font-size: 13px; line-height: 1.6; max-height: 50vh; overflow-y: auto;">
-              {{ detailPost?.content || '(空)' }}
-            </div>
-          </div>
-          <div>
-            <div class="form-label">中文翻译</div>
-            <div style="white-space: pre-wrap; font-size: 13px; line-height: 1.6; max-height: 50vh; overflow-y: auto;">
-              {{ detailPost?.translation || '(无翻译)' }}
-            </div>
-          </div>
-        </div>
-      </div>
+    <!-- 图片灯箱。原来的帖子详情弹窗去掉了：卡片里已经是全文 + 双语，
+         再点开一个弹窗看同样的内容没有意义 -->
+    <div v-if="zoomUrl" class="lightbox" @click="zoomUrl = ''">
+      <img :src="zoomUrl" alt="帖子配图（放大）" />
     </div>
   </div>
 </template>
+
+<style scoped>
+.thread-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px 16px 0;
+}
+.thread {
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: var(--bg-card, transparent);
+}
+.thread.hit,
+.reply.hit {
+  background: var(--warning-bg, #fef3c7);
+}
+.thread-head,
+.reply-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+.grow {
+  flex: 1;
+}
+.badge-source {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--border-light);
+  color: var(--text-secondary);
+}
+.reply-count {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.replies {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border-light);
+}
+/* 左侧竖线是层级的主要信号：光靠缩进，行一多就分不出谁回复谁 */
+.reply {
+  border-left: 2px solid var(--border-light);
+  padding: 6px 0 6px 10px;
+  margin-bottom: 6px;
+}
+.more-replies {
+  border: none;
+  background: none;
+  padding: 4px 0 0 10px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--primary);
+}
+.mode-switch {
+  display: inline-flex;
+  border: 1px solid var(--border-light);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.mode-switch button {
+  border: none;
+  background: none;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+.mode-switch button.active {
+  background: var(--primary);
+  color: #fff;
+}
+.lightbox {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  cursor: zoom-out;
+}
+.lightbox img {
+  max-width: 92vw;
+  max-height: 92vh;
+  object-fit: contain;
+}
+</style>

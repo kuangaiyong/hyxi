@@ -10,6 +10,7 @@
  */
 
 const fs = require('fs');
+const path = require('path');
 const { readJob, log, progress, writeOutput } = require('./lib/job');
 const { makeFingerprint } = require('./lib/fingerprint');
 const { launchBrowser, newContext, saveStorageState } = require('./lib/browser');
@@ -36,6 +37,10 @@ const CONFIG = {
     baseUrl: (job.base_url || 'https://www.facebook.com').replace(/\/+$/, ''),
     outputFile: job.output_path,
     stateFile: job.state_file,
+    // 图片落盘根目录，由 job 指定（与 output_path 同理，文件位置只有一个来源）。
+    // 没配就不抓图，老 job 文件照样能跑
+    mediaDir: job.media_dir || '',
+    sourceId: job.source_id || 'unknown',
     maxBatches: params.max_batches || 10,
 };
 
@@ -78,7 +83,19 @@ const SELECTORS = {
     // 「… 展开」。都是界面文案不是正文，而 content 前 100 字进指纹 —— 留着等于把
     // UI 文案写进去重锚点，还会让同一条帖子展开前后算出两个指纹。
     bodyTrail: '\\s*(…\\s*)?(展开|收起|See more|See less|Meer weergeven|Minder weergeven)$',
+    // 正文图。2026-08-04 对真实小组页实测：
+    //   - 正文图是 <img>，host 为 scontent-*.xx.fbcdn.net，渲染尺寸 367×795 这个量级
+    //   - 界面图标是 data:image/svg+xml（16~18px），emoji 在 static.xx.fbcdn.net，
+    //     两者都不在 scontent 上，按 host 一刀就切干净
+    //   - **头像不是 img 而是 <svg><image>**，压根不会被 querySelectorAll('img') 选中
+    // 尺寸下限是第二道保险，防的是将来冒出小尺寸的 scontent 图标
+    image: 'img',
+    imageHost: 'scontent',
+    imageMinSize: 100,
 };
+
+// 单张图上限。超过就跳过 —— 图片是附加信息，不值得为一张大图拖慢整轮抓取
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
 // 时间链接的标记属性 + 按标记缓存的 tooltip 文本。信息流是往下追加，上一批的帖子
 // 每一批都会被重新提取一次，不缓存就要把同一条帖子 hover 十遍。
@@ -196,6 +213,15 @@ async function extractBatch(page) {
         // 作者：取第一个**有文字**的个人主页链接，前面那几个是同一个人的头像链接
         const nameOf = (root, scoped) => text([...root.querySelectorAll(sel.author)].find(
             (el) => (!scoped || el.closest(sel.post) === root) && el.textContent.trim()));
+        // 正文图 URL。层级限定同 own()：评论的图不能算到主贴头上
+        const imagesOf = (root) => [...root.querySelectorAll(sel.image)]
+            .filter((im) => im.closest(sel.post) === root)
+            .filter((im) => (im.currentSrc || im.src || '').includes(sel.imageHost))
+            .filter((im) => {
+                const r = im.getBoundingClientRect();
+                return r.width >= sel.imageMinSize && r.height >= sel.imageMinSize;
+            })
+            .map((im) => im.currentSrc || im.src);
         const idOf = (link, kind) => {
             const href = link ? link.getAttribute('href') : '';
             const m = href && (kind === 'comment'
@@ -228,6 +254,7 @@ async function extractBatch(page) {
                         timeKey: mark(link, id && `c${id}`),
                         content: commentText(c),
                         message_id: id,
+                        imageUrls: imagesOf(c),
                     };
                 });
                 const link = own(article, sel.postTime);
@@ -237,6 +264,7 @@ async function extractBatch(page) {
                     timeKey: mark(link, id && `p${id}`),
                     content: bodyText(own(article, sel.body)),
                     message_id: id,
+                    imageUrls: imagesOf(article),
                     comments,
                 });
             });
@@ -280,6 +308,9 @@ function flatten(rawPosts, displayBatch) {
             reply_level: 0,
         };
         post.fingerprint = makeFingerprint(post);
+        // 临时字段：downloadImages() 下完就删，换成本地路径的 images。
+        // 指纹只吃 username|timestamp|content[:100]，多挂一个字段不影响它
+        post._imageUrls = raw.imageUrls || [];
         flat.push(post);
         (raw.comments || []).filter((c) => !isNotAPost(c)).forEach((c) => {
             const comment = {
@@ -292,10 +323,64 @@ function flatten(rawPosts, displayBatch) {
                 reply_level: 1,
             };
             comment.fingerprint = makeFingerprint(comment);
+            comment._imageUrls = c.imageUrls || [];
             flat.push(comment);
         });
     });
     return flat;
+}
+
+function extOf(contentType, url) {
+    const ct = (contentType || '').toLowerCase();
+    if (ct.includes('png')) return 'png';
+    if (ct.includes('webp')) return 'webp';
+    if (ct.includes('gif')) return 'gif';
+    const m = url.match(/\.(jpe?g|png|webp|gif)(\?|$)/i);
+    return m ? m[1].toLowerCase().replace('jpeg', 'jpg') : 'jpg';
+}
+
+/**
+ * 把正文图下载到本地，`images` 存相对 media 根的路径。
+ *
+ * **不能只存 Facebook 的原始链接**：fbcdn URL 带签名和过期时间，几天后页面上就是
+ * 一片裂图，而舆情报告本来就是要回溯的 —— 那时数据还在、图没了，比一开始就没有更糟。
+ * 存相对路径而不是绝对路径，落盘文件才能跨机器搬。
+ *
+ * 用 context.request 而不是自己 fetch：它复用浏览器的会话与指纹，与页面发出的
+ * 请求同源。单张失败只跳过这一张，帖子照常入库 —— 图片是附加信息，不该把整条拖失败。
+ */
+async function downloadImages(context, posts) {
+    if (!CONFIG.mediaDir) return;
+    const dir = path.join(CONFIG.mediaDir, CONFIG.sourceId);
+    let saved = 0;
+    let failed = 0;
+    for (const post of posts) {
+        const urls = post._imageUrls || [];
+        delete post._imageUrls;
+        if (!urls.length) continue;
+        const rels = [];
+        for (let i = 0; i < urls.length; i++) {
+            try {
+                const resp = await context.request.get(urls[i], { timeout: 30000 });
+                if (!resp.ok()) { failed++; continue; }
+                const buf = await resp.body();
+                if (buf.length > MAX_IMAGE_BYTES) { failed++; continue; }
+                fs.mkdirSync(dir, { recursive: true });
+                const name = `${post.fingerprint}_${i}.${extOf(resp.headers()['content-type'], urls[i])}`;
+                fs.writeFileSync(path.join(dir, name), buf);
+                rels.push(`${CONFIG.sourceId}/${name}`);
+                saved++;
+            } catch (e) {
+                failed++;
+            }
+            // 串行 + 小间隔：页面已经加载过这些图，但集中回源仍是一次突发
+            await new Promise((r) => setTimeout(r, 300));
+        }
+        if (rels.length) post.images = rels;
+    }
+    if (saved || failed) {
+        log(`   图片：保存 ${saved} 张${failed ? `，失败 ${failed} 张` : ''}`);
+    }
 }
 
 /** 无限滚动：往下滚一屏并等新内容渲染，返回是否还有增长 */
@@ -384,19 +469,21 @@ async function main() {
                 throw new Error('第一批未提取到任何帖子，提取器可能已失效或页面被拦截');
             }
 
-            let added = 0;
+            const added = [];
             flat.forEach((p) => {
                 if (!seen.has(p.fingerprint)) {
                     seen.add(p.fingerprint);
                     fresh.push(p);
-                    added++;
+                    added.push(p);
                 }
             });
-            log(`  批次 ${batch}：提取 ${flat.length} 条（含评论），新增 ${added} 条`);
+            // 只给新增的帖子下图：已见过的这一轮会被指纹去重，图早就下过了
+            await downloadImages(context, added);
+            log(`  批次 ${batch}：提取 ${flat.length} 条（含评论），新增 ${added.length} 条`);
             progress(batch, CONFIG.maxBatches, `批次 ${batch}/${CONFIG.maxBatches}`);
 
             // 水位线：信息流按时间倒序，整批都见过就说明已经翻到旧内容
-            if (CONFIG.incremental && existingPosts.length && added === 0) {
+            if (CONFIG.incremental && existingPosts.length && added.length === 0) {
                 log('   已翻到历史数据，停止继续滚动');
                 break;
             }

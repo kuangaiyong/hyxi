@@ -157,6 +157,9 @@ class PostData(BaseModel):
     source_name: str = ""
     reply_level: int = 0
     matched: bool = False  # 搜索命中标记：带出父贴时用来告诉前端高亮哪几条
+    # 正文图，相对 data/media 的路径（如 src_xxx/abc_0.png），经 /api/v1/media 回读。
+    # 只给人看，不进翻译和舆情的 prompt
+    images: List[str] = Field(default_factory=list)
     replies: List["PostData"] = Field(default_factory=list)
 
 

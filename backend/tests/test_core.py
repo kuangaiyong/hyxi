@@ -1820,6 +1820,7 @@ class TestFacebookLoginEndToEnd:
         self.tmpdir = tempfile.mkdtemp()
         self.output = os.path.join(self.tmpdir, "fb_out.json")
         self.state = os.path.join(self.tmpdir, "session.json")
+        self.media = os.path.join(self.tmpdir, "media")
 
     def teardown_method(self):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
@@ -1859,6 +1860,7 @@ class TestFacebookLoginEndToEnd:
                     "max_batches": 1,
                 },
                 "state_file": self.state,
+                "media_dir": self.media,
                 "pacing": {"delay_min": 200, "delay_max": 400},
             }
             loop = asyncio.new_event_loop()
@@ -1985,6 +1987,35 @@ class TestFacebookLoginEndToEnd:
         assert "min SOC blijft een raadsel" in parent["content"], "第三段丢了"
         assert "ondergrens" not in parent["content"], "把嵌套回复的正文吞进父评论了"
         assert child["content"] == "Die 8% ondergrens is inderdaad vreemd."
+
+    def test_body_images_are_downloaded_and_decoys_ignored(self):
+        """正文图要下载到本地，头像 / emoji / 非 scontent 的图都不能混进来。
+
+        只存 Facebook 的原始链接不行：fbcdn URL 带签名和过期时间，几天后就是一片
+        裂图。实测正文图是 <img>、host 在 scontent 上、渲染尺寸几百像素；界面图标是
+        data:svg，emoji 在 static.xx.fbcdn.net，而**头像是 <svg><image> 不是 img**。
+        fixture 的第一条主贴把这四种都摆上了，只有那张 400×300 的该被抓走。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+
+        with site.LoginSite() as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
+
+        root = [p for p in data["posts"] if p["message_id"] == "9001"][0]
+        images = root.get("images") or []
+        assert len(images) == 1, f"抓多了或抓少了: {images}"
+
+        rel = images[0]
+        assert rel.startswith("fixture_fb/"), f"没有按 source 分目录: {rel}"
+        assert not os.path.isabs(rel), "存了绝对路径，落盘文件就搬不了机器了"
+        saved = os.path.join(self.media, rel)
+        assert os.path.exists(saved), f"文件没落盘: {saved}"
+        assert os.path.getsize(saved) > 0
+
+        # 没图的帖子不该凭空多出一个 images 字段
+        folded = [p for p in data["posts"] if p["username"] == "TechNerd_NL"][0]
+        assert not folded.get("images")
 
     def test_session_is_reused_without_password(self):
         """(c) 保留会话重跑：密码给成错的也应该照样成功，证明这一轮根本没走登录"""

@@ -3,11 +3,11 @@
 import os
 import logging
 from contextlib import asynccontextmanager
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from app.auth import require_api_key
 from app.config import settings
 from app.logging_config import get_logger
@@ -80,6 +80,27 @@ app.include_router(tasks_router.router, dependencies=_protected)
 app.include_router(results_router.router, dependencies=_protected)
 app.include_router(schedules_router.router, dependencies=_protected)
 app.include_router(sources_router.router, dependencies=_protected)
+
+
+@app.get("/api/v1/media/{rel_path:path}", dependencies=_protected)
+async def get_media(rel_path: str):
+    """回读采集时下载的正文图。
+
+    不用 StaticFiles 挂载：`<img>` 没法自定义请求头，而 require_api_key 已经支持
+    `?api_key=` 查询参数（当初为 SSE 开的口子），所以走普通端点复用同一套鉴权。
+
+    **路径必须校验**：`../../config.json` 里是明文 LLM API Key，realpath 解析后
+    不在 media 目录内一律 404 —— 不回 403，免得把目录结构也告诉对方。
+    """
+    # 裸的 ../ 通常在客户端就被规范化掉了，但 %2e%2e%2f 会被框架解码后原样送到这里 ——
+    # 实测确认过，所以这段校验不是摆设
+    root = os.path.realpath(os.path.join(settings.data_dir, "media"))
+    target = os.path.realpath(os.path.join(root, rel_path))
+    if target != root and not target.startswith(root + os.sep):
+        raise HTTPException(status_code=404, detail="不存在")
+    if not os.path.isfile(target):
+        raise HTTPException(status_code=404, detail="不存在")
+    return FileResponse(target)
 
 
 @app.get("/")

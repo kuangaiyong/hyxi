@@ -74,6 +74,10 @@ class FacebookGroupCollector(Collector):
             "incremental": params.get("incremental", True),
             "output_path": output_path,
             "state_file": source.get("state_file") or self.session_path(source),
+            # 正文图落盘根目录。脚本在下面按 source_id 分子目录，images 字段存
+            # 相对这里的路径，供 /api/v1/media/{path} 回读。
+            # 允许 source 覆盖（同 state_file），否则测试会往真实 data 目录里写图
+            "media_dir": source.get("media_dir") or os.path.join(settings.data_dir, "media"),
             # 凭据不在 job 里 —— 只走子进程环境变量（见 CollectorRunner._child_env）
             "base_url": (params.get("base_url") or DEFAULT_BASE_URL).rstrip("/"),
             "pacing": source.get("pacing") or {"delay_min": 4000, "delay_max": 11000},

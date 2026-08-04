@@ -94,6 +94,7 @@ def _to_post_data(post: dict, index: int, names: dict, matched: bool = False) ->
         source_name=names.get(post.get("source", ""), post.get("source", "")),
         reply_level=int(post.get("reply_level", 0) or 0),
         matched=matched,
+        images=post.get("images") or [],
     )
 
 

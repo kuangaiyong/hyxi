@@ -65,6 +65,9 @@ _REG_PAGE = """<html><head><meta charset="utf-8"><title>注册</title></head><bo
 #   - 主贴时间链接的 aria-label 是**相对时间**，评论的是绝对时间但走 Facebook 账号
 #     自己的时区（实测比本地早 15 小时）—— 两个坑都复刻在这里，绝对的本地时间
 #     只有 hover 出来的 tooltip 有
+#   - 长正文只渲染前几行，末尾挂一个 role=button 的「展开」。不点它，textContent
+#     拿到的是残缺正文 + 「展开」两个字（实测有一条整条正文只剩 16 个字符）；
+#     点开后按钮文字变成「收起」，同样会被 textContent 吃进正文。第二条主贴复刻这一幕。
 _FEED_PAGE = """<html><head><meta charset="utf-8"><title>小组</title></head><body>
 <div role="feed">
   <div role="article">
@@ -86,9 +89,18 @@ _FEED_PAGE = """<html><head><meta charset="utf-8"><title>小组</title></head><b
     <a href="/groups/2407063016436085/user/33/">TechNerd_NL</a>
     <a href="/groups/2407063016436085/posts/9002/" aria-label="4天"
        data-tip="2026年5月30日周五05:27"><span>4天</span></a>
-    <div data-ad-comet-preview="message">Firmware 2.4.1 heeft bij mij de WiFi-verbinding gesloopt.</div>
+    <div data-ad-comet-preview="message" id="folded"><span>Firmware 2.4.1 heeft…
+      <div role="button" tabindex="0" onclick="unfold()">展开</div></span></div>
   </div>
 </div>
+<script>
+function unfold() {
+  document.getElementById('folded').innerHTML =
+    '<span>Firmware 2.4.1 heeft bij mij de WiFi-verbinding gesloopt. '
+    + 'Na een downgrade werkt alles weer. '
+    + '<div role="button" tabindex="0">收起</div></span>';
+}
+</script>
 <script>
 document.addEventListener('mouseover', function (e) {
   var a = e.target.closest && e.target.closest('a[data-tip]');

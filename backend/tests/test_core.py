@@ -1854,6 +1854,27 @@ class TestFacebookLoginEndToEnd:
         assert roots[0]["message_id"] == "9001"
         assert comments[0]["message_id"] == "5501"
 
+    def test_folded_body_is_expanded_before_extraction(self):
+        """长正文必须先点开「展开」再提取。
+
+        Facebook 对长帖只渲染前几行，末尾挂一个 role=button 的「展开」。不点它，
+        textContent 拿到的是**残缺正文 + 「展开」两个字** —— 真站实测有一条整条正文
+        只剩 16 个字符（`Goedemiddag,… 展开`），152 条里 22 条中招。翻译和舆情全建立在
+        这段残文上，而 content 前 100 字还进指纹，等于把界面文案写进了去重锚点。
+        展开后按钮文字变成「收起」，同样会被 textContent 吃进正文，一并剥掉。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+
+        with site.LoginSite() as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
+
+        folded = [p for p in data["posts"] if p["username"] == "TechNerd_NL"][0]
+        assert "downgrade" in folded["content"], "正文没展开，拿到的是截断的前几行"
+        assert "展开" not in folded["content"], "「展开」按钮的文字混进了正文"
+        assert "收起" not in folded["content"], "展开后「收起」按钮的文字混进了正文"
+        assert not folded["content"].endswith("…"), "截断省略号残留在正文末尾"
+
     def test_session_is_reused_without_password(self):
         """(c) 保留会话重跑：密码给成错的也应该照样成功，证明这一轮根本没走登录"""
         self._skip_unless_ready()

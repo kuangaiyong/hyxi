@@ -20,7 +20,7 @@ class LLMConfig(BaseModel):
             "example": {
                 "api_key": "sk-xxxxxxxxxxxxx",
                 "base_url": "https://api.deepseek.com",
-                "model_name": "deepseek-v4-pro"
+                "model_name": "deepseek-v4-flash"
             }
         }
 

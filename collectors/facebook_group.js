@@ -70,6 +70,14 @@ const SELECTORS = {
     body: '[data-ad-comet-preview="message"], [data-ad-rendering-role="story_message"]',
     // 评论没有专用正文容器，第一个 div[dir=auto] 就是正文
     commentBody: 'div[dir="auto"]',
+    // 以下两个是**文本模式不是选择器**：折叠正文那个按钮只能按文字认。
+    // 登录后的界面语言由 Facebook 账号自己的设置决定，与采集器的 locale 无关
+    // （见 CLAUDE.md），所以中英荷三种都收。
+    expandText: '展开|See more|Meer weergeven',
+    // 展开后按钮文字变成「收起」，textContent 会把它一起吃进正文；没点开的则残留
+    // 「… 展开」。都是界面文案不是正文，而 content 前 100 字进指纹 —— 留着等于把
+    // UI 文案写进去重锚点，还会让同一条帖子展开前后算出两个指纹。
+    bodyTrail: '\\s*(…\\s*)?(展开|收起|See more|See less|Meer weergeven|Minder weergeven)$',
 };
 
 // 时间链接的标记属性 + 按标记缓存的 tooltip 文本。信息流是往下追加，上一批的帖子
@@ -134,9 +142,46 @@ async function hoverTime(page, key) {
     }
 }
 
+/**
+ * 提取前先把折叠的正文点开。
+ *
+ * Facebook 对长帖只渲染前几行，末尾挂一个 role=button 的「展开」。不点它，
+ * textContent 拿到的就是残缺正文 —— 真站实测有一条整条正文只剩 16 个字符
+ * （`Goedemiddag,… 展开`），点开后是 208 个。翻译和舆情都建立在正文上，残文比
+ * 没有更糟：它看起来是完整的一句话。
+ *
+ * 已展开的帖子按钮文字变成「收起」，不会再被匹配到，所以信息流每批重新提取时
+ * 不会重复点击。
+ */
+async function expandBodies(page) {
+    const clicked = await page.evaluate((sel) => {
+        const re = new RegExp(`^(${sel.expandText})$`);
+        const btns = [...document.querySelectorAll(`${sel.post} [role="button"]`)]
+            .filter((el) => re.test(el.textContent.trim()));
+        btns.forEach((b) => b.click());
+        return btns.length;
+    }, SELECTORS);
+    if (!clicked) return;
+    try {
+        // 等正文真的换掉再提取。等不到就往下走并说出来 —— 那一批正文会截断，
+        // 而截断的正文和完整的正文是两个指纹，闷着不说会变成重复数据
+        await page.waitForFunction((sel) => {
+            const re = new RegExp(`^(${sel.expandText})$`);
+            return ![...document.querySelectorAll(`${sel.post} [role="button"]`)]
+                .some((el) => re.test(el.textContent.trim()));
+        }, SELECTORS, { timeout: 5000 });
+    } catch (e) {
+        if (/has been closed|target closed|crashed/i.test(e.message)) throw e;
+        log('   ⚠️ 有正文没能展开，这一批可能存在截断');
+    }
+}
+
 async function extractBatch(page) {
+    await expandBodies(page);
     const raw = await page.evaluate((sel) => {
         const text = (el) => (el ? el.textContent.replace(/\s+/g, ' ').trim() : '');
+        // 正文要额外剥掉末尾的展开/收起按钮文字，用户名等字段不需要
+        const bodyText = (el) => text(el).replace(new RegExp(sel.bodyTrail), '');
         // 主贴的字段只能在主贴自己这一层找：评论也是 article，嵌在里面
         const own = (root, selector) => [...root.querySelectorAll(selector)]
             .find((el) => el.closest(sel.post) === root) || null;
@@ -173,7 +218,7 @@ async function extractBatch(page) {
                     return {
                         username: nameOf(c, false),
                         timeKey: mark(link, id && `c${id}`),
-                        content: text(c.querySelector(sel.commentBody)),
+                        content: bodyText(c.querySelector(sel.commentBody)),
                         message_id: id,
                     };
                 });
@@ -182,7 +227,7 @@ async function extractBatch(page) {
                 out.push({
                     username: nameOf(article, true),
                     timeKey: mark(link, id && `p${id}`),
-                    content: text(own(article, sel.body)),
+                    content: bodyText(own(article, sel.body)),
                     message_id: id,
                     comments,
                 });

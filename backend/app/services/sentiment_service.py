@@ -156,24 +156,29 @@ class SentimentService:
         success_count = 0
         fail_count = 0
 
+        def _post_block(orig_idx: int, p: dict) -> str:
+            """一条帖子在 prompt 里的样子。批量和单条重试必须用同一份 ——
+            来源标签和父贴上文都影响判定，重试时少给就成了另一道题。"""
+            content = p.get("content", "")
+            truncated = content[:2000] if len(content) > 2000 else content
+            sid = p.get("source", "")
+            label = (source_names or {}).get(sid, sid) or "未知来源"
+            block = f"帖子{orig_idx + 1} [来源: {label}]:\n"
+            # 评论多是「+1」「same here」，单独看全是 neutral 噪音，
+            # 带上父贴前 200 字才判得准
+            parent = (parent_by_key or {}).get(post_key(p))
+            if parent:
+                block += f"[回复上文: {(parent.get('content') or '')[:200]}]\n"
+            return block + f"{truncated}\n\n"
+
         try:
             for batch_start in range(0, total_non_empty, BATCH_SIZE):
                 batch = non_empty[batch_start:batch_start + BATCH_SIZE]
 
                 # 构建批量分析请求
                 user_message = "请分析以下帖子对HYXi Halo产品的情感倾向：\n\n"
-                for idx_in_batch, (orig_idx, p) in enumerate(batch):
-                    content = p.get("content", "")
-                    truncated = content[:2000] if len(content) > 2000 else content
-                    sid = p.get("source", "")
-                    label = (source_names or {}).get(sid, sid) or "未知来源"
-                    user_message += f"帖子{orig_idx + 1} [来源: {label}]:\n"
-                    # 评论多是「+1」「same here」，单独看全是 neutral 噪音，
-                    # 带上父贴前 200 字才判得准
-                    parent = (parent_by_key or {}).get(post_key(p))
-                    if parent:
-                        user_message += f"[回复上文: {(parent.get('content') or '')[:200]}]\n"
-                    user_message += f"{truncated}\n\n"
+                for orig_idx, p in batch:
+                    user_message += _post_block(orig_idx, p)
 
                 try:
                     result_text = await llm.chat_with_retry(
@@ -234,6 +239,50 @@ class SentimentService:
                 })
 
                 await asyncio.sleep(1.0)
+
+            # ===== 重试解析失败的条目 =====
+            # 批量输出靠 ---SENTIMENT_SEPARATOR--- 切分，LLM 偶尔少给一段或吐出非 JSON，
+            # 那一条就此判死。逐条再问一次 —— 单条不必切分隔符，解析可靠得多。
+            # 翻译早就是这么做的（见 translator_service 的单条重译），舆情漏了这一步。
+            retry_targets = [
+                (orig_idx, p) for orig_idx, p in non_empty
+                if not (results[orig_idx] or {}).get("sentiment")
+            ]
+            if retry_targets:
+                await progress.emit(task_id, "log", {
+                    "level": "info",
+                    "message": f"开始重试 {len(retry_targets)} 条解析失败的分析...",
+                })
+                for orig_idx, p in retry_targets:
+                    try:
+                        text = await llm.chat_with_retry(
+                            system_prompt=SENTIMENT_SYSTEM_PROMPT,
+                            user_message=(
+                                "请分析以下帖子对HYXi Halo产品的情感倾向"
+                                "（只有一条，直接输出一个JSON对象，不要分隔符）：\n\n"
+                                + _post_block(orig_idx, p)
+                            ),
+                            temperature=0.2,
+                            max_tokens=1024,
+                            max_retries=2,
+                            label=f"重析单条 #{orig_idx + 1}",
+                        )
+                        parsed = SentimentService._parse_sentiment(text)
+                        if parsed and parsed.get("sentiment"):
+                            results[orig_idx] = parsed
+                            success_count += 1
+                            fail_count -= 1
+                    except Exception:
+                        # 重试再失败就保留批量那轮写下的「解析失败」记录，不覆盖成别的
+                        pass
+                    await asyncio.sleep(1.0)
+
+                still = sum(1 for i, _p in retry_targets
+                            if not (results[i] or {}).get("sentiment"))
+                await progress.emit(task_id, "log", {
+                    "level": "info" if still == 0 else "warning",
+                    "message": f"重试完成，{len(retry_targets) - still} 条成功，{still} 条仍失败",
+                })
 
         finally:
             await llm.close()

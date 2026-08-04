@@ -138,6 +138,75 @@ class TestSentimentParsingEndToEnd:
         assert SentimentService._parse_sentiment("") is None
 
 
+class TestSentimentRetryEndToEnd:
+    """批量里解析失败的条目必须逐条重试 —— 真 HTTP、真 httpx、真解析"""
+
+    def setup_method(self):
+        import app.config as cfg
+        import app.services.storage as storage_module
+        self.cfg = cfg
+        self.tmpdir = tempfile.mkdtemp()
+        self._old_dir = cfg.settings.data_dir
+        self._old_cfg = cfg.settings.config_file
+        cfg.settings.data_dir = self.tmpdir
+        cfg.settings.config_file = os.path.join(self.tmpdir, "config.json")
+        # DB_PATH 是 import 时算好的常量，只改 data_dir 会写进真实的 hyxi.db
+        self.storage = storage_module
+        self._old_db = storage_module.DB_PATH
+        storage_module.DB_PATH = os.path.join(self.tmpdir, "hyxi.db")
+        storage_module.init_db()
+
+    def teardown_method(self):
+        self.cfg.settings.data_dir = self._old_dir
+        self.cfg.settings.config_file = self._old_cfg
+        self.storage.DB_PATH = self._old_db
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _llm_site(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures"))
+        import llm_site
+        return llm_site
+
+    def test_parse_failures_are_retried_one_by_one(self):
+        """批量输出少一段可解析的 JSON，不能就让那条帖子永远「解析失败」。
+
+        批量结果靠 ---SENTIMENT_SEPARATOR--- 切分，LLM 偶尔会在某一段吐出非 JSON。
+        改造前那条直接记成 {"sentiment": null, "reason_cn": "解析失败"} 就完事了 ——
+        真实任务里 88 条中有 2 条因此永久缺席，而翻译早就有单条重译。
+        """
+        import asyncio
+        site = self._llm_site()
+        from app.services.sentiment_service import SentimentService
+        from app.services.progress_manager import ProgressManager
+
+        posts = [
+            {"content": f"Firmware 2.4.{i} sloopte mijn WiFi-verbinding volledig.",
+             "fingerprint": f"fp{i}", "source": "src_x", "timestamp": "01-07-2026 10:00"}
+            for i in range(3)
+        ]
+
+        server = site.LLMSite()
+        with server as base_url:
+            with open(self.cfg.settings.config_file, "w", encoding="utf-8") as f:
+                json.dump({"api_key": "sk-test", "base_url": base_url,
+                           "model_name": "test-model"}, f)
+
+            out = asyncio.new_event_loop().run_until_complete(
+                SentimentService.analyze("retry-e2e", posts, ProgressManager(),
+                                         source_names={"src_x": "Facebook"})
+            )
+
+        results = out["results"]
+        assert out["failed"] == 0, f"仍有条目没救回来: {results}"
+        assert out["success"] == 3
+        assert all(r and r.get("sentiment") for r in results), results
+        # 最后一条正是批量里被吐成非 JSON 的那条，重试后拿到了真实结论
+        assert results[-1]["reason_cn"] == "单条重试成功"
+        # 重试必须是一条一条发的：批量那次 3 条，之后跟着一次 1 条的重试
+        assert server.seen[0] == 3, server.seen
+        assert server.seen[1:] == [1], f"重试没有按单条发出: {server.seen}"
+
+
 class TestBuildSummaryEndToEnd:
     """舆情汇总：真实数据统计"""
 

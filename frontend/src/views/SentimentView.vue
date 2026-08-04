@@ -232,17 +232,19 @@ async function loadPosts() {
   try {
     const size = 200  // 后端 page_size 上限
     const map = new Map<number, PostData>()
-    const first = await resultsApi.fetchPosts(taskId.value, 1, size)
-    for (const p of first.posts) {
+    // 评论挂在主贴的 replies 里，只遍历顶层就把它们全漏了 —— 而舆情结果的下标
+    // 来自扁平数组，评论也占位。实测 88 条里 42 条是评论，趋势图因此只画了一半
+    const walk = (p: PostData) => {
       map.set(p.index - 1, p)  // index 是 1-based
+      ;(p.replies || []).forEach(walk)
     }
+    const first = await resultsApi.fetchPosts(taskId.value, 1, size)
+    first.posts.forEach(walk)
     // 页数由首个响应的 total 定死，避免网络循环依赖后端的翻页终止条件
     const pages = Math.ceil(first.total / size)
     for (let page = 2; page <= pages; page++) {
       const result = await resultsApi.fetchPosts(taskId.value, page, size)
-      for (const p of result.posts) {
-        map.set(p.index - 1, p)
-      }
+      result.posts.forEach(walk)
     }
     postsMap.value = map
   } catch (e) {
@@ -446,6 +448,12 @@ const trendData = computed(() => {
     .map(([date, counts]) => ({ date, ...counts }))
 })
 
+// 趋势图只画得出有时间戳的帖子。旧版提取器留下的条目没有时间，
+// 不把这个数标出来，图上的点加起来对不上概览的「已分析」，看着像少算了
+const trendTotal = computed(() =>
+  trendData.value.reduce((n, d) => n + d.positive + d.negative + d.neutral, 0)
+)
+
 const trendMax = computed(() => {
   let max = 1
   for (const d of trendData.value) {
@@ -580,9 +588,15 @@ function viewPost(idx: number) {
 
       <!-- 概览卡片 -->
       <div class="stats-grid">
+        <!-- 分子分母一起给：三档情感之和等于「已分析」而不是总数，
+             只显示总数会让人以为少算了几条 -->
         <div class="stat-card">
-          <div class="stat-value">{{ data.total }}</div>
-          <div class="stat-label">分析帖子数</div>
+          <div class="stat-value">{{ data.success }} / {{ data.total }}</div>
+          <div class="stat-label">已分析 / 总帖子数</div>
+        </div>
+        <div v-if="data.failed" class="stat-card">
+          <div class="stat-value" style="color: var(--warning, #D97706);">{{ data.failed }}</div>
+          <div class="stat-label">未分析（见下表）</div>
         </div>
         <div class="stat-card">
           <div class="stat-value" style="color: var(--success);">{{ data.summary.sentiment_distribution.positive }}</div>
@@ -727,7 +741,12 @@ function viewPost(idx: number) {
 
       <!-- 趋势图: 情感随时间变化 -->
       <div v-if="trendData.length > 1" class="card">
-        <div class="card-header">📈 情感趋势</div>
+        <div class="card-header">
+          📈 情感趋势
+          <span class="text-sm text-secondary" style="font-weight: normal;">
+            （仅含有时间的 {{ trendTotal }} 条）
+          </span>
+        </div>
         <div class="trend-chart">
           <svg :viewBox="`0 0 700 220`" style="width: 100%;" role="img" aria-label="情感趋势图">
             <!-- Y轴标注 -->

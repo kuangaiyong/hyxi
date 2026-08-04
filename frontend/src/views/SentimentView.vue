@@ -1,6 +1,10 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import * as echarts from 'echarts/core'
+import { LineChart } from 'echarts/charts'
+import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/components'
+import { CanvasRenderer } from 'echarts/renderers'
 import * as sentimentApi from '@/api/sentiment'
 import * as resultsApi from '@/api/results'
 import { useToast } from '@/composables/useToast'
@@ -98,14 +102,21 @@ const DIM_COLORS: Record<string, string> = {
   '安全性': '#DC2626',
 }
 
+// 按需注册，整包 echarts 会往首屏包里塞进一兆多用不上的图表类型
+echarts.use([LineChart, GridComponent, TooltipComponent, LegendComponent, CanvasRenderer])
+
 onMounted(() => {
   checkStatus()
+  themeOb = new MutationObserver(() => { if (trendChart) renderTrend() })
+  themeOb.observe(document.documentElement, { attributeFilter: ['data-theme'] })
 })
 
 onUnmounted(() => {
   closeSSE()
   stopPolling()
   clearConnectTimer()
+  themeOb?.disconnect()
+  disposeTrend()
 })
 
 // 定时器句柄：组件卸载后再触发就会泄漏一条无人持有的 EventSource
@@ -454,93 +465,90 @@ const trendTotal = computed(() =>
   trendData.value.reduce((n, d) => n + d.positive + d.negative + d.neutral, 0)
 )
 
-const trendMax = computed(() => {
-  let max = 1
-  for (const d of trendData.value) {
-    max = Math.max(max, d.positive + d.negative + d.neutral)
-  }
-  return max
-})
-
-// ===== 趋势图几何 =====
-const CHART = { w: 720, h: 260, padL: 44, padR: 16, padT: 16, padB: 44 }
-const PLOT_W = CHART.w - CHART.padL - CHART.padR
-const PLOT_H = CHART.h - CHART.padT - CHART.padB
-
 const SERIES = [
   { key: 'positive', label: '正面' },
   { key: 'negative', label: '负面' },
   { key: 'neutral', label: '中立' },
 ] as const
 
-const hoverIdx = ref<number | null>(null)
+// ===== 趋势图（ECharts）=====
 
-// 纵轴按整数步长向上取整。直接用 trendMax 等分会画出 1.5 这样的刻度，
-// 标签四舍五入成 2 之后就落在了 1.5 的位置上——线和数字对不上
-const trendAxis = computed(() => {
-  const step = Math.max(1, Math.ceil(trendMax.value / 4))
-  const rows = Math.ceil(trendMax.value / step)
-  return { step, rows, top: step * rows }
-})
+const trendEl = ref<HTMLElement | null>(null)
+let trendChart: echarts.ECharts | null = null
+let trendResizeOb: ResizeObserver | null = null
+let themeOb: MutationObserver | null = null
 
-const trendGeom = computed(() => {
-  const days = trendData.value
-  const n = days.length
-  const px = (i: number) => CHART.padL + (i / Math.max(n - 1, 1)) * PLOT_W
-  const py = (v: number) => CHART.padT + (1 - v / trendAxis.value.top) * PLOT_H
+/** 深浅色是 AppLayout 直接改 documentElement 上的 data-theme，没有 store 可订阅，
+ *  ECharts 又只吃具体色值，只能在每次出图时把当下的 CSS 变量读出来 */
+function cssVar(name: string): string {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+}
 
-  // 三段自下而上依次累加，纵轴上界是「当天三类之和」，整张图正好占满绘图区。
-  // 若改回三条独立折线，这个上界会让每条线都压在底部三分之一里
-  let below = new Array(n).fill(0)
-  const areas = SERIES.map((s) => {
-    const upper = days.map((d, i) => below[i] + d[s.key])
-    const top = upper.map((v, i) => `${i ? 'L' : 'M'}${px(i)},${py(v)}`).join(' ')
-    const bottom = below
-      .map((v, i) => ({ v, i }))
-      .reverse()
-      .map(({ v, i }) => `L${px(i)},${py(v)}`)
-      .join(' ')
-    const seg = { ...s, color: COLORS[s.key], area: `${top} ${bottom} Z`, line: top,
-                  dots: upper.map((v, i) => ({ cx: px(i), cy: py(v) })) }
-    below = upper
-    return seg
-  })
+function trendOption() {
+  const label = cssVar('--text-light')
+  const line = cssVar('--border-light')
+  return {
+    color: SERIES.map((s) => COLORS[s.key]),
+    // ECharts 6 起 containLabel 作废且静默失效，改用 outerBounds 把「绘图区 + 轴标签」
+    // 一起框住；内边距必须显式归零，否则默认的 10% 会把图挤成 830px 宽
+    grid: { left: 0, right: 0, top: 0, bottom: 0, outerBounds: { left: 4, right: 16, top: 36, bottom: 4 } },
+    tooltip: {
+      trigger: 'axis',
+      backgroundColor: cssVar('--bg-card'),
+      borderColor: cssVar('--border'),
+      textStyle: { color: cssVar('--text'), fontSize: 12 },
+    },
+    legend: { top: 0, itemHeight: 8, textStyle: { color: label } },
+    xAxis: {
+      type: 'category',
+      // 类目值保留完整日期让提示框显示年份，轴上只画月-日，26 天才不用旋转
+      data: trendData.value.map((d) => d.date),
+      boundaryGap: false,
+      axisLine: { lineStyle: { color: line } },
+      axisTick: { show: false },
+      axisLabel: { color: label, formatter: (v: string) => v.slice(5) },
+    },
+    yAxis: {
+      type: 'value',
+      // 条数是整数，不加这条会在数据少时画出 0.5 这样的刻度
+      minInterval: 1,
+      axisLabel: { color: label },
+      splitLine: { lineStyle: { color: line } },
+    },
+    series: SERIES.map((s) => ({
+      name: s.label,
+      type: 'line',
+      symbol: 'circle',
+      symbolSize: 6,
+      data: trendData.value.map((d) => d[s.key]),
+    })),
+  }
+}
 
-  // 每个日期一条透明竖条负责接鼠标，比逐点命中好按得多（点只有几像素）
-  const bw = PLOT_W / Math.max(n - 1, 1)
-  const bands = days.map((d, i) => ({
-    x: Math.max(CHART.padL, px(i) - bw / 2),
-    w: bw,
-    cx: px(i),
-    date: d.date,
-  }))
+function renderTrend() {
+  if (!trendEl.value) return
+  if (!trendChart) {
+    trendChart = echarts.init(trendEl.value)
+    // 侧边栏折叠不会触发 window resize，盯容器才两种情况都覆盖得到
+    trendResizeOb = new ResizeObserver(() => trendChart?.resize())
+    trendResizeOb.observe(trendEl.value)
+  }
+  trendChart.setOption(trendOption(), true)
+}
 
-  // 26 个日期全标出来必须旋转才塞得下，读起来费劲；等距抽稀到最多 8 个
-  const step = Math.ceil(n / 8)
-  const ticks = days
-    .map((d, i) => ({ i, date: d.date }))
-    .filter(({ i }) => i % step === 0 || i === n - 1)
-    .map(({ i, date }) => ({ x: px(i), label: date.slice(5) }))
+function disposeTrend() {
+  trendResizeOb?.disconnect()
+  trendResizeOb = null
+  trendChart?.dispose()
+  trendChart = null
+}
 
-  const { step: yStep, rows } = trendAxis.value
-  const grid = Array.from({ length: rows + 1 }, (_, k) => ({ v: yStep * k, y: py(yStep * k) }))
-
-  return { areas, bands, ticks, grid, x0: CHART.padL, x1: CHART.padL + PLOT_W }
-})
-
-const hoverDay = computed(() =>
-  hoverIdx.value === null ? null : trendData.value[hoverIdx.value] || null
-)
-
-/** 提示框跟着悬停点走，贴边时靠 translate 收回来，不然会被卡片裁掉 */
-const tooltipStyle = computed(() => {
-  const i = hoverIdx.value
-  if (i === null) return {}
-  const cx = trendGeom.value.bands[i]?.cx ?? 0
-  const pct = (cx / CHART.w) * 100
-  const shift = pct < 18 ? '0%' : pct > 82 ? '-100%' : '-50%'
-  return { left: `${pct}%`, transform: `translateX(${shift})` }
-})
+// 必须连容器一起 watch：数据先于结果区渲染就位（结果区还被 loading 挡着），
+// 只盯 trendData 会在容器还是 null 时白跑一次，之后容器挂上来也没人再画
+watch([trendData, trendEl], () => {
+  if (trendEl.value && trendData.value.length > 1) renderTrend()
+  else disposeTrend()
+}, { flush: 'post' })
 
 function sentimentLabel(s: string | null | undefined): string {
   if (!s) return '未分析'
@@ -827,101 +835,7 @@ function viewPost(idx: number) {
             （仅含有时间的 {{ trendTotal }} 条）
           </span>
         </div>
-        <div class="trend-chart" @mouseleave="hoverIdx = null">
-          <!-- key 绑到数据本身：分析完成后 clipPath 里那个矩形若不重新挂载，
-               CSS 动画不会重播，图会静默变一下，看不出「刚跑完一轮」 -->
-          <svg
-            :key="`${trendData.length}-${trendTotal}`"
-            :viewBox="`0 0 ${CHART.w} ${CHART.h}`"
-            class="trend-svg" role="img" aria-label="情感趋势图"
-          >
-            <defs>
-              <linearGradient v-for="s in trendGeom.areas" :id="`grad-${s.key}`" :key="s.key" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" :stop-color="s.color" stop-opacity="0.85" />
-                <stop offset="100%" :stop-color="s.color" stop-opacity="0.45" />
-              </linearGradient>
-              <!-- 生长动画靠这个矩形横向拉开，路径本身不动，重绘时不会闪 -->
-              <clipPath id="trend-reveal">
-                <rect class="trend-reveal-rect" x="0" y="0" :width="CHART.w" :height="CHART.h" />
-              </clipPath>
-            </defs>
-
-            <g class="trend-axis">
-              <template v-for="g in trendGeom.grid" :key="g.v">
-                <line :x1="trendGeom.x0" :y1="g.y" :x2="trendGeom.x1" :y2="g.y" />
-                <text :x="trendGeom.x0 - 8" :y="g.y + 4" text-anchor="end">{{ g.v }}</text>
-              </template>
-              <text v-for="t in trendGeom.ticks" :key="t.x" :x="t.x" :y="CHART.h - CHART.padB + 20" text-anchor="middle">
-                {{ t.label }}
-              </text>
-            </g>
-
-            <g class="trend-plot" clip-path="url(#trend-reveal)">
-              <path
-                v-for="s in trendGeom.areas"
-                :key="s.key"
-                :d="s.area"
-                :fill="`url(#grad-${s.key})`"
-                class="trend-area"
-              />
-              <path
-                v-for="s in trendGeom.areas"
-                :key="`l-${s.key}`"
-                :d="s.line"
-                fill="none"
-                :stroke="s.color"
-                stroke-width="2"
-                stroke-linejoin="round"
-                stroke-linecap="round"
-              />
-            </g>
-
-            <!-- 悬停：竖线 + 三段各自的点。重新分析后天数可能变少，
-                 悬停下标必须连带校验，否则会读到 undefined.cx 整页白屏 -->
-            <g v-if="hoverIdx !== null && trendGeom.bands[hoverIdx]" class="trend-hover">
-              <line
-                :x1="trendGeom.bands[hoverIdx].cx" :y1="CHART.padT"
-                :x2="trendGeom.bands[hoverIdx].cx" :y2="CHART.h - CHART.padB"
-              />
-              <circle
-                v-for="s in trendGeom.areas"
-                :key="s.key"
-                :cx="s.dots[hoverIdx].cx"
-                :cy="s.dots[hoverIdx].cy"
-                r="4.5"
-                :fill="s.color"
-              />
-            </g>
-
-            <rect
-              v-for="(b, i) in trendGeom.bands"
-              :key="b.date"
-              :x="b.x" :y="CHART.padT" :width="b.w" :height="CHART.h - CHART.padT - CHART.padB"
-              fill="transparent"
-              @mouseenter="hoverIdx = i"
-            />
-          </svg>
-
-          <div v-if="hoverDay" class="trend-tip" :style="tooltipStyle">
-            <div class="trend-tip-date">{{ hoverDay.date }}</div>
-            <div v-for="s in SERIES" :key="s.key" class="trend-tip-row">
-              <span class="trend-dot" :style="{ background: COLORS[s.key] }"></span>
-              <span>{{ s.label }}</span>
-              <b>{{ hoverDay[s.key] }}</b>
-            </div>
-            <div class="trend-tip-row trend-tip-total">
-              <span>合计</span>
-              <b>{{ hoverDay.positive + hoverDay.negative + hoverDay.neutral }}</b>
-            </div>
-          </div>
-
-          <div class="trend-legend">
-            <span v-for="s in SERIES" :key="s.key">
-              <span class="trend-dot" :style="{ background: COLORS[s.key] }"></span>{{ s.label }}
-            </span>
-            <span class="text-secondary">悬停查看每日明细</span>
-          </div>
-        </div>
+        <div ref="trendEl" class="trend-chart"></div>
       </div>
 
       <!-- 帖子详情列表 -->
@@ -1079,114 +993,9 @@ function viewPost(idx: number) {
 </template>
 
 <style scoped>
+/* ECharts 按容器实际尺寸画布，高度必须由 CSS 给死，否则初始化时算出 0 */
 .trend-chart {
-  position: relative;
-}
-
-.trend-svg {
   width: 100%;
-  display: block;
-  overflow: visible;
-}
-
-/* 硬编码的 #64748B / #E2E8F0 在深色模式下几乎看不见，轴与网格一律走变量 */
-.trend-axis line {
-  stroke: var(--border-light);
-  stroke-width: 1;
-}
-.trend-axis text {
-  font-size: 11px;
-  fill: var(--text-light);
-}
-
-.trend-area {
-  transition: opacity 0.2s;
-}
-.trend-chart:hover .trend-area {
-  opacity: 0.85;
-}
-
-.trend-hover line {
-  stroke: var(--text-light);
-  stroke-width: 1;
-  stroke-dasharray: 4 3;
-}
-.trend-hover circle {
-  stroke: var(--bg-card);
-  stroke-width: 2;
-}
-
-.trend-reveal-rect {
-  transform-origin: left center;
-  animation: trend-grow 0.7s cubic-bezier(0.22, 1, 0.36, 1);
-}
-@keyframes trend-grow {
-  from { transform: scaleX(0); }
-  to { transform: scaleX(1); }
-}
-@keyframes trend-fade {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-
-.trend-tip {
-  position: absolute;
-  top: 8px;
-  min-width: 120px;
-  padding: 8px 12px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: var(--shadow-md);
-  font-size: 12px;
-  pointer-events: none;
-  z-index: 2;
-  /* 在日期之间滑过去，而不是一格一格地闪 */
-  transition: left 0.15s ease, transform 0.15s ease;
-}
-.trend-tip-date {
-  font-weight: 600;
-  margin-bottom: 6px;
-}
-.trend-tip-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  line-height: 1.9;
-}
-.trend-tip-row b {
-  margin-left: auto;
-}
-.trend-tip-total {
-  margin-top: 4px;
-  padding-top: 4px;
-  border-top: 1px solid var(--border-light);
-  color: var(--text-secondary);
-}
-
-.trend-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  display: inline-block;
-  margin-right: 6px;
-}
-
-.trend-legend {
-  display: flex;
-  gap: 16px;
-  justify-content: center;
-  align-items: center;
-  margin-top: 10px;
-  font-size: 12px;
-}
-
-/* 必须放在全部动效声明之后：选择器权重相同，靠顺序覆盖。
-   降级成淡入而不是干脆不动 —— RDP / 远程桌面会话普遍上报 reduce，
-   一刀切成 none 等于在这类环境里完全看不到图是「画出来的」 */
-@media (prefers-reduced-motion: reduce) {
-  .trend-reveal-rect { animation: none; }
-  .trend-plot { animation: trend-fade 0.45s ease; }
-  .trend-tip { transition: none; }
+  height: 280px;
 }
 </style>

@@ -1817,12 +1817,12 @@ class TestFacebookLoginEndToEnd:
             data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
 
         assert data["complete"] is True, data.get("stop_reason")
-        assert len(data["posts"]) == 3          # 2 主贴 + 1 评论
+        assert len(data["posts"]) == 4          # 2 主贴 + 1 评论 + 1 嵌套回复
         assert os.path.exists(self.state), "会话文件没有落盘，下一轮还得再输一次密码"
 
         roots = [p for p in data["posts"] if not p["parent_fingerprint"]]
         comments = [p for p in data["posts"] if p["parent_fingerprint"]]
-        assert len(roots) == 2 and len(comments) == 1
+        assert len(roots) == 2 and len(comments) == 2
         assert comments[0]["reply_level"] == 1
         import re
         assert re.match(r"^\d{2}-\d{2}-\d{4} \d{2}:\d{2}$", roots[0]["timestamp"])
@@ -1892,7 +1892,30 @@ class TestFacebookLoginEndToEnd:
         blank = [p for p in data["posts"]
                  if not p["message_id"] and not (p["content"] or "").strip()]
         assert blank == [], f"广告 article 被存成了空帖: {blank}"
-        assert len(data["posts"]) == 3, "丢空帖时把真帖子也带走了"
+        assert len(data["posts"]) == 4, "丢空帖时把真帖子也带走了"
+
+    def test_multi_paragraph_comment_keeps_every_paragraph(self):
+        """评论的多段正文必须全取，而且不能把嵌套回复的正文吞进来。
+
+        评论没有专用正文容器，每一段是一个并列的 div[dir=auto] —— querySelector
+        只拿第一段。真站实测一条 9 段的评论只存下第一段的 71 个字符，原文 811 个，
+        丢了 92%。而嵌套回复也是 role=article，取多段时不限定层级就会把子回复的
+        正文并进父评论，父子两条都错。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+
+        with site.LoginSite() as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
+
+        parent = [p for p in data["posts"] if p["message_id"] == "5501"][0]
+        child = [p for p in data["posts"] if p["message_id"] == "5502"][0]
+
+        assert "+1" in parent["content"], "第一段丢了"
+        assert "app is sterk verbeterd" in parent["content"], "第二段丢了"
+        assert "min SOC blijft een raadsel" in parent["content"], "第三段丢了"
+        assert "ondergrens" not in parent["content"], "把嵌套回复的正文吞进父评论了"
+        assert child["content"] == "Die 8% ondergrens is inderdaad vreemd."
 
     def test_session_is_reused_without_password(self):
         """(c) 保留会话重跑：密码给成错的也应该照样成功，证明这一轮根本没走登录"""
@@ -1905,7 +1928,7 @@ class TestFacebookLoginEndToEnd:
             data = self._run(base_url, site.GOOD_USER, "这个密码是错的")
 
         assert data["complete"] is True, data.get("stop_reason")
-        assert len(data["posts"]) == 3
+        assert len(data["posts"]) == 4
 
     def test_deleting_session_falls_back_to_credentials(self):
         """(b) 删掉会话重跑仍能成功"""

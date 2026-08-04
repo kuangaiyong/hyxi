@@ -70,6 +70,10 @@ _REG_PAGE = """<html><head><meta charset="utf-8"><title>注册</title></head><bo
 #     点开后按钮文字变成「收起」，同样会被 textContent 吃进正文。最后一条主贴复刻这一幕。
 #   - 信息流里混着不是帖子的 article（广告 / 推荐小组卡片），既没有固定链接也没有
 #     正文容器。中间那条 role=article 就是它，提取器必须把它丢掉而不是存成空帖。
+#   - **评论的多段正文是一串并列的 div[dir=auto]，一段一个**（实测一条评论有 9 段），
+#     querySelector 只拿第一段。第一条评论复刻成 3 段，并在它里面再嵌一条回复 ——
+#     嵌套回复也是 article，取多段时必须限定在本条评论这一层，否则会把子回复的
+#     正文吞进父评论。
 _FEED_PAGE = """<html><head><meta charset="utf-8"><title>小组</title></head><body>
 <div role="feed">
   <div role="article">
@@ -82,8 +86,17 @@ _FEED_PAGE = """<html><head><meta charset="utf-8"><title>小组</title></head><b
       <a href="/groups/2407063016436085/user/22/" aria-label="Joost1988"></a>
       <a href="/groups/2407063016436085/user/22/">Joost1988</a>
       <div dir="auto">Zelfde ervaring hier, +1</div>
+      <div dir="auto">Vooral de app is sterk verbeterd.</div>
+      <div dir="auto">Alleen de min SOC blijft een raadsel.</div>
       <a href="/groups/2407063016436085/posts/9001/?comment_id=5501"
          aria-label="2026年5月28日凌晨3:42" data-tip="2026年5月28日周三18:42">6天</a>
+      <div role="article">
+        <a href="/groups/2407063016436085/user/44/" aria-label="Sanne_K"></a>
+        <a href="/groups/2407063016436085/user/44/">Sanne_K</a>
+        <div dir="auto">Die 8% ondergrens is inderdaad vreemd.</div>
+        <a href="/groups/2407063016436085/posts/9001/?comment_id=5502"
+           aria-label="2026年5月28日凌晨4:10" data-tip="2026年5月28日周三19:10">6天</a>
+      </div>
     </div>
   </div>
   <div role="article">

@@ -68,7 +68,7 @@ const SELECTORS = {
     postTime: 'a[href*="/posts/"]:not([href*="comment_id"])',
     commentTime: 'a[href*="comment_id"]',
     body: '[data-ad-comet-preview="message"], [data-ad-rendering-role="story_message"]',
-    // 评论没有专用正文容器，第一个 div[dir=auto] 就是正文
+    // 评论没有专用正文容器，正文是一串并列的 div[dir=auto]，**一段一个**（见 commentText）
     commentBody: 'div[dir="auto"]',
     // 以下两个是**文本模式不是选择器**：折叠正文那个按钮只能按文字认。
     // 登录后的界面语言由 Facebook 账号自己的设置决定，与采集器的 locale 无关
@@ -181,10 +181,18 @@ async function extractBatch(page) {
     const raw = await page.evaluate((sel) => {
         const text = (el) => (el ? el.textContent.replace(/\s+/g, ' ').trim() : '');
         // 正文要额外剥掉末尾的展开/收起按钮文字，用户名等字段不需要
-        const bodyText = (el) => text(el).replace(new RegExp(sel.bodyTrail), '');
+        const stripTrail = (s) => s.replace(new RegExp(sel.bodyTrail), '');
+        const bodyText = (el) => stripTrail(text(el));
         // 主贴的字段只能在主贴自己这一层找：评论也是 article，嵌在里面
         const own = (root, selector) => [...root.querySelectorAll(selector)]
             .find((el) => el.closest(sel.post) === root) || null;
+        // 评论正文是一串**并列**的 div[dir=auto]，一段一个 —— 取第一个就只剩第一段。
+        // 实测一条 9 段的评论只存下第一段的 71 个字符，原文 811 个。
+        // 层级限定不能省：嵌套回复也是 article，不限定就会把子回复的正文并进父评论。
+        const commentText = (root) => stripTrail(
+            [...root.querySelectorAll(sel.commentBody)]
+                .filter((el) => el.closest(sel.post) === root)
+                .map(text).filter(Boolean).join('\n'));
         // 作者：取第一个**有文字**的个人主页链接，前面那几个是同一个人的头像链接
         const nameOf = (root, scoped) => text([...root.querySelectorAll(sel.author)].find(
             (el) => (!scoped || el.closest(sel.post) === root) && el.textContent.trim()));
@@ -218,7 +226,7 @@ async function extractBatch(page) {
                     return {
                         username: nameOf(c, false),
                         timeKey: mark(link, id && `c${id}`),
-                        content: bodyText(c.querySelector(sel.commentBody)),
+                        content: commentText(c),
                         message_id: id,
                     };
                 });

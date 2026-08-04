@@ -46,24 +46,74 @@ _TWO_FACTOR_PAGE = """<html><head><meta charset="utf-8"><title>两步验证</tit
 </form>
 </body></html>"""
 
+# 注册页：真站登录表单下方那个绿色大按钮指向 /reg/?entry_point=login&next=...，
+# 人工授权时误点一下就落到这里。页面上没有 email/pass 输入框，也没有 feed，
+# 于是轮询循环两头都不认，会一声不吭地空转到超时 —— 这份 fixture 就是复现那一幕。
+_REG_PAGE = """<html><head><meta charset="utf-8"><title>注册</title></head><body>
+<form method="POST" action="/reg/">
+  <input type="text" name="reg_email__" />
+</form>
+<a href="/login/">登录</a>
+</body></html>"""
+
+# 小组页结构对齐 2026-08-04 探测到的真实（已登录）小组页：
+#   - 没有 abbr[data-utime]，也没有 data-post-id / data-comment-id，
+#     帖子和评论的 id 只能从固定链接的 URL 里取
+#   - 没有 h3 / strong，作者只剩 a[href*="/user/"]，而同一个人会连出几个这样的链接，
+#     排在前面的是头像、文本为空 —— 直接 querySelector 取到的是空的那个
+#   - 评论正文是第一个 div[dir=auto]，没有专用容器
+#   - 主贴时间链接的 aria-label 是**相对时间**，评论的是绝对时间但走 Facebook 账号
+#     自己的时区（实测比本地早 15 小时）—— 两个坑都复刻在这里，绝对的本地时间
+#     只有 hover 出来的 tooltip 有
 _FEED_PAGE = """<html><head><meta charset="utf-8"><title>小组</title></head><body>
 <div role="feed">
-  <div role="article" data-post-id="p1">
-    <h3><a href="/u/1">Marieke_V</a></h3>
-    <abbr data-utime="1780391640"></abbr>
+  <div role="article">
+    <a href="/groups/2407063016436085/user/11/" aria-label="Marieke_V"></a>
+    <a href="/groups/2407063016436085/user/11/">Marieke_V</a>
+    <a href="/groups/2407063016436085/posts/9001/" aria-label="6天"
+       data-tip="2026年5月28日周三17:54"><span>6天</span></a>
     <div data-ad-comet-preview="message">Na drie maanden met de HYXi Halo ben ik echt tevreden.</div>
-    <div role="article" data-comment-id="c1">
-      <h3><a href="/u/2">Joost1988</a></h3>
-      <abbr data-utime="1780394520"></abbr>
-      <div data-ad-comet-preview="message">Zelfde ervaring hier, +1</div>
+    <div role="article">
+      <a href="/groups/2407063016436085/user/22/" aria-label="Joost1988"></a>
+      <a href="/groups/2407063016436085/user/22/">Joost1988</a>
+      <div dir="auto">Zelfde ervaring hier, +1</div>
+      <a href="/groups/2407063016436085/posts/9001/?comment_id=5501"
+         aria-label="2026年5月28日凌晨3:42" data-tip="2026年5月28日周三18:42">6天</a>
     </div>
   </div>
-  <div role="article" data-post-id="p2">
-    <h3><a href="/u/3">TechNerd_NL</a></h3>
-    <abbr data-utime="1780519620"></abbr>
+  <div role="article">
+    <a href="/groups/2407063016436085/user/33/" aria-label="TechNerd_NL"></a>
+    <a href="/groups/2407063016436085/user/33/">TechNerd_NL</a>
+    <a href="/groups/2407063016436085/posts/9002/" aria-label="4天"
+       data-tip="2026年5月30日周五05:27"><span>4天</span></a>
     <div data-ad-comet-preview="message">Firmware 2.4.1 heeft bij mij de WiFi-verbinding gesloopt.</div>
   </div>
 </div>
+<script>
+document.addEventListener('mouseover', function (e) {
+  var a = e.target.closest && e.target.closest('a[data-tip]');
+  if (!a || document.getElementById('tip')) return;
+  var tip = document.createElement('div');
+  tip.id = 'tip';
+  tip.setAttribute('role', 'tooltip');
+  tip.textContent = a.getAttribute('data-tip');
+  document.body.appendChild(tip);
+});
+document.addEventListener('mouseout', function () {
+  var t = document.getElementById('tip');
+  if (t) t.remove();
+});
+</script>
+</body></html>"""
+
+# 一刻不停在导航的页面。人在窗口里输账号、提交、过验证，每一步都是一次导航，
+# 而轮询每 2 秒查一次 loggedIn —— 两者撞上时 Playwright 会抛「Execution context was
+# destroyed」。这页把那个窗口放到最大，用来钉死「轮询不能因为导航而把脚本搞挂」。
+# 导航挂在 load 上而不是解析期，否则 gotoPage 自己就会被打断，测的就不是轮询了。
+_CHURN_PAGE = """<html><head><meta charset="utf-8"><title>跳转中</title></head><body>
+<script>window.addEventListener('load', function () {
+  setTimeout(function () { location.replace('/churn?n=' + Math.random()); }, 0);
+});</script>
 </body></html>"""
 
 _GROUP_RE = re.compile(r"^/groups/\d+/?$")
@@ -83,15 +133,30 @@ class _Handler(BaseHTTPRequestHandler):
     def _has_session(self) -> bool:
         return SESSION_COOKIE in (self.headers.get("Cookie") or "")
 
+    def _record_lang(self):
+        self.server.request_languages.append(self.headers.get("Accept-Language") or "")
+
     def do_GET(self):
+        self._record_lang()
         if self.path.startswith("/login"):
             self._send(_LOGIN_PAGE.format(error=""))
+            return
+        if self.path.startswith("/reg"):
+            self._send(_REG_PAGE)
+            return
+        if self.path.startswith("/churn"):
+            self._send(_CHURN_PAGE)
             return
         if _GROUP_RE.match(self.path):
             # 未登录时 302 到 /login/?next=... —— 2026-08-03 实测真站就是这个行为，
             # 不是给未登录用户看只读预览
             if not self._has_session():
-                target = "/login/?next=" + quote(self.path, safe="")
+                if self.server.landing == "reg":
+                    target = "/reg/?entry_point=login&next=" + quote(self.path, safe="")
+                elif self.server.landing == "churn":
+                    target = "/churn"
+                else:
+                    target = "/login/?next=" + quote(self.path, safe="")
                 self._send("", status=302, extra_headers=[("Location", target)])
                 return
             self._send(_FEED_PAGE)
@@ -99,6 +164,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
+        self._record_lang()
         if not self.path.startswith("/login"):
             self.send_error(404)
             return
@@ -123,15 +189,25 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class LoginSite:
-    """with LoginSite() as base_url: ..."""
+    """with LoginSite() as base_url: ...
 
-    def __init__(self, port: int = 0):
+    landing="reg" 时未登录访问小组页改跳注册页，用来验证脚本会不会提示走错页面；
+    landing="churn" 时改跳一个不停自我导航的页面，用来验证轮询撞上导航不会把脚本搞挂。
+    request_languages 收下每个请求的 Accept-Language，是「浏览器界面语言」这件事
+    唯一不依赖真站的观测点。
+    """
+
+    def __init__(self, port: int = 0, landing: str = "login"):
         self._port = port
+        self._landing = landing
         self._server = None
         self._thread = None
+        self.request_languages = []
 
     def __enter__(self) -> str:
         self._server = ThreadingHTTPServer(("127.0.0.1", self._port), _Handler)
+        self._server.landing = self._landing
+        self._server.request_languages = self.request_languages
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         return "http://127.0.0.1:{}".format(self._server.server_address[1])

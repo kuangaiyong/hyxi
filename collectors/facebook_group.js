@@ -54,13 +54,28 @@ const SELECTORS = {
     // aria-live 提示（荷兰语「Je wachtwoord wordt weergegeven」/「你的密码正在显示」），
     // 那是无障碍朗读用的，不是错误；把它当错误会让每一次正常登录都被判成密码不对。
     loginError: '#error_box',
-    // 内容提取
+    // 内容提取。以下于 2026-08-04 对真实小组页（已登录）核实：
+    // 页面上没有 abbr[data-utime]，也没有 data-post-id / data-comment-id，
+    // 帖子和评论的 id 只能从固定链接的 URL 里取。
     post: '[role="article"]',
     comment: '[role="article"] [role="article"]',
-    author: 'h3 a, strong a, [data-ad-rendering-role="profile_name"]',
-    time: 'abbr[data-utime], a[href*="/posts/"] span[title]',
+    // 主贴和评论都没有 h3 / strong，作者只剩小组内的个人主页链接。同一个人会连出几个
+    // 这样的链接，**排在前面的是头像、文本为空** —— 直接 querySelector 取到的就是空的
+    // 那个，于是每条帖子都成了匿名（取法见 nameOf）
+    author: 'a[href*="/user/"]',
+    // 时间锚点：主贴是头部那个固定链接，评论自带 comment_id。
+    // 两者的 aria-label 都不能用，原因见 resolveTimes()
+    postTime: 'a[href*="/posts/"]:not([href*="comment_id"])',
+    commentTime: 'a[href*="comment_id"]',
     body: '[data-ad-comet-preview="message"], [data-ad-rendering-role="story_message"]',
+    // 评论没有专用正文容器，第一个 div[dir=auto] 就是正文
+    commentBody: 'div[dir="auto"]',
 };
+
+// 时间链接的标记属性 + 按标记缓存的 tooltip 文本。信息流是往下追加，上一批的帖子
+// 每一批都会被重新提取一次，不缓存就要把同一条帖子 hover 十遍。
+const TIME_MARK = 'data-hyxi-t';
+const timeCache = new Map();
 
 function groupUrl() {
     return `${CONFIG.baseUrl}/groups/${CONFIG.groupId}`;
@@ -70,54 +85,129 @@ function loginUrl() {
     return `${CONFIG.baseUrl}/login`;
 }
 
-/** 统一成落盘格式 dd-mm-yyyy HH:MM；拿不到结构化时间就原样保留，绝不编造 */
+/**
+ * 统一成落盘格式 dd-mm-yyyy HH:MM。
+ *
+ * 解析不出绝对时间就返回空串，**绝不原样保留**：timestamp 是指纹的一部分，
+ * 把「6天」这类会随天数变化的文本写进去，第二天同一条帖子就变成新帖 ——
+ * 全部历史数据失配，已翻译的重新付费翻译，舆情重复计数。
+ */
 function normalizeTime(raw) {
-    const asEpoch = Number(raw);
-    const d = Number.isFinite(asEpoch) && asEpoch > 1e9
-        ? new Date(asEpoch * 1000)
-        : new Date(raw);
-    if (isNaN(d.getTime())) return (raw || '').trim();
+    const s = (raw || '').trim();
+    if (!s) return '';
     const p = (n) => String(n).padStart(2, '0');
+    // 中文界面的 tooltip：2026年7月28日周二19:53
+    const cn = s.match(/(\d{4})年(\d{1,2})月(\d{1,2})日\D*?(\d{1,2}):(\d{2})/);
+    if (cn) return `${p(cn[3])}-${p(cn[2])}-${cn[1]} ${p(cn[4])}:${cn[5]}`;
+    const asEpoch = Number(s);
+    const d = Number.isFinite(asEpoch) && asEpoch > 1e9 ? new Date(asEpoch * 1000) : new Date(s);
+    if (isNaN(d.getTime())) return '';
     return `${p(d.getDate())}-${p(d.getMonth() + 1)}-${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-async function extractBatch(page) {
-    return await page.evaluate((sel) => {
-        const text = (el) => (el ? el.textContent.replace(/\s+/g, ' ').trim() : '');
-        const timeOf = (el) => {
-            const t = el.querySelector(sel.time);
-            if (!t) return '';
-            return t.getAttribute('data-utime') || t.getAttribute('title') || text(t);
-        };
-        const out = [];
-        // 只取顶层 article：评论也是 article，嵌在主贴里面
-        const articles = [...document.querySelectorAll(sel.post)].filter(
-            (a) => !a.parentElement.closest(sel.post)
-        );
-        articles.forEach((article) => {
-            const comments = [...article.querySelectorAll(sel.comment)].map((c) => ({
-                username: text(c.querySelector(sel.author)),
-                rawTime: timeOf(c),
-                content: text(c.querySelector(sel.body)),
-                message_id: c.getAttribute('data-comment-id') || '',
-            }));
-            out.push({
-                username: text(article.querySelector(sel.author)),
-                rawTime: timeOf(article),
-                content: text(article.querySelector(sel.body)),
-                message_id: article.getAttribute('data-post-id') || '',
-                comments,
-            });
-        });
-        return out;
-    }, SELECTORS);
+/**
+ * hover 时间链接读 tooltip —— 这是页面上唯一一处绝对且本地的时间。
+ *
+ * 主贴头部链接的 aria-label 是相对时间（「6天」），明天再抓就是「7天」，进指纹即失配；
+ * 评论的 aria-label 是绝对时间，但用的是 **Facebook 账号自己的时区**（实测比宿主机
+ * 早 15 小时 = PDT vs Asia/Shanghai），和主贴根本对不上。tooltip 两者都给本地绝对时间。
+ */
+async function hoverTime(page, key) {
+    try {
+        const el = await page.$(`[${TIME_MARK}="${key}"]`);
+        if (!el) return '';
+        // 上一个 tooltip 不消失，读到的就分不清是谁的
+        await page.mouse.move(2, 2);
+        await page.waitForFunction(
+            () => !document.querySelector('[role="tooltip"]'), null, { timeout: 1200 });
+        await el.hover({ timeout: 5000 });
+        const tip = await page.waitForFunction(() => {
+            const t = document.querySelector('[role="tooltip"]');
+            return t ? t.textContent.trim() : null;
+        }, null, { timeout: 2000 });
+        return String(await tip.jsonValue());
+    } catch (e) {
+        // 页面/浏览器没了是真故障，要往外抛让这一轮判为残缺（退出码 2）。吞掉的话
+        // 剩下的帖子会一路拿到空时间，最后写出一份 complete: true 的、时间全空的结果
+        if (/has been closed|target closed|crashed/i.test(e.message)) throw e;
+        return '';
+    }
 }
 
-function flatten(rawPosts, displayBatch, anonCounter) {
+async function extractBatch(page) {
+    const raw = await page.evaluate((sel) => {
+        const text = (el) => (el ? el.textContent.replace(/\s+/g, ' ').trim() : '');
+        // 主贴的字段只能在主贴自己这一层找：评论也是 article，嵌在里面
+        const own = (root, selector) => [...root.querySelectorAll(selector)]
+            .find((el) => el.closest(sel.post) === root) || null;
+        // 作者：取第一个**有文字**的个人主页链接，前面那几个是同一个人的头像链接
+        const nameOf = (root, scoped) => text([...root.querySelectorAll(sel.author)].find(
+            (el) => (!scoped || el.closest(sel.post) === root) && el.textContent.trim()));
+        const idOf = (link, kind) => {
+            const href = link ? link.getAttribute('href') : '';
+            const m = href && (kind === 'comment'
+                ? href.match(/comment_id=([^&#]+)/)
+                : href.match(/\/posts\/([^/?#]+)/));
+            return m ? m[1] : '';
+        };
+        // 给时间链接打标记，随后在页面外逐个 hover。已打过的不重打 ——
+        // 滚动是往下追加，上一批的元素还在 DOM 里，重打会让缓存全部落空
+        window.__hyxiSeq = window.__hyxiSeq || 0;
+        const mark = (el, id) => {
+            if (!el) return '';
+            const existing = el.getAttribute('data-hyxi-t');
+            if (existing) return existing;
+            const key = id.replace(/[^A-Za-z0-9_]/g, '') || `n${++window.__hyxiSeq}`;
+            el.setAttribute('data-hyxi-t', key);
+            return key;
+        };
+
+        const out = [];
+        // 只取顶层 article：评论也是 article，嵌在主贴里面
+        [...document.querySelectorAll(sel.post)]
+            .filter((a) => !a.parentElement.closest(sel.post))
+            .forEach((article) => {
+                const comments = [...article.querySelectorAll(sel.comment)].map((c) => {
+                    const link = c.querySelector(sel.commentTime);
+                    const id = idOf(link, 'comment');
+                    return {
+                        username: nameOf(c, false),
+                        timeKey: mark(link, id && `c${id}`),
+                        content: text(c.querySelector(sel.commentBody)),
+                        message_id: id,
+                    };
+                });
+                const link = own(article, sel.postTime);
+                const id = idOf(link, 'post');
+                out.push({
+                    username: nameOf(article, true),
+                    timeKey: mark(link, id && `p${id}`),
+                    content: text(own(article, sel.body)),
+                    message_id: id,
+                    comments,
+                });
+            });
+        return out;
+    }, SELECTORS);
+
+    const items = raw.flatMap((p) => [p, ...p.comments]);
+    for (const item of items) {
+        if (item.timeKey && !timeCache.has(item.timeKey)) {
+            timeCache.set(item.timeKey, await hoverTime(page, item.timeKey));
+        }
+        item.rawTime = timeCache.get(item.timeKey) || '';
+    }
+    return raw;
+}
+
+// 取不到作者时一律填同一个「匿名」，**不要按序号编名字**：信息流每一批都会把上一批的
+// 帖子重新提取一遍，序号会跟着变，而 username 进指纹 —— 实测同一条帖子因此在两个批次里
+// 拿到两个指纹，一轮抓下来就翻倍。同名不会把两个人混成一条：指纹里还有时间和正文。
+function flatten(rawPosts, displayBatch) {
     const flat = [];
     rawPosts.forEach((raw) => {
         const post = {
-            username: raw.username || `用户${++anonCounter.n}`,
+            username: raw.username || '匿名',
             timestamp: normalizeTime(raw.rawTime),
             content: raw.content,
             page_number: displayBatch,
@@ -129,7 +219,7 @@ function flatten(rawPosts, displayBatch, anonCounter) {
         flat.push(post);
         (raw.comments || []).forEach((c) => {
             const comment = {
-                username: c.username || `用户${++anonCounter.n}`,
+                username: c.username || '匿名',
                 timestamp: normalizeTime(c.rawTime),
                 content: c.content,
                 page_number: displayBatch,
@@ -165,7 +255,11 @@ async function main() {
     };
 
     const browser = await launchBrowser(CONFIG.headless);
-    const context = await newContext(browser, { stateFile: CONFIG.stateFile, locale: 'nl-NL' });
+    // 不跟 tweakers.js 用 nl-NL：locale 决定未登录界面的语言，而人工授权模式下这个窗口
+    // 是给操作者看的。荷兰语页面上最显眼的绿色按钮是「Nieuw account maken」（创建新账户），
+    // 实测被认成注册页。zh-CN 同时与宿主机时区 Asia/Shanghai、中国出口 IP 自洽。
+    // 注意：登录之后 Facebook 按账号自己的语言设置渲染，与这里无关。
+    const context = await newContext(browser, { stateFile: CONFIG.stateFile, locale: 'zh-CN' });
     const page = await context.newPage();
 
     // ===== 人工授权模式：开有头浏览器让人自己过验证，只落会话不采数据 =====
@@ -212,7 +306,6 @@ async function main() {
     }
 
     const fresh = [];
-    const anonCounter = { n: 0 };
     let batch = 0;
     let complete = true;
     let stopReason = null;
@@ -221,7 +314,7 @@ async function main() {
         await gotoPage(page, groupUrl(), CONFIG.timeout);
         for (batch = 1; batch <= CONFIG.maxBatches; batch++) {
             await humanRead(page);
-            const flat = flatten(await extractBatch(page), batch, anonCounter);
+            const flat = flatten(await extractBatch(page), batch);
 
             if (batch === 1 && flat.length === 0) {
                 throw new Error('第一批未提取到任何帖子，提取器可能已失效或页面被拦截');

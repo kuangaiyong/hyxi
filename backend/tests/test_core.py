@@ -1824,9 +1824,35 @@ class TestFacebookLoginEndToEnd:
         comments = [p for p in data["posts"] if p["parent_fingerprint"]]
         assert len(roots) == 2 and len(comments) == 1
         assert comments[0]["reply_level"] == 1
-        # data-utime 是 epoch 秒，要落成 dd-mm-yyyy HH:MM
         import re
         assert re.match(r"^\d{2}-\d{2}-\d{4} \d{2}:\d{2}$", roots[0]["timestamp"])
+
+    def test_timestamp_comes_from_tooltip_not_the_relative_label(self):
+        """时间必须取 hover tooltip 的绝对时间。
+
+        页面上另外两个时间来源都不能用，而且错了不会报错、只会静默污染指纹：
+        主贴头部链接的 aria-label 是相对时间（「6天」），明天再抓同一条帖子就是「7天」，
+        timestamp 进指纹 → 全部历史数据被判成新帖，已翻译的重新付费翻译、舆情重复计数；
+        评论的 aria-label 是绝对时间，但走 Facebook 账号自己的时区（实测早 15 小时），
+        和主贴对不上。作者、正文、message_id 一并钉住 —— 真实页面上
+        data-post-id / data-comment-id / abbr[data-utime] 都不存在。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+
+        with site.LoginSite() as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
+
+        roots = [p for p in data["posts"] if not p["parent_fingerprint"]]
+        comments = [p for p in data["posts"] if p["parent_fingerprint"]]
+        assert roots[0]["timestamp"] == "28-05-2026 17:54", "主贴取了会漂的相对时间"
+        assert comments[0]["timestamp"] == "28-05-2026 18:42", "评论取了账号时区的时间"
+        # 作者链接前面还有一个同一个人的头像链接，文本是空的
+        assert roots[0]["username"] == "Marieke_V", "取到的是空文本的头像链接"
+        assert comments[0]["username"] == "Joost1988"
+        assert "+1" in comments[0]["content"], "评论正文不在 [data-ad-comet-preview] 里"
+        assert roots[0]["message_id"] == "9001"
+        assert comments[0]["message_id"] == "5501"
 
     def test_session_is_reused_without_password(self):
         """(c) 保留会话重跑：密码给成错的也应该照样成功，证明这一轮根本没走登录"""
@@ -2077,7 +2103,7 @@ class TestSessionStateReflectsReality:
             "会话已经不管用了，界面上却还会显示「会话正常」"
         )
 
-    def _authorize(self, source: dict, base_url: str, timeout_ms: int):
+    def _authorize(self, source: dict, base_url: str, timeout_ms: int, progress=None):
         """跑一轮人工授权（login_only）。超时上限可配就是为了在验证里跑短一点"""
         import asyncio
         from app.collectors import get_collector
@@ -2095,7 +2121,9 @@ class TestSessionStateReflectsReality:
         loop = asyncio.new_event_loop()
         try:
             return loop.run_until_complete(
-                CollectorRunner.execute("auth-e2e", collector, job_source, ProgressManager())
+                CollectorRunner.execute(
+                    "auth-e2e", collector, job_source, progress or ProgressManager()
+                )
             )
         finally:
             loop.close()
@@ -2126,6 +2154,85 @@ class TestSessionStateReflectsReality:
         assert source_service.get_source(source["id"])["last_auth_at"] is None, (
             "授权超时也意味着会话没拿到，徽标必须翻回「需重新授权」"
         )
+
+    def test_browser_requests_chinese_ui(self):
+        """人工授权窗口是给操作者看的，站点界面必须是他读得懂的语言。
+
+        locale 从 tweakers.js 抄来的 nl-NL 会把 Facebook 未登录界面整页切成荷兰语，
+        而视觉上最抢眼的绿色按钮写着「Nieuw account maken」（创建新账户）——
+        实测被用户认成注册页，以为点错了地方。
+        """
+        self._skip_unless_ready()
+
+        sys.path.insert(0, _FIXTURES_DIR)
+        import login_site
+
+        source = self._authorized_source()
+        site = login_site.LoginSite()
+        with site as base_url:
+            self._collect(source, base_url, login_site.GOOD_USER, login_site.GOOD_PASSWORD)
+
+        assert site.request_languages, "fixture 站点没收到任何请求"
+        assert all(lang.startswith("zh") for lang in site.request_languages), (
+            f"浏览器界面语言不是中文，人工授权窗口操作者读不懂: {set(site.request_languages)}"
+        )
+
+    def test_stuck_on_registration_page_is_reported(self):
+        """人工授权时落到注册页 → 必须出一句提示，而不是静默空转到超时。
+
+        窗口里登录表单下方就是「创建新账户」，面板第 ②③ 步本来就是让人自己操作，
+        误点是可预期的。轮询循环只认 loggedIn，落到注册页两头都不认，
+        用户对着一个没反应的窗口等满 10 分钟都不知道自己走错了页。
+        """
+        self._skip_unless_ready()
+        import pytest
+        from app.services.collector_runner import ManualAuthRequired
+        from app.services.progress_manager import ProgressManager
+
+        sys.path.insert(0, _FIXTURES_DIR)
+        import login_site
+
+        progress = ProgressManager()
+        queue = progress.subscribe("auth-e2e")
+
+        source = self._authorized_source()
+        with login_site.LoginSite(landing="reg") as base_url:
+            with pytest.raises(ManualAuthRequired):
+                self._authorize(source, base_url, 6000, progress=progress)
+
+        messages = []
+        while not queue.empty():
+            msg = queue.get_nowait()
+            if msg["event"] == "log":
+                messages.append(msg["data"]["message"])
+
+        assert any("创建新账户" in m for m in messages), (
+            f"落到注册页却一声不吭，用户只能干等到超时: {messages}"
+        )
+
+    def test_navigation_during_polling_does_not_kill_the_script(self):
+        """人工授权期间页面导航，不能把脚本搞挂。
+
+        人在窗口里输账号、提交、过人机验证，每一步都是导航；轮询每 2 秒查一次 loggedIn，
+        撞上导航提交时 Playwright 抛「Execution context was destroyed」。原先直接往外抛，
+        脚本以退出码 1 死掉、Playwright 连带关掉那个窗口 —— 用户刚输进去的账号密码全白费，
+        界面上还只给一句 Playwright 的英文报错。必须当成「这一轮没查成」继续轮询，
+        最终以退出码 3 给出可操作提示。
+        """
+        self._skip_unless_ready()
+        import pytest
+        from app.services.collector_runner import ManualAuthRequired
+
+        sys.path.insert(0, _FIXTURES_DIR)
+        import login_site
+
+        source = self._authorized_source()
+        with login_site.LoginSite(landing="churn") as base_url:
+            # 不是 ManualAuthRequired 就说明脚本被导航搞挂了（异常里带 code=1 那条）
+            with pytest.raises(ManualAuthRequired) as exc:
+                self._authorize(source, base_url, 8000)
+
+        assert "等待人工登录超时" in exc.value.reason, exc.value.reason
 
     def test_successful_collect_keeps_last_auth_at(self):
         """反向保证：采集成功时不能把授权时间抹掉，否则徽标会反过来误报失效"""

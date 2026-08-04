@@ -121,6 +121,7 @@ async function waitForManualLogin(page, { entryUrl, selectors, timeout, gotoPage
     await gotoPage(page, entryUrl, timeout);
     const deadline = Date.now() + maxWaitMs;
     let reported = 0;
+    let regHinted = false;
     while (Date.now() < deadline) {
         // 人随时可能直接关掉窗口放弃授权 —— 界面上第四步还就是叫他关窗口。
         // 不接住的话 page.$ 会抛「Target page, context or browser has been closed」
@@ -131,11 +132,23 @@ async function waitForManualLogin(page, { entryUrl, selectors, timeout, gotoPage
             landed = await page.$(selectors.loggedIn);
         } catch (e) {
             if (page.isClosed() || /has been closed/i.test(e.message)) return 'closed';
-            throw e;
+            // 人在窗口里每操作一步都是一次导航，而这里 2 秒查一次 —— 撞上时 Playwright 抛
+            // 「Execution context was destroyed」。那不是故障，只是这一轮没查成；抛出去脚本
+            // 会以退出码 1 死掉、窗口被连带关闭，用户刚输进去的账号密码全白费。
+            if (!/execution context was destroyed|frame was detached|navigating and changing/i.test(e.message)) throw e;
+            landed = null;
         }
         if (landed) {
             log('   检测到登录成功');
             return 'ok';
+        }
+        // 登录表单下方就是「创建新账户」，误点一下就落到注册页 —— 那里既没有登录框也没有
+        // feed，轮询两头都不认，用户会对着一个没反应的窗口等满整个超时。只提示一次，不刷屏。
+        // 只看路径且要求边界：整条 URL 上匹配会把 /privacy/policy/regulation/
+        // 和 ?from=reg_link 这类正常页面误报成注册页
+        if (!regHinted && /^\/(reg|r\.php)(\/|$)/.test(new URL(page.url()).pathname)) {
+            regHinted = true;
+            log('   ⚠️ 当前停在「创建新账户」页，请点页面上的「登录」回到登录页');
         }
         const left = Math.round((deadline - Date.now()) / 1000);
         if (left <= reported - 15 || reported === 0) {

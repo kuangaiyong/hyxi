@@ -154,10 +154,27 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 - **提交后不要赌它整页导航**：`waitForLanding()` 轮询到状态确定为止（`classifyLanding()` 对「还停在登录页且没报错」返回 `pending`），导航还是 AJAX 都不影响。当场判死会把提交到落地之间那一段误报成密码错
 - **真实拦截点是 Arkose Labs 人机验证**：落地 URL 为 `/two_step_verification/authentication/?...&flow=pre_authentication`，正文提到 “MatchKey van Arkose Labs”。这不是输个短信码就完事的两步验证，**必须人来过** —— `classifyLanding()` 把它归入 `checkpoint`，脚本以退出码 3 交回给人。破解它属于「明确不做」
 - **把输入改成逐字键入（`humanType`）后实测无任何变化，照样弹人机验证**。所以别再往「模拟得更像人」这个方向调登录了：触发信号是账号 + 出口 IP 归属地 + 全新浏览器指纹这个组合，不是打字速度。`humanType` 保留（零耗时填完一整个密码本来就不该出现），但它解决不了这件事。**唯一可靠的路径是人工授权一次，之后复用会话**
+- **`/login/?next=...` 不会跳注册页**：25 秒内 URL 一次都没变、`input[name="email"]` / `input[name="pass"]` 全程存在、页面上没有任何注册表单。曾有人报「人工登录跳到注册页」，实际是 `locale: 'nl-NL'`（从 `tweakers.js` 抄来的）把界面整页切成荷兰语，而最抢眼的绿色按钮写着 `Nieuw account maken`（指向 `/reg/?entry_point=login&next=...`）。**`facebook_group.js` 的 locale 是 `zh-CN`，别再抄 Tweakers 那份** —— 人工授权窗口是给操作者看的，还顺带与宿主机时区 `Asia/Shanghai` + 中国出口 IP 自洽
+- **locale 只管未登录界面**：登录之后 Facebook 按账号自己的语言设置渲染，与 accept-language 无关。所以 `SELECTORS.loggedIn` 里 `[aria-label="创建帖子"]` 和 `[aria-label="Create a post"]` 两个都得留着，真正扛事的是语言无关的 `[role="feed"]` / `[data-pagelet^="GroupsFeed"]`
+- **不要用 curl 诊断 Facebook**：同一个 `/login/?next=...`，curl 拿到的是 **400 “Sorry, something went wrong.”**，真 Chrome 拿到的是 **200 完整登录页**。它按 TLS / 请求头指纹区别对待，用 curl 取证会得出完全相反的结论
+- **人工授权的轮询必须扛得住导航**：人在窗口里每操作一步都是一次导航，2 秒一次的 `page.$` 撞上去就抛 `Execution context was destroyed`。真实发生过 —— 用户提交密码那一刻脚本以退出码 1 死掉、窗口被连带关闭，刚输的东西全白费。`waitForManualLogin()` 现在把这类导航瞬态当成「这轮没查成」继续轮询，只有 `has been closed` 才判定人放弃了授权
 
-`tests/fixtures/login_site.py` 已按上述结论复刻：302 跳转、随机 id、0×0 的 submit、以及那个会抢走点击的「显示密码」图标 —— 测的就是真实路径上的坑。
+`tests/fixtures/login_site.py` 已按上述结论复刻：302 跳转、随机 id、0×0 的 submit、那个会抢走点击的「显示密码」图标，以及 `landing="reg"`（未登录访问小组页改跳注册页）/ `landing="churn"`（跳一个不停自我导航的页面）两个分支 —— 测的就是真实路径上的坑。它还把每个请求的 `Accept-Language` 记进 `request_languages`，是「窗口对操作者可读」这件事唯一不依赖真站的观测点。
 
-**尚未验证的一段**：过完人机验证之后的小组页 DOM（`post` / `author` / `time` / `body` 那几个选择器）还没见过真实页面，目前仍是推测。选择器失配时有「第一批零帖子即硬失败」兜住，不会写出看起来完整的空结果，但要真正采到数据必须先完成一次人工授权、再照着真实 DOM 校准。
+### 小组页 DOM 实测结论（2026-08-04，人工授权拿到真实会话后实跑）
+
+提取器已照真实页面校准，不再是推测。**改它之前先读这一段**：
+
+- **页面上没有 `abbr[data-utime]`，也没有 `data-post-id` / `data-comment-id`**。主贴 id 从头部固定链接的 `/posts/{id}` 取，评论 id 从 `comment_id={id}` 取
+- **没有 `h3`，也没有 `strong a`**。作者只剩小组内的个人主页链接 `a[href*="/user/"]`，而同一个人会连出好几个这样的链接，**排在前面的是头像、文本为空** —— `querySelector` 取到的正是空的那个。必须取第一个**有文字**的（`nameOf()`）。踩过：58 条帖子全成了匿名
+- **时间只能 hover 读 tooltip**（`[role="tooltip"]`，headless 下照样出，形如 `2026年7月28日周二19:53`）。页面上另外两个时间来源都有毒：主贴头部链接的 `aria-label` 是**相对时间**（「6天」），评论的 `aria-label` 是绝对时间但走 **Facebook 账号自己的时区**（实测比宿主机早 15 小时 = PDT vs `Asia/Shanghai`），主贴和评论根本对不上
+- **`timestamp` 进指纹，所以解析不出绝对时间就留空，绝不原样保留**。写个「6天」进去，明天再抓同一条帖子就是「7天」→ 新指纹 → 全部历史数据判成新帖，已翻译的重复付费翻译、舆情重复计数
+- **取不到作者时一律填同一个「匿名」，不要按序号编名字**。信息流每一批都会把上一批的帖子重新提取一遍，序号跟着变而 `username` 也进指纹 —— 实测同一条帖子在两个批次里拿到两个指纹，一轮抓下来数据翻倍
+- **tooltip 结果按链接缓存**（`timeCache` + DOM 上的 `data-hyxi-t` 标记）：滚动是往下追加，不缓存就要把同一条帖子 hover 十遍
+
+实测证据（真 facebook.com 小组 `2407063016436085`，2 批）：41 条 = 19 主贴 + 22 评论，时间 / 作者 / `message_id` 无一为空，`message_id` 重复 0 组；**保留结果再跑一次增量：提取 16 条、新增 0 条** —— 指纹跨进程稳定。
+
+`tests/fixtures/login_site.py` 的小组页按上述结构复刻，连坑一起：文本为空的头像链接排在作者链接前面、主贴 `aria-label` 给相对时间、评论 `aria-label` 给一个时区错开的绝对时间、tooltip 靠 `mouseover` 现挂。
 
 ### 已排除的三条路（核实过，不要再重复讨论）
 
@@ -273,7 +290,7 @@ translate 和 generate_excel 在 context 里没有 posts 时会**从各数据源
 
 ## 测试
 
-**161 个测试，必须全部 PASSED**（本机实测 `161 passed in 154s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**166 个测试，必须全部 PASSED**（本机实测 `166 passed in 203s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v

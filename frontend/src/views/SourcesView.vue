@@ -343,7 +343,9 @@ function formatTime(iso: string | null): string {
       <ol class="text-sm mb-4" style="padding-left: 20px; line-height: 1.9;">
         <li>已经弹出一个浏览器窗口 —— 它在<strong>运行后端的那台机器的桌面上</strong>，
           不是你当前这个浏览器里的标签页。</li>
-        <li>在那个窗口里输入账号和密码。<strong>密码直接输给站点，本系统不经手也不保存。</strong></li>
+        <li>窗口里是站点的登录页，填「邮箱或手机号」和「密码」，
+          <strong>不要点下方绿色的「创建新账户」</strong>——那是注册，不是登录。
+          <strong>密码直接输给站点，本系统不经手也不保存。</strong></li>
         <li><strong>亲手完成人机验证 / 两步验证。</strong>这一步只能由你来，脚本不会做任何绕过尝试。</li>
         <li>本页提示「授权成功」后即可关闭那个窗口。之后的采集会直接复用会话，不再需要密码。</li>
       </ol>

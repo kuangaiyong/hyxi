@@ -224,4 +224,5 @@ def collector_catalog() -> List[dict]:
             "param_fields": c.param_fields,
         }
         for c in all_collectors()
+        if not c.internal
     ]

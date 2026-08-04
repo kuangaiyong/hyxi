@@ -274,8 +274,19 @@ class TestSourcesAPIEndToEnd:
         assert tweakers["needs_credentials"] is False
         assert [f["name"] for f in tweakers["param_fields"]] == ["thread_id", "base_url"]
         assert [f["required"] for f in tweakers["param_fields"]] == [True, False]
-        group = next(c for c in resp.json() if c["id"] == "group_feed")
+        group = next(c for c in resp.json() if c["id"] == "facebook_group")
         assert group["incremental_strategy"] == "watermark"
+
+    def test_internal_collector_hidden_from_catalog(self):
+        """group_feed 是给 fixture 站点用的通用采集器（base_url 必填、没有真实站点），
+        真实版本是 facebook_group。它不该出现在「新增数据源」的下拉框里，但仍要能被
+        get_collector 解析 —— 既有数据源和增量回归测试都还在用它"""
+        from app.collectors import get_collector
+
+        ids = [c["id"] for c in self.client.get("/api/v1/collectors").json()]
+        assert "group_feed" not in ids
+        assert ids == ["tweakers", "facebook_group"]
+        assert get_collector("group_feed").id == "group_feed"
 
     def test_source_crud(self):
         resp = self._create(name="Tweakers 主帖")

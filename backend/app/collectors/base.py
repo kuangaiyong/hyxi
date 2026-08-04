@@ -20,6 +20,9 @@ class Collector:
     needs_credentials: bool = False
     param_fields: List[Dict[str, Any]] = []
     incremental_strategy: str = "page"  # "page" | "watermark"
+    # 不进「新增数据源」的采集器下拉框。留给没有真实站点、只服务于本地 fixture 的采集器；
+    # get_collector() 照样能解析出来，已注册的数据源和回归测试不受影响
+    internal: bool = False
 
     def script_path(self) -> str:
         return os.path.join(settings.project_root, "collectors", self.script)

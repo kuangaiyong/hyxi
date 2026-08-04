@@ -301,7 +301,7 @@ translate 和 generate_excel 在 context 里没有 posts 时会**从各数据源
 
 ## 测试
 
-**176 个测试，必须全部 PASSED**（本机实测 `176 passed in 255s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**177 个测试，必须全部 PASSED**（本机实测 `177 passed in 342s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
@@ -322,6 +322,8 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 `useSSE.ts` 是唯一的 SSE 消费点：监听 `step_start` / `step_progress` / `step_complete` / `log` / `error` / `task_complete`，收到 `task_complete` 后主动 `disconnect()`。
 
 `SourcesView.vue` 的参数表单**不写死字段**，按 `GET /api/v1/collectors` 回的 `param_fields` 渲染；必填校验以后端 `_validate_params()` 的 400 为准，前端只负责把报文显示出来。加新采集器时前端零改动。
+
+**新采集器没出现在下拉框里，先看 `Collector.internal`**：该端点会过滤掉 `internal = True` 的采集器（`collector_catalog()`）。目前只有 `group_feed`「公开小组信息流」是这样 —— 它是多来源那一版为本地 fixture 站点写的通用采集器，`base_url` 必填且没有默认站点，真实场景下用户填不出可用地址，真实版本是 `facebook_group`。**它只是不进界面，`get_collector()` 照常解析**，已注册的数据源、任务编排和 `TestGroupFeedCollectorEndToEnd` 那条增量回归都还在用它。
 
 **生产构建**：`npm run build`（= `vue-tsc -b && vite build`）。
 

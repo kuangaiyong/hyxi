@@ -19,6 +19,9 @@ class GroupFeedCollector(Collector):
     script = "group_feed.js"
     needs_credentials = False
     incremental_strategy = "watermark"
+    # 没有默认站点（base_url 必填），真实场景下用户填不出可用地址 —— 真实版本是
+    # facebook_group，这个只服务于 fixture 站点，不进界面
+    internal = True
     param_fields = [
         {
             "name": "group_id",

@@ -67,7 +67,9 @@ _REG_PAGE = """<html><head><meta charset="utf-8"><title>注册</title></head><bo
 #     只有 hover 出来的 tooltip 有
 #   - 长正文只渲染前几行，末尾挂一个 role=button 的「展开」。不点它，textContent
 #     拿到的是残缺正文 + 「展开」两个字（实测有一条整条正文只剩 16 个字符）；
-#     点开后按钮文字变成「收起」，同样会被 textContent 吃进正文。第二条主贴复刻这一幕。
+#     点开后按钮文字变成「收起」，同样会被 textContent 吃进正文。最后一条主贴复刻这一幕。
+#   - 信息流里混着不是帖子的 article（广告 / 推荐小组卡片），既没有固定链接也没有
+#     正文容器。中间那条 role=article 就是它，提取器必须把它丢掉而不是存成空帖。
 _FEED_PAGE = """<html><head><meta charset="utf-8"><title>小组</title></head><body>
 <div role="feed">
   <div role="article">
@@ -83,6 +85,9 @@ _FEED_PAGE = """<html><head><meta charset="utf-8"><title>小组</title></head><b
       <a href="/groups/2407063016436085/posts/9001/?comment_id=5501"
          aria-label="2026年5月28日凌晨3:42" data-tip="2026年5月28日周三18:42">6天</a>
     </div>
+  </div>
+  <div role="article">
+    <div>Gesponsord</div>
   </div>
   <div role="article">
     <a href="/groups/2407063016436085/user/33/" aria-label="TechNerd_NL"></a>

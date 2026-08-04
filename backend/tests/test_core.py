@@ -1875,6 +1875,25 @@ class TestFacebookLoginEndToEnd:
         assert "收起" not in folded["content"], "展开后「收起」按钮的文字混进了正文"
         assert not folded["content"].endswith("…"), "截断省略号残留在正文末尾"
 
+    def test_non_post_articles_are_dropped(self):
+        """信息流里的广告 / 推荐卡片也是 role=article，不能存成空帖。
+
+        它们既没有固定链接也没有正文容器，存下来就是一条四个字段全空的记录：
+        白占一次翻译调用（真站旧数据里有 56 条这种，全被标成"已翻译"），还会在
+        结果页显示成一条什么都没有的帖子。判据是 **id 和正文全都没有** ——
+        纯图片帖有 id 没正文、正文没渲染出来的帖子有正文没 id，两种都得留住。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+
+        with site.LoginSite() as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
+
+        blank = [p for p in data["posts"]
+                 if not p["message_id"] and not (p["content"] or "").strip()]
+        assert blank == [], f"广告 article 被存成了空帖: {blank}"
+        assert len(data["posts"]) == 3, "丢空帖时把真帖子也带走了"
+
     def test_session_is_reused_without_password(self):
         """(c) 保留会话重跑：密码给成错的也应该照样成功，证明这一轮根本没走登录"""
         self._skip_unless_ready()

@@ -245,12 +245,23 @@ async function extractBatch(page) {
     return raw;
 }
 
+/**
+ * 信息流里混着不是帖子的 article：广告、推荐小组卡片之类，既没有固定链接也没有正文。
+ * 留着会白占一次翻译调用，还会在结果里显示成一条什么都没有的空帖。
+ *
+ * **只在两者都缺时才丢**：纯图片帖有 id 没正文，正文没渲染出来的帖子有正文没 id，
+ * 两种都是真帖子。只有 id 和正文全都没有，才是真的没有任何东西可分析。
+ */
+function isNotAPost(item) {
+    return !item.message_id && !(item.content || '').trim();
+}
+
 // 取不到作者时一律填同一个「匿名」，**不要按序号编名字**：信息流每一批都会把上一批的
 // 帖子重新提取一遍，序号会跟着变，而 username 进指纹 —— 实测同一条帖子因此在两个批次里
 // 拿到两个指纹，一轮抓下来就翻倍。同名不会把两个人混成一条：指纹里还有时间和正文。
 function flatten(rawPosts, displayBatch) {
     const flat = [];
-    rawPosts.forEach((raw) => {
+    rawPosts.filter((raw) => !isNotAPost(raw)).forEach((raw) => {
         const post = {
             username: raw.username || '匿名',
             timestamp: normalizeTime(raw.rawTime),
@@ -262,7 +273,7 @@ function flatten(rawPosts, displayBatch) {
         };
         post.fingerprint = makeFingerprint(post);
         flat.push(post);
-        (raw.comments || []).forEach((c) => {
+        (raw.comments || []).filter((c) => !isNotAPost(c)).forEach((c) => {
             const comment = {
                 username: c.username || '匿名',
                 timestamp: normalizeTime(c.rawTime),

@@ -462,6 +462,86 @@ const trendMax = computed(() => {
   return max
 })
 
+// ===== 趋势图几何 =====
+const CHART = { w: 720, h: 260, padL: 44, padR: 16, padT: 16, padB: 44 }
+const PLOT_W = CHART.w - CHART.padL - CHART.padR
+const PLOT_H = CHART.h - CHART.padT - CHART.padB
+
+const SERIES = [
+  { key: 'positive', label: '正面' },
+  { key: 'negative', label: '负面' },
+  { key: 'neutral', label: '中立' },
+] as const
+
+const hoverIdx = ref<number | null>(null)
+
+// 纵轴按整数步长向上取整。直接用 trendMax 等分会画出 1.5 这样的刻度，
+// 标签四舍五入成 2 之后就落在了 1.5 的位置上——线和数字对不上
+const trendAxis = computed(() => {
+  const step = Math.max(1, Math.ceil(trendMax.value / 4))
+  const rows = Math.ceil(trendMax.value / step)
+  return { step, rows, top: step * rows }
+})
+
+const trendGeom = computed(() => {
+  const days = trendData.value
+  const n = days.length
+  const px = (i: number) => CHART.padL + (i / Math.max(n - 1, 1)) * PLOT_W
+  const py = (v: number) => CHART.padT + (1 - v / trendAxis.value.top) * PLOT_H
+
+  // 三段自下而上依次累加，纵轴上界是「当天三类之和」，整张图正好占满绘图区。
+  // 若改回三条独立折线，这个上界会让每条线都压在底部三分之一里
+  let below = new Array(n).fill(0)
+  const areas = SERIES.map((s) => {
+    const upper = days.map((d, i) => below[i] + d[s.key])
+    const top = upper.map((v, i) => `${i ? 'L' : 'M'}${px(i)},${py(v)}`).join(' ')
+    const bottom = below
+      .map((v, i) => ({ v, i }))
+      .reverse()
+      .map(({ v, i }) => `L${px(i)},${py(v)}`)
+      .join(' ')
+    const seg = { ...s, color: COLORS[s.key], area: `${top} ${bottom} Z`, line: top,
+                  dots: upper.map((v, i) => ({ cx: px(i), cy: py(v) })) }
+    below = upper
+    return seg
+  })
+
+  // 每个日期一条透明竖条负责接鼠标，比逐点命中好按得多（点只有几像素）
+  const bw = PLOT_W / Math.max(n - 1, 1)
+  const bands = days.map((d, i) => ({
+    x: Math.max(CHART.padL, px(i) - bw / 2),
+    w: bw,
+    cx: px(i),
+    date: d.date,
+  }))
+
+  // 26 个日期全标出来必须旋转才塞得下，读起来费劲；等距抽稀到最多 8 个
+  const step = Math.ceil(n / 8)
+  const ticks = days
+    .map((d, i) => ({ i, date: d.date }))
+    .filter(({ i }) => i % step === 0 || i === n - 1)
+    .map(({ i, date }) => ({ x: px(i), label: date.slice(5) }))
+
+  const { step: yStep, rows } = trendAxis.value
+  const grid = Array.from({ length: rows + 1 }, (_, k) => ({ v: yStep * k, y: py(yStep * k) }))
+
+  return { areas, bands, ticks, grid, x0: CHART.padL, x1: CHART.padL + PLOT_W }
+})
+
+const hoverDay = computed(() =>
+  hoverIdx.value === null ? null : trendData.value[hoverIdx.value] || null
+)
+
+/** 提示框跟着悬停点走，贴边时靠 translate 收回来，不然会被卡片裁掉 */
+const tooltipStyle = computed(() => {
+  const i = hoverIdx.value
+  if (i === null) return {}
+  const cx = trendGeom.value.bands[i]?.cx ?? 0
+  const pct = (cx / CHART.w) * 100
+  const shift = pct < 18 ? '0%' : pct > 82 ? '-100%' : '-50%'
+  return { left: `${pct}%`, transform: `translateX(${shift})` }
+})
+
 function sentimentLabel(s: string | null | undefined): string {
   if (!s) return '未分析'
   return { positive: '正面', negative: '负面', neutral: '中立' }[s] || s
@@ -747,45 +827,99 @@ function viewPost(idx: number) {
             （仅含有时间的 {{ trendTotal }} 条）
           </span>
         </div>
-        <div class="trend-chart">
-          <svg :viewBox="`0 0 700 220`" style="width: 100%;" role="img" aria-label="情感趋势图">
-            <!-- Y轴标注 -->
-            <text x="30" y="20" font-size="11" fill="#64748B">{{ trendMax }}</text>
-            <text x="30" y="115" font-size="11" fill="#64748B">{{ Math.round(trendMax / 2) }}</text>
-            <text x="30" y="210" font-size="11" fill="#64748B">0</text>
-            <!-- 网格线 -->
-            <line v-for="y in [40, 120, 200]" :key="y" x1="40" :y1="y" x2="680" :y2="y" stroke="#E2E8F0" stroke-width="1" />
-            <!-- X轴标注 -->
-            <text
-              v-for="(d, i) in trendData"
-              :key="d.date"
-              :x="40 + (i / Math.max(trendData.length - 1, 1)) * 640"
-              y="215"
-              font-size="9"
-              fill="#94A3B8"
-              text-anchor="middle"
-              :transform="`rotate(-30, ${40 + (i / Math.max(trendData.length - 1, 1)) * 640}, 215)`"
-            >{{ d.date.slice(5) }}</text>
-            <!-- 折线: 正面 -->
-            <polyline
-              :points="trendData.map((d, i) => `${40 + (i / Math.max(trendData.length - 1, 1)) * 640},${200 - (d.positive / trendMax) * 160}`).join(' ')"
-              fill="none" stroke="#10B981" stroke-width="2"
-            />
-            <!-- 折线: 负面 -->
-            <polyline
-              :points="trendData.map((d, i) => `${40 + (i / Math.max(trendData.length - 1, 1)) * 640},${200 - (d.negative / trendMax) * 160}`).join(' ')"
-              fill="none" stroke="#EF4444" stroke-width="2"
-            />
-            <!-- 折线: 中立 -->
-            <polyline
-              :points="trendData.map((d, i) => `${40 + (i / Math.max(trendData.length - 1, 1)) * 640},${200 - (d.neutral / trendMax) * 160}`).join(' ')"
-              fill="none" stroke="#6B7280" stroke-width="2" stroke-dasharray="4,3"
+        <div class="trend-chart" @mouseleave="hoverIdx = null">
+          <!-- key 绑到数据本身：分析完成后 clipPath 里那个矩形若不重新挂载，
+               CSS 动画不会重播，图会静默变一下，看不出「刚跑完一轮」 -->
+          <svg
+            :key="`${trendData.length}-${trendTotal}`"
+            :viewBox="`0 0 ${CHART.w} ${CHART.h}`"
+            class="trend-svg" role="img" aria-label="情感趋势图"
+          >
+            <defs>
+              <linearGradient v-for="s in trendGeom.areas" :id="`grad-${s.key}`" :key="s.key" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" :stop-color="s.color" stop-opacity="0.85" />
+                <stop offset="100%" :stop-color="s.color" stop-opacity="0.45" />
+              </linearGradient>
+              <!-- 生长动画靠这个矩形横向拉开，路径本身不动，重绘时不会闪 -->
+              <clipPath id="trend-reveal">
+                <rect class="trend-reveal-rect" x="0" y="0" :width="CHART.w" :height="CHART.h" />
+              </clipPath>
+            </defs>
+
+            <g class="trend-axis">
+              <template v-for="g in trendGeom.grid" :key="g.v">
+                <line :x1="trendGeom.x0" :y1="g.y" :x2="trendGeom.x1" :y2="g.y" />
+                <text :x="trendGeom.x0 - 8" :y="g.y + 4" text-anchor="end">{{ g.v }}</text>
+              </template>
+              <text v-for="t in trendGeom.ticks" :key="t.x" :x="t.x" :y="CHART.h - CHART.padB + 20" text-anchor="middle">
+                {{ t.label }}
+              </text>
+            </g>
+
+            <g class="trend-plot" clip-path="url(#trend-reveal)">
+              <path
+                v-for="s in trendGeom.areas"
+                :key="s.key"
+                :d="s.area"
+                :fill="`url(#grad-${s.key})`"
+                class="trend-area"
+              />
+              <path
+                v-for="s in trendGeom.areas"
+                :key="`l-${s.key}`"
+                :d="s.line"
+                fill="none"
+                :stroke="s.color"
+                stroke-width="2"
+                stroke-linejoin="round"
+                stroke-linecap="round"
+              />
+            </g>
+
+            <!-- 悬停：竖线 + 三段各自的点。重新分析后天数可能变少，
+                 悬停下标必须连带校验，否则会读到 undefined.cx 整页白屏 -->
+            <g v-if="hoverIdx !== null && trendGeom.bands[hoverIdx]" class="trend-hover">
+              <line
+                :x1="trendGeom.bands[hoverIdx].cx" :y1="CHART.padT"
+                :x2="trendGeom.bands[hoverIdx].cx" :y2="CHART.h - CHART.padB"
+              />
+              <circle
+                v-for="s in trendGeom.areas"
+                :key="s.key"
+                :cx="s.dots[hoverIdx].cx"
+                :cy="s.dots[hoverIdx].cy"
+                r="4.5"
+                :fill="s.color"
+              />
+            </g>
+
+            <rect
+              v-for="(b, i) in trendGeom.bands"
+              :key="b.date"
+              :x="b.x" :y="CHART.padT" :width="b.w" :height="CHART.h - CHART.padT - CHART.padB"
+              fill="transparent"
+              @mouseenter="hoverIdx = i"
             />
           </svg>
-          <div style="display: flex; gap: 16px; justify-content: center; margin-top: 8px;">
-            <span style="font-size: 12px;"><span style="color:#10B981;">━━</span> 正面</span>
-            <span style="font-size: 12px;"><span style="color:#EF4444;">━━</span> 负面</span>
-            <span style="font-size: 12px;"><span style="color:#6B7280;">╌╌</span> 中立</span>
+
+          <div v-if="hoverDay" class="trend-tip" :style="tooltipStyle">
+            <div class="trend-tip-date">{{ hoverDay.date }}</div>
+            <div v-for="s in SERIES" :key="s.key" class="trend-tip-row">
+              <span class="trend-dot" :style="{ background: COLORS[s.key] }"></span>
+              <span>{{ s.label }}</span>
+              <b>{{ hoverDay[s.key] }}</b>
+            </div>
+            <div class="trend-tip-row trend-tip-total">
+              <span>合计</span>
+              <b>{{ hoverDay.positive + hoverDay.negative + hoverDay.neutral }}</b>
+            </div>
+          </div>
+
+          <div class="trend-legend">
+            <span v-for="s in SERIES" :key="s.key">
+              <span class="trend-dot" :style="{ background: COLORS[s.key] }"></span>{{ s.label }}
+            </span>
+            <span class="text-secondary">悬停查看每日明细</span>
           </div>
         </div>
       </div>
@@ -943,3 +1077,116 @@ function viewPost(idx: number) {
     </div>
   </div>
 </template>
+
+<style scoped>
+.trend-chart {
+  position: relative;
+}
+
+.trend-svg {
+  width: 100%;
+  display: block;
+  overflow: visible;
+}
+
+/* 硬编码的 #64748B / #E2E8F0 在深色模式下几乎看不见，轴与网格一律走变量 */
+.trend-axis line {
+  stroke: var(--border-light);
+  stroke-width: 1;
+}
+.trend-axis text {
+  font-size: 11px;
+  fill: var(--text-light);
+}
+
+.trend-area {
+  transition: opacity 0.2s;
+}
+.trend-chart:hover .trend-area {
+  opacity: 0.85;
+}
+
+.trend-hover line {
+  stroke: var(--text-light);
+  stroke-width: 1;
+  stroke-dasharray: 4 3;
+}
+.trend-hover circle {
+  stroke: var(--bg-card);
+  stroke-width: 2;
+}
+
+.trend-reveal-rect {
+  transform-origin: left center;
+  animation: trend-grow 0.7s cubic-bezier(0.22, 1, 0.36, 1);
+}
+@keyframes trend-grow {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+@keyframes trend-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.trend-tip {
+  position: absolute;
+  top: 8px;
+  min-width: 120px;
+  padding: 8px 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow-md);
+  font-size: 12px;
+  pointer-events: none;
+  z-index: 2;
+  /* 在日期之间滑过去，而不是一格一格地闪 */
+  transition: left 0.15s ease, transform 0.15s ease;
+}
+.trend-tip-date {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.trend-tip-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  line-height: 1.9;
+}
+.trend-tip-row b {
+  margin-left: auto;
+}
+.trend-tip-total {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border-light);
+  color: var(--text-secondary);
+}
+
+.trend-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  margin-right: 6px;
+}
+
+.trend-legend {
+  display: flex;
+  gap: 16px;
+  justify-content: center;
+  align-items: center;
+  margin-top: 10px;
+  font-size: 12px;
+}
+
+/* 必须放在全部动效声明之后：选择器权重相同，靠顺序覆盖。
+   降级成淡入而不是干脆不动 —— RDP / 远程桌面会话普遍上报 reduce，
+   一刀切成 none 等于在这类环境里完全看不到图是「画出来的」 */
+@media (prefers-reduced-motion: reduce) {
+  .trend-reveal-rect { animation: none; }
+  .trend-plot { animation: trend-fade 0.45s ease; }
+  .trend-tip { transition: none; }
+}
+</style>

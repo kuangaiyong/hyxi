@@ -194,7 +194,13 @@ async def get_stats(task_id: str):
     usernames = [p.get("username", "") for p in posts]
     counter = Counter(usernames)
     pages = set(p.get("page_number", 1) for p in posts)
-    timestamps = [p.get("timestamp", "") for p in posts if p.get("timestamp")]
+    # 先归一化成 ISO 再排序取极值。**不能取数组首尾** —— 存储顺序是抓取顺序
+    # （信息流按时间倒序渲染，增量又往后追加），与时间早晚无关，实测出现过
+    # time_range_start 比 time_range_end 晚 18 天。也不能直接对落盘的
+    # dd-mm-yyyy 排序：那是按「日」排先，01-07 会被排到 28-06 前面。
+    timestamps = sorted(
+        _normalize_timestamp(p["timestamp"]) for p in posts if p.get("timestamp")
+    )
 
     top_users = [
         {"username": user, "count": count}
@@ -205,8 +211,8 @@ async def get_stats(task_id: str):
         total_posts=len(posts),
         unique_users=len(counter),
         total_pages=len(pages),
-        time_range_start=_normalize_timestamp(timestamps[0]) if timestamps else None,
-        time_range_end=_normalize_timestamp(timestamps[-1]) if timestamps else None,
+        time_range_start=timestamps[0] if timestamps else None,
+        time_range_end=timestamps[-1] if timestamps else None,
         top_users=top_users,
     )
 

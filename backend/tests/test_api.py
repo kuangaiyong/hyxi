@@ -651,6 +651,84 @@ class TestNestedPostsApiEndToEnd:
         assert stats["total_posts"] == 9
 
 
+class TestStatsTimeRangeEndToEnd:
+    """统计里的时间区间必须真的是最早和最晚"""
+
+    @classmethod
+    def setup_class(cls):
+        import app.config as cfg
+
+        cls.cfg = cfg
+        cls._old_api_key = cfg.settings.api_key
+        cfg.settings.api_key = ""
+
+        from main import app
+        from app.services import storage
+
+        cls.tmpdir = tempfile.mkdtemp()
+        cls.storage = storage
+        cls._old_db_path = storage.DB_PATH
+        storage.DB_PATH = os.path.join(cls.tmpdir, "hyxi.db")
+        storage.init_db()
+        cls.client = TestClient(app)
+
+        # 存储顺序刻意不等于时间顺序 —— 信息流按时间倒序渲染，增量又往后追加，
+        # 真实落盘文件本来就是乱的。最早的那条排在最后，最晚的排在中间。
+        # 日期还跨了月：01-07 和 28-06 按落盘的 dd-mm-yyyy 字符串比大小会得出
+        # 「7 月 1 日早于 6 月 28 日」，所以必须先归一化成 ISO 再比。
+        posts = [
+            {"username": "中", "timestamp": "30-06-2026 12:00", "content": "中间",
+             "fingerprint": "t2", "source": "src_x", "page_number": 1,
+             "parent_fingerprint": None, "reply_level": 0},
+            {"username": "晚", "timestamp": "01-07-2026 08:00", "content": "最晚",
+             "fingerprint": "t3", "source": "src_x", "page_number": 1,
+             "parent_fingerprint": None, "reply_level": 0},
+            {"username": "无时间", "timestamp": "", "content": "时间提取失败",
+             "fingerprint": "t4", "source": "src_x", "page_number": 1,
+             "parent_fingerprint": None, "reply_level": 0},
+            {"username": "早", "timestamp": "28-06-2026 09:00", "content": "最早",
+             "fingerprint": "t1", "source": "src_x", "page_number": 1,
+             "parent_fingerprint": None, "reply_level": 0},
+        ]
+        cls.path = os.path.join(cls.tmpdir, "range.json")
+        with open(cls.path, "w", encoding="utf-8") as f:
+            json.dump({"total_pages": 1, "posts": posts}, f, ensure_ascii=False)
+
+        cls.task_id = "range-e2e"
+        from app.services.orchestrator import orchestrator
+        orchestrator.tasks[cls.task_id] = {
+            "id": cls.task_id, "status": "completed", "description": "时间区间",
+            "plan": [], "logs": [], "progress": 1.0, "current_step": None,
+            "result": {
+                "total_posts": len(posts),
+                "sources": [{"id": "src_x", "name": "乱序来源", "collector_id": "group_feed",
+                             "output_path": cls.path, "post_count": len(posts)}],
+            },
+        }
+        cls.orchestrator = orchestrator
+
+    @classmethod
+    def teardown_class(cls):
+        cls.cfg.settings.api_key = cls._old_api_key
+        cls.storage.DB_PATH = cls._old_db_path
+        cls.orchestrator.tasks.pop(cls.task_id, None)
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def test_time_range_is_min_and_max_not_first_and_last(self):
+        """取的是最早/最晚，不是数组的首尾。
+
+        实测线上出现过 time_range_start=2026-07-28、time_range_end=2026-07-10，
+        开始比结束晚了 18 天 —— 因为直接取了 timestamps[0] 和 timestamps[-1]，
+        而存储顺序是抓取顺序，与时间早晚无关。空时间戳不参与（真实数据里有一批
+        旧版提取器留下的空时间，让它当上「最早」会把整个区间拉垮）。
+        """
+        stats = self.client.get(f"/api/v1/tasks/{self.task_id}/stats").json()
+
+        assert stats["time_range_start"] == "2026-06-28 09:00"
+        assert stats["time_range_end"] == "2026-07-01 08:00"
+        assert stats["time_range_start"] <= stats["time_range_end"], "开始晚于结束"
+
+
 class TestApiKeyAuthEndToEnd:
     """共享密钥认证 — 未配置时放行，配置后拦截"""
 

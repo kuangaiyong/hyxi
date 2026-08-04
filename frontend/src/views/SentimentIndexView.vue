@@ -11,7 +11,7 @@ const loadError = ref('')
 // 过滤
 const filterTaskStatus = ref('')
 const filterSentimentStatus = ref('')
-const filterThreadId = ref('')
+const filterSource = ref('')
 const filterKeyword = ref('')
 
 const SENTIMENT_LABELS: Record<string, string> = {
@@ -34,8 +34,6 @@ async function loadData() {
 
     const list = []
     for (const task of targetTasks) {
-      const tid = extractThreadId(task.description)
-      if (!tid || tid === '-') continue
       try {
         let sentimentStatus = 'none'
         let sentimentSummary: any = null
@@ -50,7 +48,7 @@ async function loadData() {
         } catch { /* none */ }
 
         list.push({
-          threadId: tid,
+          sources: sourceNames(task),
           taskId: task.id,
           description: task.description,
           sentimentStatus,
@@ -73,7 +71,7 @@ const filteredItems = computed(() => {
   let list = items.value
   if (filterTaskStatus.value) list = list.filter(i => i.taskStatus === filterTaskStatus.value)
   if (filterSentimentStatus.value) list = list.filter(i => i.sentimentStatus === filterSentimentStatus.value)
-  if (filterThreadId.value) list = list.filter(i => i.threadId === filterThreadId.value)
+  if (filterSource.value) list = list.filter(i => i.sources.includes(filterSource.value))
   if (filterKeyword.value) {
     const kw = filterKeyword.value.toLowerCase()
     list = list.filter(i => i.description.toLowerCase().includes(kw))
@@ -81,8 +79,8 @@ const filteredItems = computed(() => {
   return list
 })
 
-// 所有帖子ID（去重）
-const allThreadIds = computed(() => [...new Set(items.value.map(i => i.threadId))].sort())
+// 所有来源（去重）
+const allSources = computed(() => [...new Set(items.value.flatMap(i => i.sources))].sort())
 
 // 统计面板
 const statsPanel = computed(() => {
@@ -116,9 +114,13 @@ const statsPanel = computed(() => {
   }
 })
 
-function extractThreadId(desc: string): string {
-  const m = desc.match(/(\d{5,})/)
-  return m ? m[1] : ''
+/** 结果里存了当时的来源清单；失败任务没跑到落结果那一步，退回 plan 里的 collect 步骤 */
+function sourceNames(task: any): string[] {
+  const fromResult = (task.result?.sources || []).map((s: any) => s.name).filter(Boolean)
+  if (fromResult.length) return fromResult
+  return (task.plan || [])
+    .filter((s: any) => s.action === 'collect' && s.params?.source_name)
+    .map((s: any) => s.params.source_name)
 }
 
 function formatTime(iso: string): string {
@@ -184,17 +186,17 @@ function statusLabel(s: string): string {
           <option value="none">待分析</option>
         </select>
 
-        <select v-if="allThreadIds.length > 1" v-model="filterThreadId" class="form-input" style="width: auto; padding: 4px 24px 4px 8px; font-size: 12px;">
-          <option value="">全部帖子</option>
-          <option v-for="tid in allThreadIds" :key="tid" :value="tid">#{{ tid }}</option>
+        <select v-if="allSources.length > 1" v-model="filterSource" class="form-input" style="width: auto; padding: 4px 24px 4px 8px; font-size: 12px;">
+          <option value="">全部来源</option>
+          <option v-for="s in allSources" :key="s" :value="s">{{ s }}</option>
         </select>
 
         <input v-model="filterKeyword" type="text" class="form-input" placeholder="搜索描述..."
           style="width: 160px; padding: 4px 8px; font-size: 12px;" />
 
-        <button v-if="filterTaskStatus || filterSentimentStatus || filterThreadId || filterKeyword"
+        <button v-if="filterTaskStatus || filterSentimentStatus || filterSource || filterKeyword"
           class="btn btn-outline btn-sm"
-          @click="filterTaskStatus='';filterSentimentStatus='';filterThreadId='';filterKeyword=''">清除</button>
+          @click="filterTaskStatus='';filterSentimentStatus='';filterSource='';filterKeyword=''">清除</button>
 
         <span class="text-sm text-secondary" style="margin-left: auto;">共 {{ filteredItems.length }} 条</span>
       </div>
@@ -224,7 +226,7 @@ function statusLabel(s: string): string {
           <tr>
             <th style="width: 44px; text-align: center;">#</th>
             <th>任务描述</th>
-            <th style="width: 72px; text-align: center;">帖子</th>
+            <th style="width: 120px; text-align: center;">来源</th>
             <th style="width: 80px; text-align: center;">任务状态</th>
             <th style="width: 80px; text-align: center;">舆情状态</th>
             <th style="width: 140px; text-align: center;">时间</th>
@@ -241,7 +243,7 @@ function statusLabel(s: string): string {
             <td style="font-size: 13px; max-width: 280px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
               {{ item.description }}
             </td>
-            <td style="text-align: center; font-family: monospace; font-size: 12px;">#{{ item.threadId }}</td>
+            <td style="text-align: center; font-size: 12px;">{{ item.sources.join('、') || '-' }}</td>
             <td style="text-align: center;">
               <span class="badge" :class="'badge-' + item.taskStatus">{{ statusLabel(item.taskStatus) }}</span>
             </td>

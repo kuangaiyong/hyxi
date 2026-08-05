@@ -12,7 +12,6 @@ class Settings(BaseSettings):
     # 项目路径
     project_root: str = str(Path(__file__).parent.parent.parent)
     data_dir: str = os.path.join(project_root, "backend", "data")
-    config_file: str = os.path.join(data_dir, "config.json")
     tasks_dir: str = os.path.join(data_dir, "tasks")
     exports_dir: str = os.path.join(data_dir, "exports")
 

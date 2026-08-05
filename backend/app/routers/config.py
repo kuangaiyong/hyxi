@@ -1,36 +1,19 @@
 """LLM 配置 CRUD 端点"""
 
-import json
-import os
-from typing import Optional
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from app.models import LLMConfig, LLMConfigPublic, ConfigTestResult
-from app.config import settings
+from app.services import storage
 from app.services.llm_service import LLMService
+from app.services.llm_utils import LLM_CONFIG_PREFIX
 
 router = APIRouter(prefix="/api/v1/config", tags=["配置"])
-
-
-def _load_config() -> Optional[dict]:
-    """从文件加载配置"""
-    if os.path.exists(settings.config_file):
-        with open(settings.config_file, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return None
-
-
-def _save_config(config: dict) -> None:
-    """保存配置到文件"""
-    os.makedirs(os.path.dirname(settings.config_file), exist_ok=True)
-    with open(settings.config_file, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
 
 
 @router.get("", response_model=LLMConfigPublic)
 async def get_config():
     """获取当前配置（不返回 API Key）"""
-    cfg = _load_config()
-    if cfg:
+    cfg = storage.get_app_config(LLM_CONFIG_PREFIX)
+    if cfg.get("api_key"):
         return LLMConfigPublic(
             base_url=cfg.get("base_url", ""),
             model_name=cfg.get("model_name", ""),
@@ -47,7 +30,7 @@ async def get_config():
 async def save_config(config: LLMConfig):
     """保存 LLM 配置"""
     cfg = config.model_dump()
-    _save_config(cfg)
+    storage.set_app_config(LLM_CONFIG_PREFIX, cfg)
     return LLMConfigPublic(
         base_url=cfg["base_url"],
         model_name=cfg["model_name"],
@@ -76,8 +59,7 @@ async def test_connection(config: LLMConfig):
 @router.delete("", response_model=LLMConfigPublic)
 async def reset_config():
     """重置配置为默认值"""
-    if os.path.exists(settings.config_file):
-        os.remove(settings.config_file)
+    storage.delete_app_config(LLM_CONFIG_PREFIX)
     return LLMConfigPublic(
         base_url="https://api.deepseek.com",
         model_name="deepseek-chat",

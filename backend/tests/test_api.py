@@ -23,17 +23,18 @@ class TestAPIEndpointsEndToEnd:
         cls._old_key = cfg.settings.api_key
         cfg.settings.api_key = ""
         cfg.settings.data_dir = cls.tmpdir
-        cfg.settings.config_file = os.path.join(cls.tmpdir, "config.json")
         cfg.settings.tasks_dir = os.path.join(cls.tmpdir, "tasks")
         cfg.settings.exports_dir = os.path.join(cls.tmpdir, "exports")
         os.makedirs(cfg.settings.tasks_dir, exist_ok=True)
         os.makedirs(cfg.settings.exports_dir, exist_ok=True)
 
-        # 创建一个空的 config.json 避免 orchestrator 报错
-        with open(cfg.settings.config_file, "w") as f:
-            json.dump({"api_key": "sk-test", "base_url": "https://api.test.com", "model_name": "test-model"}, f)
-
         from main import app
+        from app.services import storage
+        cls.storage = storage
+        storage.set_app_config("llm", {
+            "api_key": "sk-test", "base_url": "https://api.test.com",
+            "model_name": "test-model",
+        })
         cls.client = TestClient(app)
 
     @classmethod

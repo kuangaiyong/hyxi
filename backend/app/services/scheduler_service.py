@@ -12,6 +12,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from app.config import settings
+from app.services import storage
 from app.services.orchestrator import orchestrator
 from app.services.progress_manager import progress_manager
 
@@ -73,14 +74,14 @@ class SchedulerService:
     """定时任务调度器"""
 
     def __init__(self):
-        db_path = os.path.join(settings.data_dir, "scheduler.db")
-        jobstores = {"default": SQLAlchemyJobStore(url=f"sqlite:///{db_path}")}
+        # 触发器与业务配置同库：全部持久化只有 hyxi.db 一个文件，备份和搬迁只用拿一份。
+        # APScheduler 自己建 apscheduler_jobs 表，与业务表互不干涉
+        jobstores = {"default": SQLAlchemyJobStore(url=f"sqlite:///{storage.DB_PATH}")}
 
         self.scheduler = AsyncIOScheduler(
             jobstores=jobstores,
             timezone="Asia/Shanghai",
         )
-        self._config_path = os.path.join(settings.data_dir, "scheduled_tasks.json")
         self._running_jobs: dict[str, str] = {}  # scheduled_task_id -> apscheduler_job_id
 
     def start(self):
@@ -107,17 +108,17 @@ class SchedulerService:
     # ===== 任务配置持久化 =====
 
     def _load_configs(self) -> list:
-        if os.path.exists(self._config_path):
-            with open(self._config_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        return []
+        return storage.load_schedules()
 
     def _save_configs(self, configs: list):
-        os.makedirs(os.path.dirname(self._config_path), exist_ok=True)
-        # ensure_ascii=False 写的是中文描述，不显式指定编码则依赖系统 locale，
-        # 换到 GBK 环境会 UnicodeEncodeError 并摧毁整个定时任务配置文件
-        with open(self._config_path, "w", encoding="utf-8") as f:
-            json.dump(configs, f, ensure_ascii=False, indent=2)
+        """整表覆写。调用方一贯是「读全量 → 改一条 → 写回」，逐条 upsert
+        补不上「某条被删掉了」这种情况，所以先算差集再删。"""
+        keep = {c["id"] for c in configs}
+        for existing in storage.load_schedules():
+            if existing["id"] not in keep:
+                storage.delete_schedule(existing["id"])
+        for cfg in configs:
+            storage.save_schedule(cfg)
 
     def _add_job(self, cfg: dict):
         """向 APScheduler 添加一个 job"""

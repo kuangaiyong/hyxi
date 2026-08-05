@@ -148,9 +148,7 @@ class TestSentimentRetryEndToEnd:
         self.cfg = cfg
         self.tmpdir = tempfile.mkdtemp()
         self._old_dir = cfg.settings.data_dir
-        self._old_cfg = cfg.settings.config_file
         cfg.settings.data_dir = self.tmpdir
-        cfg.settings.config_file = os.path.join(self.tmpdir, "config.json")
         # DB_PATH 是 import 时算好的常量，只改 data_dir 会写进真实的 hyxi.db
         self.storage = storage_module
         self._old_db = storage_module.DB_PATH
@@ -159,7 +157,6 @@ class TestSentimentRetryEndToEnd:
 
     def teardown_method(self):
         self.cfg.settings.data_dir = self._old_dir
-        self.cfg.settings.config_file = self._old_cfg
         self.storage.DB_PATH = self._old_db
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
@@ -188,9 +185,9 @@ class TestSentimentRetryEndToEnd:
 
         server = site.LLMSite()
         with server as base_url:
-            with open(self.cfg.settings.config_file, "w", encoding="utf-8") as f:
-                json.dump({"api_key": "sk-test", "base_url": base_url,
-                           "model_name": "test-model"}, f)
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-test", "base_url": base_url, "model_name": "test-model",
+            })
 
             out = asyncio.new_event_loop().run_until_complete(
                 SentimentService.analyze("retry-e2e", posts, ProgressManager(),
@@ -631,30 +628,31 @@ class TestLLMUtilsEndToEnd:
     def setup_method(self):
         self.tmpdir = tempfile.mkdtemp()
         import app.config as cfg
+        import app.services.storage as storage_module
         self._orig_data_dir = cfg.settings.data_dir
-        self._orig_config_file = cfg.settings.config_file
         cfg.settings.data_dir = self.tmpdir
-        cfg.settings.config_file = os.path.join(self.tmpdir, "config.json")
+        # DB_PATH 是 import 时算好的常量，只改 data_dir 会写进真实的 hyxi.db
+        self.storage = storage_module
+        self._old_db = storage_module.DB_PATH
+        storage_module.DB_PATH = os.path.join(self.tmpdir, "hyxi.db")
+        storage_module.init_db()
 
     def teardown_method(self):
         import app.config as cfg
         cfg.settings.data_dir = self._orig_data_dir
-        cfg.settings.config_file = self._orig_config_file
+        self.storage.DB_PATH = self._old_db
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def test_load_config_returns_none_when_no_file(self):
+    def test_load_config_returns_none_when_unset(self):
         from app.services.llm_utils import load_llm_config
         assert load_llm_config() is None
 
-    def test_load_config_returns_config_when_file_exists(self):
-        config_data = {
+    def test_load_config_returns_config_when_saved(self):
+        self.storage.set_app_config("llm", {
             "api_key": "sk-test-key-123",
             "base_url": "https://api.example.com",
             "model_name": "test-model",
-        }
-        cfg_path = os.path.join(self.tmpdir, "config.json")
-        with open(cfg_path, "w") as f:
-            json.dump(config_data, f)
+        })
 
         from app.services.llm_utils import load_llm_config
         config = load_llm_config()
@@ -663,26 +661,30 @@ class TestLLMUtilsEndToEnd:
         assert config.base_url == "https://api.example.com"
         assert config.model_name == "test-model"
 
-    def test_load_config_handles_corrupt_json(self):
-        cfg_path = os.path.join(self.tmpdir, "config.json")
-        with open(cfg_path, "w") as f:
-            f.write("not valid json {{{")
-
+    def test_load_config_handles_incomplete_row(self):
+        """只有 base_url 没有 api_key 时不能当成「已配置」——LLMConfig 会校验失败"""
+        self.storage.set_app_config("llm", {"base_url": "https://api.example.com"})
         from app.services.llm_utils import load_llm_config
         assert load_llm_config() is None
+
+    def test_reset_clears_the_key(self):
+        """重置后必须真的取不到，否则界面显示未配置而后台还在拿旧 key 发请求"""
+        self.storage.set_app_config("llm", {
+            "api_key": "sk-x", "base_url": "https://a.test", "model_name": "m",
+        })
+        self.storage.delete_app_config("llm")
+        from app.services.llm_utils import load_llm_config
+        assert load_llm_config() is None
+        assert self.storage.get_app_config("llm") == {}
 
     def test_get_llm_service_returns_none_without_config(self):
         from app.services.llm_utils import get_llm_service
         assert get_llm_service() is None
 
     def test_get_llm_service_returns_service_with_config(self):
-        config_data = {
-            "api_key": "sk-test",
-            "base_url": "https://api.test.com",
-            "model_name": "m",
-        }
-        with open(os.path.join(self.tmpdir, "config.json"), "w") as f:
-            json.dump(config_data, f)
+        self.storage.set_app_config("llm", {
+            "api_key": "sk-test", "base_url": "https://api.test.com", "model_name": "m",
+        })
 
         from app.services.llm_utils import get_llm_service
         import asyncio
@@ -713,6 +715,81 @@ def _export_meta(**over):
     }
     meta.update(over)
     return meta
+
+
+class TestJsonToSqliteMigrationEndToEnd:
+    """启动时把遗留的 JSON 搬进 SQLite —— 真文件、真库，不 mock"""
+
+    def setup_method(self):
+        import app.config as cfg
+        import app.services.storage as storage_module
+        self.cfg = cfg
+        self.tmpdir = tempfile.mkdtemp()
+        self._old_dir = cfg.settings.data_dir
+        cfg.settings.data_dir = self.tmpdir
+        self.storage = storage_module
+        self._old_db = storage_module.DB_PATH
+        storage_module.DB_PATH = os.path.join(self.tmpdir, "hyxi.db")
+        storage_module.init_db()
+
+    def teardown_method(self):
+        self.cfg.settings.data_dir = self._old_dir
+        self.storage.DB_PATH = self._old_db
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write(self, name, payload):
+        path = os.path.join(self.tmpdir, name)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        return path
+
+    def test_config_and_schedules_move_into_tables(self):
+        cfg_path = self._write("config.json", {
+            "api_key": "sk-legacy", "base_url": "https://legacy.test", "model_name": "m1",
+        })
+        sched_path = self._write("scheduled_tasks.json", [
+            {"id": "s1", "description": "每天抓一次", "interval": "daily",
+             "time": "09:00", "enabled": True, "created_at": "2026-08-01T10:00:00",
+             "history": [{"task_id": "t1", "status": "completed"}]},
+            {"id": "s2", "description": "停用的", "interval": "hourly",
+             "time": "", "enabled": False, "created_at": "2026-08-02T10:00:00"},
+        ])
+
+        self.storage.migrate_from_json()
+
+        assert self.storage.get_app_config("llm") == {
+            "api_key": "sk-legacy", "base_url": "https://legacy.test", "model_name": "m1",
+        }
+        rows = {s["id"]: s for s in self.storage.load_schedules()}
+        assert rows["s1"]["description"] == "每天抓一次"
+        assert rows["s1"]["enabled"] is True
+        assert rows["s1"]["history"] == [{"task_id": "t1", "status": "completed"}]
+        assert rows["s2"]["enabled"] is False
+
+        # 源文件归档而不是删除，让人能自己核对
+        assert not os.path.exists(cfg_path)
+        assert not os.path.exists(sched_path)
+        backup = os.path.join(self.tmpdir, self.storage.MIGRATED_DIR_NAME)
+        assert sorted(os.listdir(backup)) == ["config.json", "scheduled_tasks.json"]
+
+    def test_migration_is_idempotent(self):
+        """启动就跑一次，重启不能把数据搅乱，也不能把用户后来的修改冲掉"""
+        self._write("config.json", {"api_key": "sk-a", "base_url": "u", "model_name": "m"})
+        self.storage.migrate_from_json()
+
+        # 用户迁移后改了配置；此时归档目录里还躺着那份旧 config.json
+        self.storage.set_app_config("llm", {
+            "api_key": "sk-new", "base_url": "u2", "model_name": "m2",
+        })
+        self.storage.migrate_from_json()
+
+        assert self.storage.get_app_config("llm")["api_key"] == "sk-new", "旧文件把新配置冲掉了"
+
+    def test_missing_files_are_not_an_error(self):
+        """全新部署没有任何遗留 JSON，迁移不该抛"""
+        self.storage.migrate_from_json()
+        assert self.storage.get_app_config("llm") == {}
+        assert self.storage.load_schedules() == []
 
 
 class TestSentimentAbsoluteIndexEndToEnd:
@@ -1139,13 +1216,21 @@ class TestSchedulerStartupResilienceEndToEnd:
     def setup_method(self):
         self.tmpdir = tempfile.mkdtemp()
         import app.services.scheduler_service as sched_mod
+        import app.services.storage as storage_module
         self._orig_data_dir = sched_mod.settings.data_dir
         sched_mod.settings.data_dir = self.tmpdir
+        # 定时任务配置和 APScheduler 的 job store 现在都在 hyxi.db 里，而 DB_PATH
+        # 是 import 时算好的常量 —— 只改 data_dir 会让这批用例写进真实的库
+        self.storage = storage_module
+        self._old_db = storage_module.DB_PATH
+        storage_module.DB_PATH = os.path.join(self.tmpdir, "hyxi.db")
+        storage_module.init_db()
 
     def teardown_method(self):
         import asyncio
         import app.services.scheduler_service as sched_mod
         sched_mod.settings.data_dir = self._orig_data_dir
+        self.storage.DB_PATH = self._old_db
         # asyncio.run 结束时会把当前事件循环置空，其余用 get_event_loop 的测试会跟着挂
         asyncio.set_event_loop(asyncio.new_event_loop())
         shutil.rmtree(self.tmpdir, ignore_errors=True)
@@ -1156,13 +1241,12 @@ class TestSchedulerStartupResilienceEndToEnd:
 
         svc = sched_mod.SchedulerService()
         # 坏配置排在前面：修复前它会中断整个加载循环，后面的好配置永远注册不上
-        with open(svc._config_path, "w", encoding="utf-8") as f:
-            json.dump([
-                {"id": "bad", "description": "畸形时间", "interval": "daily",
-                 "time": "9", "enabled": True},
-                {"id": "good", "description": "正常配置", "interval": "hourly",
-                 "enabled": True},
-            ], f, ensure_ascii=False)
+        svc._save_configs([
+            {"id": "bad", "description": "畸形时间", "interval": "daily",
+             "time": "9", "enabled": True, "created_at": "2026-08-01T00:00:00"},
+            {"id": "good", "description": "正常配置", "interval": "hourly",
+             "enabled": True, "created_at": "2026-08-01T00:00:01"},
+        ])
 
         async def run():
             svc.start()
@@ -1199,9 +1283,9 @@ class TestSchedulerStartupResilienceEndToEnd:
 
         svc = sched_mod.SchedulerService()
         # 模拟旧版本遗留的脏数据：time 畸形，但 hourly 不读 time 所以 job 建得起来
-        with open(svc._config_path, "w", encoding="utf-8") as f:
-            json.dump([{"id": "legacy", "description": "遗留脏配置", "interval": "hourly",
-                        "time": "9", "enabled": True}], f, ensure_ascii=False)
+        svc._save_configs([{"id": "legacy", "description": "遗留脏配置", "interval": "hourly",
+                            "time": "9", "enabled": True,
+                            "created_at": "2026-08-01T00:00:00"}])
 
         async def run():
             svc.start()

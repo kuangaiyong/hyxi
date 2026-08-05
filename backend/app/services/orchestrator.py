@@ -31,89 +31,37 @@ class TaskOrchestrator:
         self._running_tasks: set = set()
         self._sentiment_running: set = set()
         self._task_queue: asyncio.Queue = asyncio.Queue()  # 任务等待队列
-        self._persist_path = os.path.join(settings.data_dir, "tasks.json")
-        self._db_ready = False
-        try:
-            init_db()
-            migrate_from_json()
-            self._db_ready = True
-        except Exception as e:
-            logger.warning("SQLite 不可用，回退到 JSON 存储: %s", str(e))
+        init_db()
+        migrate_from_json()
         self._load_tasks()
 
     # ===== 持久化 =====
 
     def _load_tasks(self):
-        """从磁盘加载历史任务，并清理异常终止的任务"""
-        # 优先使用 SQLite
-        if self._db_ready:
-            task_list = load_all_tasks()
-            for task_data in task_list:
-                tid = task_data["id"]
-                if task_data["status"] in ("pending", "parsing", "running"):
-                    task_data["status"] = TaskStatus.CANCELLED
-                    task_data["completed_at"] = datetime.now()
-                    task_data.setdefault("logs", []).append({
-                        "time": datetime.now().isoformat(),
-                        "level": "warning",
-                        "message": "服务重启，未完成的任务已自动取消。",
-                    })
-                self.tasks[tid] = task_data
-            if any(t["status"] == TaskStatus.CANCELLED for t in task_list):
-                self._persist()
-            return
-
-        # Fallback: JSON 文件
-        if os.path.exists(self._persist_path):
-            try:
-                with open(self._persist_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                for task_data in data.get("tasks", []):
-                    tid = task_data["id"]
-                    for field in ("created_at", "started_at", "completed_at"):
-                        if task_data.get(field):
-                            task_data[field] = datetime.fromisoformat(task_data[field])
-                    if task_data["status"] in ("pending", "parsing", "running"):
-                        task_data["status"] = TaskStatus.CANCELLED
-                        task_data["completed_at"] = datetime.now()
-                        task_data.setdefault("logs", []).append({
-                            "time": datetime.now().isoformat(),
-                            "level": "warning",
-                            "message": "服务重启，未完成的任务已自动取消。",
-                        })
-                    self.tasks[tid] = task_data
-                self._save_tasks()
-            except json.JSONDecodeError as e:
-                logger.error("tasks.json 格式损坏 (%s)，任务历史将丢失。备份文件: %s.bak",
-                             str(e), self._persist_path)
-                try:
-                    import shutil
-                    shutil.copy2(self._persist_path, self._persist_path + ".bak")
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.error("加载任务列表失败 (%s): %s", type(e).__name__, str(e))
+        """从 SQLite 加载历史任务，并清理异常终止的任务"""
+        task_list = load_all_tasks()
+        for task_data in task_list:
+            if task_data["status"] in ("pending", "parsing", "running"):
+                task_data["status"] = TaskStatus.CANCELLED
+                task_data["completed_at"] = datetime.now()
+                task_data.setdefault("logs", []).append({
+                    "time": datetime.now().isoformat(),
+                    "level": "warning",
+                    "message": "服务重启，未完成的任务已自动取消。",
+                })
+            self.tasks[task_data["id"]] = task_data
+        if any(t["status"] == TaskStatus.CANCELLED for t in task_list):
+            self._persist()
 
     def _save_tasks(self):
-        """保存所有任务到磁盘"""
-        if self._db_ready:
-            for t in self.tasks.values():
-                save_task(t)
-            return
+        """保存所有任务。
 
-        # Fallback: JSON 文件
-        os.makedirs(os.path.dirname(self._persist_path), exist_ok=True)
-        tmp_path = self._persist_path + ".tmp"
-        data = {"tasks": []}
+        注意这里**从不发 DELETE**：只对 self.tasks 里剩余的任务逐条 upsert。
+        任何「从 self.tasks 移除条目」的逻辑都必须自己显式调 db_delete_task()，
+        否则残留行会在下次启动被 _load_tasks() 读回来。
+        """
         for t in self.tasks.values():
-            item = dict(t)
-            for field in ("created_at", "started_at", "completed_at"):
-                if item.get(field) and isinstance(item[field], datetime):
-                    item[field] = item[field].isoformat()
-            data["tasks"].append(item)
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, self._persist_path)
+            save_task(t)
 
     def _persist(self):
         """保存（同步到磁盘）"""
@@ -487,9 +435,9 @@ class TaskOrchestrator:
         """删除任务记录"""
         if task_id in self.tasks:
             del self.tasks[task_id]
-            # _persist() 对 SQLite 只 upsert 剩余任务，不会删行，必须显式 DELETE
-            if self._db_ready:
-                db_delete_task(task_id)
+            # _persist() 只 upsert 剩余任务、从不删行，必须显式 DELETE，
+            # 否则删掉的任务会在下次启动被读回来（曾因此「复活」过）
+            db_delete_task(task_id)
             self._persist()
             return True
         return False

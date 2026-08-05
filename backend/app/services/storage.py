@@ -54,6 +54,22 @@ CREATE TABLE IF NOT EXISTS credentials (
     FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS app_config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS schedules (
+    id TEXT PRIMARY KEY,
+    description TEXT NOT NULL DEFAULT '',
+    interval TEXT NOT NULL,
+    time TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    history_json TEXT NOT NULL DEFAULT '[]'
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sentiment_created ON sentiment(created_at DESC);
@@ -82,8 +98,63 @@ def init_db():
         logger.error("数据库初始化失败: %s", str(e))
 
 
+MIGRATED_DIR_NAME = "_migrated_backup"
+
+
+def _retire(path: str) -> None:
+    """迁移成功的源文件移进备份目录，不直接删。
+
+    留一份让人能自己核对；确认无误后由用户清掉。
+    """
+    try:
+        backup_dir = os.path.join(settings.data_dir, MIGRATED_DIR_NAME)
+        os.makedirs(backup_dir, exist_ok=True)
+        os.replace(path, os.path.join(backup_dir, os.path.basename(path)))
+    except Exception as e:
+        logger.warning("归档已迁移文件失败 %s: %s", path, e)
+
+
+def _migrate_app_config() -> None:
+    """config.json → app_config 表。含明文 LLM API Key，迁完就不该再留在文件里"""
+    path = os.path.join(settings.data_dir, "config.json")
+    if not os.path.exists(path):
+        return
+    if get_app_config("llm"):
+        return  # 已迁过
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if cfg.get("api_key"):
+            set_app_config("llm", cfg)
+            logger.info("LLM 配置已迁入 app_config 表")
+        _retire(path)
+    except Exception as e:
+        logger.error("迁移 config.json 失败: %s", e)
+
+
+def _migrate_schedules() -> None:
+    """scheduled_tasks.json → schedules 表"""
+    path = os.path.join(settings.data_dir, "scheduled_tasks.json")
+    if not os.path.exists(path):
+        return
+    if load_schedules():
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            configs = json.load(f)
+        for cfg in configs:
+            save_schedule(cfg)
+        logger.info("已迁移 %d 条定时任务配置到 SQLite", len(configs))
+        _retire(path)
+    except Exception as e:
+        logger.error("迁移 scheduled_tasks.json 失败: %s", e)
+
+
 def migrate_from_json():
-    """从 JSON 文件迁移数据到 SQLite（如果 DB 为空且有 JSON 文件）"""
+    """从 JSON 文件迁移数据到 SQLite（幂等：已迁过就跳过）"""
+    _migrate_app_config()
+    _migrate_schedules()
+
     tasks_path = os.path.join(settings.data_dir, "tasks.json")
     if not os.path.exists(tasks_path):
         return
@@ -258,6 +329,102 @@ def get_sentiment(task_id: str) -> Optional[dict]:
         return None
     finally:
         conn.close()
+
+
+# ===== 应用配置（原 config.json）=====
+
+def get_app_config(prefix: str) -> dict:
+    """取出某个前缀下的全部配置项，返回的键已去掉前缀。查不到返回空 dict"""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT key, value FROM app_config WHERE key LIKE ?", (prefix + ".%",)
+        ).fetchall()
+        return {r["key"][len(prefix) + 1:]: r["value"] for r in rows}
+    finally:
+        conn.close()
+
+
+def set_app_config(prefix: str, values: dict) -> None:
+    """整组覆盖某个前缀下的配置。先删后插，避免残留上一版多出来的键"""
+    conn = _get_conn()
+    try:
+        now = datetime.now().isoformat()
+        conn.execute("DELETE FROM app_config WHERE key LIKE ?", (prefix + ".%",))
+        conn.executemany(
+            "INSERT INTO app_config (key, value, updated_at) VALUES (?,?,?)",
+            [(f"{prefix}.{k}", "" if v is None else str(v), now) for k, v in values.items()],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_app_config(prefix: str) -> None:
+    conn = _get_conn()
+    try:
+        conn.execute("DELETE FROM app_config WHERE key LIKE ?", (prefix + ".%",))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ===== 定时任务业务配置（原 scheduled_tasks.json）=====
+
+_SCHEDULE_COLS = ("id", "description", "interval", "time", "enabled", "created_at")
+
+
+def load_schedules() -> List[dict]:
+    conn = _get_conn()
+    try:
+        rows = conn.execute("SELECT * FROM schedules ORDER BY created_at").fetchall()
+        return [_row_to_schedule(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def save_schedule(cfg: dict) -> None:
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO schedules (id, description, interval, time, enabled, created_at, history_json)
+               VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(id) DO UPDATE SET
+                 description=excluded.description, interval=excluded.interval,
+                 time=excluded.time, enabled=excluded.enabled,
+                 history_json=excluded.history_json""",
+            (
+                cfg["id"], cfg.get("description", ""), cfg.get("interval", ""),
+                cfg.get("time", ""), 1 if cfg.get("enabled", True) else 0,
+                cfg.get("created_at") or datetime.now().isoformat(),
+                json.dumps(cfg.get("history", []), ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_schedule(schedule_id: str) -> bool:
+    conn = _get_conn()
+    try:
+        cur = conn.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def _row_to_schedule(row) -> dict:
+    return {
+        "id": row["id"],
+        "description": row["description"],
+        "interval": row["interval"],
+        "time": row["time"],
+        "enabled": bool(row["enabled"]),
+        "created_at": row["created_at"],
+        "history": json.loads(row["history_json"] or "[]"),
+    }
 
 
 # ===== Source / Credential CRUD =====

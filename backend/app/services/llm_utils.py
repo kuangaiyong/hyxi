@@ -1,25 +1,24 @@
 """LLM 工具函数 — 统一加载配置和创建 LLMService 实例"""
 
-import json
-import os
 import logging
 from typing import Optional
-from app.config import settings
+from app.services import storage
 from app.services.llm_service import LLMService
 from app.models import LLMConfig
 
 logger = logging.getLogger("hyxi.llm_utils")
 
+# app_config 表里的键前缀。配置项按 llm.api_key / llm.base_url / llm.model_name 分列存
+LLM_CONFIG_PREFIX = "llm"
+
 
 def load_llm_config() -> Optional[LLMConfig]:
-    """从 config.json 加载 LLM 配置"""
-    config_path = settings.config_file
-    if not os.path.exists(config_path):
-        logger.warning("LLM 配置文件不存在: %s", config_path)
+    """从 app_config 表加载 LLM 配置"""
+    cfg_data = storage.get_app_config(LLM_CONFIG_PREFIX)
+    if not cfg_data.get("api_key"):
+        logger.warning("LLM 配置尚未录入")
         return None
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg_data = json.load(f)
         return LLMConfig(**cfg_data)
     except Exception as e:
         logger.error("加载 LLM 配置失败: %s", str(e))

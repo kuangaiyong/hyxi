@@ -11,6 +11,28 @@ from io import BytesIO
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _use_temp_db(tmpdir):
+    """把 data_dir 和 DB_PATH 一起指到临时目录，返回 (storage 模块, 还原函数)。
+
+    **DB_PATH 是 import 时算好的常量**，只改 data_dir 会让用例写进真实的 hyxi.db。
+    帖子进库之后，凡是跑采集器的用例都要这一步 —— CollectorRunner 会查 posts 表
+    算增量锚点，再把结果写回去。
+    """
+    import app.config as cfg
+    import app.services.storage as storage_module
+
+    old_dir, old_db = cfg.settings.data_dir, storage_module.DB_PATH
+    cfg.settings.data_dir = tmpdir
+    storage_module.DB_PATH = os.path.join(tmpdir, "hyxi.db")
+    storage_module.init_db()
+
+    def restore():
+        cfg.settings.data_dir = old_dir
+        storage_module.DB_PATH = old_db
+
+    return storage_module, restore
+
+
 class TestTaskLifecycleEndToEnd:
     """任务生命周期：真实 JSON 文件持久化"""
 
@@ -859,7 +881,100 @@ class TestJsonToSqliteMigrationEndToEnd:
         assert self.storage.legacy_sentiment_task_ids() == ["t"], "原始数据必须留着"
 
 
-class TestSentimentAbsoluteIndexEndToEnd:
+class TestPostsStorageEndToEnd:
+    """posts 表：seq 是全链路的顺序锚点，upsert 不能碰已处理标记"""
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.storage, self._restore = _use_temp_db(self.tmpdir)
+
+    def teardown_method(self):
+        self._restore()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    @staticmethod
+    def _p(fp, **over):
+        post = {"fingerprint": fp, "source": "src_x", "username": f"u{fp}",
+                "timestamp": "02-06-2026 09:00", "content": f"内容{fp}", "page_number": 1}
+        post.update(over)
+        return post
+
+    def test_seq_is_stable_across_incremental_rounds(self):
+        """已有帖子的 seq 一个都不能变，新帖只能追加在后面。
+
+        整条链有 8 处依赖「顺序即存储顺序」，seq 一洗牌，全部历史舆情结论就错位。
+        """
+        self.storage.upsert_posts("src_x", [self._p("a"), self._p("b"), self._p("c")])
+        first = [p["fingerprint"] for p in self.storage.load_posts(["src_x"])]
+
+        # 第二轮：老帖子重新出现（信息流每批都会重扫）+ 两条新帖
+        self.storage.upsert_posts("src_x", [
+            self._p("b"), self._p("a"), self._p("d"), self._p("c"), self._p("e"),
+        ])
+        after = [p["fingerprint"] for p in self.storage.load_posts(["src_x"])]
+
+        assert first == ["a", "b", "c"]
+        assert after == ["a", "b", "c", "d", "e"], "已有帖子的顺序被重排了"
+
+    def test_upsert_never_clobbers_translation_or_flags(self):
+        """重扫到的老帖子只更新采集字段。覆盖 translation 等于让它重新付费翻译一遍"""
+        self.storage.upsert_posts("src_x", [self._p("a")])
+        self.storage.save_translations([
+            {"source": "src_x", "fingerprint": "a", "translation": "译文",
+             "_processed": {"translated": True}},
+        ])
+        self.storage.mark_sentiment_analyzed([
+            {"source": "src_x", "fingerprint": "a",
+             "_processed": {"sentiment_at": "2026-08-05T10:00:00"}},
+        ])
+
+        # 下一轮重扫：脚本给的是刚提取的原始帖子，没有 translation 也没有标记
+        self.storage.upsert_posts("src_x", [self._p("a", content="正文被编辑过了")])
+
+        got = self.storage.load_posts(["src_x"])[0]
+        assert got["translation"] == "译文", "译文被重扫抹掉了"
+        assert got["_processed"]["translated"] is True
+        assert got["_processed"]["sentiment_at"] == "2026-08-05T10:00:00"
+        assert got["content"] == "正文被编辑过了", "采集字段没更新"
+
+    def test_added_count_reflects_only_new_posts(self):
+        assert self.storage.upsert_posts("src_x", [self._p("a"), self._p("b")]) == 2
+        assert self.storage.upsert_posts("src_x", [self._p("a"), self._p("c")]) == 1
+
+    def test_sources_are_isolated_from_each_other(self):
+        """指纹不含来源，两个平台的同名空帖不能互相覆盖"""
+        self.storage.upsert_posts("src_a", [{"fingerprint": "same", "source": "src_a",
+                                             "content": "A 平台"}])
+        self.storage.upsert_posts("src_b", [{"fingerprint": "same", "source": "src_b",
+                                             "content": "B 平台"}])
+        assert self.storage.load_posts(["src_a"])[0]["content"] == "A 平台"
+        assert self.storage.load_posts(["src_b"])[0]["content"] == "B 平台"
+        # 跨来源拼接的顺序由调用方给定，与 seq 无关
+        both = self.storage.load_posts(["src_b", "src_a"])
+        assert [p["content"] for p in both] == ["B 平台", "A 平台"]
+
+    def test_incremental_anchors_come_from_the_table(self):
+        self.storage.upsert_posts("src_x", [
+            self._p("a", page_number=1), self._p("b", page_number=7),
+        ])
+        assert sorted(self.storage.known_fingerprints("src_x")) == ["a", "b"]
+        assert self.storage.max_page_number("src_x") == 7
+        assert self.storage.max_page_number("src_none") == 0
+
+    def test_migration_preserves_array_order_as_seq(self):
+        """迁移把数组下标变成 seq，读回来必须与原 JSON 逐条同序"""
+        posts = [self._p(f"fp{i}") for i in range(6)]
+        path = os.path.join(self.tmpdir, "legacy.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"total_pages": 1, "posts": posts}, f, ensure_ascii=False)
+
+        assert self.storage.migrate_posts_file("src_x", path) == 6
+        assert [p["fingerprint"] for p in self.storage.load_posts(["src_x"])] \
+            == [p["fingerprint"] for p in posts]
+
+        # 幂等：重跑不能把 seq 洗牌，也不能重复插入
+        assert self.storage.migrate_posts_file("src_x", path) == 0
+        assert self.storage.count_posts("src_x") == 6
     """舆情结果数组的下标必须是全量帖子数组里的绝对位置。
 
     页面和导出都按下标反查帖子。存成「待分析批次内的下标」不会报任何错，
@@ -1368,39 +1483,51 @@ class TestSchedulerStartupResilienceEndToEnd:
 
 
 class TestProcessedFlagSyncEndToEnd:
-    """舆情分析写回 _processed：必须合并，不能覆盖掉 translated 标记"""
+    """舆情分析写回 sentiment_at：只能动这一个字段，不能碰 translation"""
 
     def setup_method(self):
         self.tmpdir = tempfile.mkdtemp()
-        self.json_path = os.path.join(self.tmpdir, "tweakers_thread_123.json")
-        with open(self.json_path, "w", encoding="utf-8") as f:
-            json.dump({"posts": [
-                {"fingerprint": "aaa", "content": "c1", "translation": "t1",
-                 "_processed": {"translated": True}},
-                {"fingerprint": "bbb", "content": "c2", "translation": "t2",
-                 "_processed": {"translated": True}},
-            ]}, f, ensure_ascii=False)
+        self.storage, self._restore = _use_temp_db(self.tmpdir)
+        self.storage.upsert_posts("src_x", [
+            {"fingerprint": "aaa", "source": "src_x", "content": "c1", "translation": "t1",
+             "_processed": {"translated": True}},
+            {"fingerprint": "bbb", "source": "src_x", "content": "c2", "translation": "t2",
+             "_processed": {"translated": True}},
+        ])
 
     def teardown_method(self):
+        self._restore()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_sentiment_flag_does_not_wipe_translated(self):
-        from app.services.sentiment_service import _sync_processed_flags
+        analyzed = [{"fingerprint": "aaa", "source": "src_x",
+                     "_processed": {"sentiment_at": "2026-07-30T12:00:00"}}]
+        assert self.storage.mark_sentiment_analyzed(analyzed) == 1
 
-        analyzed = [{"fingerprint": "aaa", "_processed": {"sentiment_at": "2026-07-30T12:00:00"}}]
-        assert _sync_processed_flags(self.json_path, analyzed) == 1
-
-        with open(self.json_path, encoding="utf-8") as f:
-            posts = json.load(f)["posts"]
+        posts = self.storage.load_posts(["src_x"])
         assert posts[0]["_processed"]["translated"] is True, "translated 标记被舆情写回抹掉了"
         assert posts[0]["_processed"]["sentiment_at"] == "2026-07-30T12:00:00"
+        assert posts[0]["translation"] == "t1", "译文被抹掉了"
         assert posts[1]["_processed"] == {"translated": True}
 
-    def test_no_match_leaves_file_untouched(self):
-        from app.services.sentiment_service import _sync_processed_flags
-        before = open(self.json_path, encoding="utf-8").read()
-        assert _sync_processed_flags(self.json_path, [{"fingerprint": "zzz", "_processed": {}}]) == 0
-        assert open(self.json_path, encoding="utf-8").read() == before
+    def test_no_match_leaves_rows_untouched(self):
+        before = self.storage.load_posts(["src_x"])
+        assert self.storage.mark_sentiment_analyzed(
+            [{"fingerprint": "zzz", "source": "src_x",
+              "_processed": {"sentiment_at": "2026-07-30T12:00:00"}}]
+        ) == 0
+        assert self.storage.load_posts(["src_x"]) == before
+
+    def test_already_analyzed_post_keeps_its_first_timestamp(self):
+        """重复分析不该把首次分析时间冲掉 —— 增量靠它判断谁已经算过"""
+        first = [{"fingerprint": "aaa", "source": "src_x",
+                  "_processed": {"sentiment_at": "2026-07-30T12:00:00"}}]
+        again = [{"fingerprint": "aaa", "source": "src_x",
+                  "_processed": {"sentiment_at": "2026-08-05T09:00:00"}}]
+        assert self.storage.mark_sentiment_analyzed(first) == 1
+        assert self.storage.mark_sentiment_analyzed(again) == 0
+        assert self.storage.load_posts(["src_x"])[0]["_processed"]["sentiment_at"] \
+            == "2026-07-30T12:00:00"
 
 
 class TestExcelRobustnessEndToEnd:
@@ -1706,16 +1833,15 @@ class TestScraperStallTimeoutEndToEnd:
         import app.services.collector_runner as runner_mod
         self.mod = runner_mod
         self._old_root = runner_mod.settings.project_root
-        self._old_data = runner_mod.settings.data_dir
         self._old_timeout = runner_mod.SUBPROCESS_TIMEOUT
         runner_mod.settings.project_root = self.tmpdir
-        runner_mod.settings.data_dir = self.tmpdir
         runner_mod.SUBPROCESS_TIMEOUT = 3
+        self.storage, self._restore_db = _use_temp_db(self.tmpdir)
 
     def teardown_method(self):
         self.mod.settings.project_root = self._old_root
-        self.mod.settings.data_dir = self._old_data
         self.mod.SUBPROCESS_TIMEOUT = self._old_timeout
+        self._restore_db()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_stalled_stdout_times_out_and_kills_whole_tree(self):
@@ -1814,10 +1940,17 @@ fs.writeFileSync(
 
 PARTIAL_SCRIPT = _READ_JOB + """
 console.log(JSON.stringify({ evt: 'progress', current: 1, total: 9, msg: '第 1/9 页' }));
+// 退出码 2 的契约是「部分完成，数据已落盘」——脚本在退出前必定先把本轮抓到的写出来
 fs.writeFileSync(
   job.output_path,
-  JSON.stringify({ thread_id: 123, total_pages: 9, total_posts: 1, complete: false,
-                   stop_reason: '目标站拒绝访问 (HTTP 429)，已主动停止抓取', posts: [] }),
+  JSON.stringify({ thread_id: 123, total_pages: 9, total_posts: 2, complete: false,
+                   stop_reason: '目标站拒绝访问 (HTTP 429)，已主动停止抓取',
+                   posts: [
+                     { fingerprint: 'p1', username: 'u1', timestamp: '01-07-2026 10:00',
+                       content: '限流前抓到的第一条', page_number: 1 },
+                     { fingerprint: 'p2', username: 'u2', timestamp: '01-07-2026 10:05',
+                       content: '限流前抓到的第二条', page_number: 2 },
+                   ] }),
   'utf-8'
 );
 console.error('目标站拒绝访问 (HTTP 429)，已主动停止抓取');
@@ -1836,13 +1969,13 @@ class _ScraperTmpRoot:
         import app.services.collector_runner as runner_mod
         self.mod = runner_mod
         self._old_root = runner_mod.settings.project_root
-        self._old_data = runner_mod.settings.data_dir
         runner_mod.settings.project_root = self.tmpdir
-        runner_mod.settings.data_dir = self.tmpdir
+        # 帖子进库之后 CollectorRunner 会查 posts 表算增量锚点、再把结果写回去
+        self.storage, self._restore_db = _use_temp_db(self.tmpdir)
 
     def teardown_method(self):
         self.mod.settings.project_root = self._old_root
-        self.mod.settings.data_dir = self._old_data
+        self._restore_db()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _execute(self, params=None):
@@ -1907,6 +2040,28 @@ class TestScraperPartialExitEndToEnd(_ScraperTmpRoot):
             message = ""
         assert "code=2" in message, f"退出码 2 没有让抓取步骤失败: {message!r}"
         assert "拒绝访问" in message, f"中断原因没带到用户面前: {message!r}"
+
+    def test_partial_results_are_persisted_so_retry_can_resume(self):
+        """退出码 2 的契约是「部分完成，**数据已落盘**，可增量续抓」。
+
+        抓到一半撞上限流时，脚本已经把本轮的写进交接文件了。要是先判退出码再入库，
+        这批数据会连同临时文件一起被删掉，/retry 只能从第 1 页重抓一遍 ——
+        160 页的长帖抓到第 100 页限流，那 100 页就白抓了。
+        """
+        if not _HAS_NODE:
+            import pytest
+            pytest.skip("未安装 node")
+        try:
+            self._execute()
+        except Exception:
+            pass
+
+        posts = self.storage.load_posts(["tweakers"])
+        assert [p["fingerprint"] for p in posts] == ["p1", "p2"], \
+            "退出码 2 抓到的帖子没入库，重试只能从头再抓"
+        # 续抓锚点也要跟着建立起来，否则下一轮仍从第 1 页开始
+        assert self.storage.max_page_number("tweakers") == 2
+        assert sorted(self.storage.known_fingerprints("tweakers")) == ["p1", "p2"]
 
 
 class TestStartPageReachesCollectorJobEndToEnd(_ScraperTmpRoot):
@@ -1981,17 +2136,12 @@ class TestTweakersCollectorGoldenEndToEnd:
     """
 
     def setup_method(self):
-        from app.config import settings
         self.tmpdir = tempfile.mkdtemp()
-        self.output = os.path.join(
-            settings.project_root, f"tweakers_thread_{FIXTURE_THREAD_ID}.json"
-        )
-        if os.path.exists(self.output):
-            os.remove(self.output)
+        # 帖子进库之后脚本的产出是个用完即删的交接文件，不再落项目根目录
+        self.storage, self._restore_db = _use_temp_db(self.tmpdir)
 
     def teardown_method(self):
-        if os.path.exists(self.output):
-            os.remove(self.output)
+        self._restore_db()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_extraction_matches_golden_baseline(self):
@@ -2054,9 +2204,10 @@ class TestGroupFeedCollectorEndToEnd:
 
     def setup_method(self):
         self.tmpdir = tempfile.mkdtemp()
-        self.output = os.path.join(self.tmpdir, "group_feed_out.json")
+        self.storage, self._restore_db = _use_temp_db(self.tmpdir)
 
     def teardown_method(self):
+        self._restore_db()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _run(self, incremental: bool):
@@ -2069,9 +2220,6 @@ class TestGroupFeedCollectorEndToEnd:
         from fixture_site import FixtureSite
 
         collector = get_collector("group_feed")
-        # 输出改到临时目录，不污染项目根
-        collector = type(collector)()
-        collector.output_path = lambda source: self.output
 
         with FixtureSite() as base_url:
             source = {
@@ -2129,29 +2277,49 @@ class TestGroupFeedCollectorEndToEnd:
         assert posts[0]["timestamp"] == "02-06-2026 09:14"
 
     def test_incremental_rerun_keeps_translations(self):
-        """增量重跑绝不能整体覆盖旧文件。
+        """增量重跑绝不能覆盖已翻译的帖子。
 
-        落盘文件同时承载 translation 和 _processed 标记，覆盖等于把已翻译的帖子
+        posts 表同时承载 translation 和 _processed 标记，整体覆盖等于把已翻译的帖子
         重新变成新帖 —— 下一轮再付一次翻译钱，舆情也重算一遍。
         """
         self._skip_unless_ready()
-        self._run(incremental=False)
+        first = self._run(incremental=False)
+        first_fp = first["posts"][0]["fingerprint"]
+        seq_before = [p["fingerprint"] for p in self.storage.load_posts(["fixture_group"])]
 
-        # 模拟翻译步骤写回：给第一条挂上译文和已处理标记
-        with open(self.output, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        first_fp = data["posts"][0]["fingerprint"]
-        data["posts"][0]["translation"] = "我已经用了三个月"
-        data["posts"][0]["_processed"] = {"translated": True}
-        with open(self.output, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
+        # 模拟翻译步骤写回
+        self.storage.save_translations([{
+            "source": "fixture_group", "fingerprint": first_fp,
+            "translation": "我已经用了三个月", "_processed": {"translated": True},
+        }])
+        # 再模拟舆情写回，验证两个标记互不干扰
+        self.storage.mark_sentiment_analyzed([{
+            "source": "fixture_group", "fingerprint": first_fp,
+            "_processed": {"sentiment_at": "2026-08-05T10:00:00"},
+        }])
 
         again = self._run(incremental=True)
 
         assert len(again["posts"]) == 8, "增量重跑后帖子数变了，说明历史数据被覆盖"
         kept = next(p for p in again["posts"] if p["fingerprint"] == first_fp)
         assert kept["translation"] == "我已经用了三个月", "译文被增量重跑抹掉了"
-        assert kept["_processed"]["translated"] is True, "_processed 标记被抹掉了"
+        assert kept["_processed"]["translated"] is True, "translated 标记被抹掉了"
+        assert kept["_processed"]["sentiment_at"] == "2026-08-05T10:00:00", "sentiment_at 被抹掉了"
+
+        # seq 是全链路的顺序锚点：它一洗牌，所有历史舆情结论就会错位到别的帖子上
+        seq_after = [p["fingerprint"] for p in self.storage.load_posts(["fixture_group"])]
+        assert seq_after == seq_before, "增量重跑把已有帖子的 seq 顺序打乱了"
+
+    def test_handoff_file_is_deleted_after_ingest(self):
+        """脚本的产出是用完即删的交接文件，不该在磁盘上留下第二份帖子数据"""
+        self._skip_unless_ready()
+        self._run(incremental=False)
+
+        leftovers = []
+        for root, _dirs, files in os.walk(self.tmpdir):
+            leftovers += [f for f in files if f.endswith(".json") and "_out" in f]
+        assert leftovers == [], f"交接文件没删干净: {leftovers}"
+        assert self.storage.count_posts("fixture_group") == 8
 
 
 class TestFacebookLoginEndToEnd:
@@ -2166,11 +2334,12 @@ class TestFacebookLoginEndToEnd:
 
     def setup_method(self):
         self.tmpdir = tempfile.mkdtemp()
-        self.output = os.path.join(self.tmpdir, "fb_out.json")
         self.state = os.path.join(self.tmpdir, "session.json")
         self.media = os.path.join(self.tmpdir, "media")
+        self.storage, self._restore_db = _use_temp_db(self.tmpdir)
 
     def teardown_method(self):
+        self._restore_db()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _skip_unless_ready(self):
@@ -2184,6 +2353,9 @@ class TestFacebookLoginEndToEnd:
         ):
             pytest.skip("项目根目录未安装 playwright")
 
+    def _posts(self):
+        return self.storage.load_posts(["fixture_fb"])
+
     def _run(self, base_url, username, password, incremental=False):
         import asyncio
         from app.collectors import get_collector
@@ -2191,7 +2363,6 @@ class TestFacebookLoginEndToEnd:
         from app.services.progress_manager import ProgressManager
 
         collector = type(get_collector("facebook_group"))()
-        collector.output_path = lambda source: self.output
         # 凭据只走子进程环境变量，绝不进 argv 和 job 文件
         os.environ["HYXI_CRED_USERNAME"] = username
         os.environ["HYXI_CRED_PASSWORD"] = password
@@ -2406,7 +2577,7 @@ class TestFacebookLoginEndToEnd:
         message = str(e.value)
         assert "FB fixture" in message
         assert "人工登录" in message, f"没告诉用户去哪操作: {message}"
-        assert not os.path.exists(self.output), "没登进去却写出了结果文件"
+        assert self.storage.count_posts("fixture_fb") == 0, "没登进去却写入了帖子"
 
     def test_bad_credentials_raise_manual_auth(self):
         self._skip_unless_ready()
@@ -2427,7 +2598,6 @@ class TestFacebookLoginEndToEnd:
         from app.services.progress_manager import ProgressManager
 
         collector = type(get_collector("facebook_group"))()
-        collector.output_path = lambda source: self.output
         source = {
             "id": "fixture_fb",
             "collector_id": "facebook_group",
@@ -2458,12 +2628,16 @@ class TestFacebookLoginEndToEnd:
         with site.LoginSite() as base_url:
             self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
             assert os.path.exists(self.state)
-            os.remove(self.output)
+            # 清掉上一次采集的帖子，好断言 login_only 自己一条都不产出
+            conn = self.storage._get_conn()
+            conn.execute("DELETE FROM posts WHERE source_id = 'fixture_fb'")
+            conn.commit()
+            conn.close()
             result = self._run_login_only(base_url, timeout_ms=30000)
 
         assert result == {"mode": "login_only", "authorized": True}
         assert os.path.exists(self.state), "授权成功却没落会话"
-        assert not os.path.exists(self.output), "人工授权模式不该产出帖子数据"
+        assert self.storage.count_posts("fixture_fb") == 0, "人工授权模式不该产出帖子数据"
 
     def test_manual_auth_times_out_with_actionable_message(self):
         """没人去点时必须超时收场，不能永久挂住一个有头浏览器"""
@@ -2508,7 +2682,7 @@ class TestFacebookLoginEndToEnd:
             "id": "fixture_fb", "collector_id": "facebook_group",
             "params": {"group_id": self.GROUP_ID},
         }
-        job = collector.build_job(source, self.output)
+        job = collector.build_job(source, os.path.join(self.tmpdir, "handoff.json"))
         assert "HYXI_CRED_PASSWORD" not in json.dumps(job)
         assert "password" not in json.dumps(job).lower()
         # 命令行只有脚本路径和 --job=
@@ -2526,20 +2700,12 @@ class TestSessionStateReflectsReality:
     GROUP_ID = "2407063016436085"
 
     def setup_method(self):
-        import app.services.storage as storage_module
-
         self.tmpdir = tempfile.mkdtemp()
-        self.output = os.path.join(self.tmpdir, "fb_out.json")
         self.state = os.path.join(self.tmpdir, "session.json")
-        # DB_PATH 是 import 时算好的常量，不重定向就会写进真实的 backend/data/hyxi.db
-        self._orig_db = storage_module.DB_PATH
-        storage_module.DB_PATH = os.path.join(self.tmpdir, "hyxi.db")
-        storage_module.init_db()
+        self.storage, self._restore_db = _use_temp_db(self.tmpdir)
 
     def teardown_method(self):
-        import app.services.storage as storage_module
-
-        storage_module.DB_PATH = self._orig_db
+        self._restore_db()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _skip_unless_ready(self):
@@ -2560,7 +2726,6 @@ class TestSessionStateReflectsReality:
         from app.services.progress_manager import ProgressManager
 
         collector = type(get_collector("facebook_group"))()
-        collector.output_path = lambda s: self.output
         job_source = dict(source)
         job_source["params"] = {
             **source["params"],
@@ -2622,7 +2787,6 @@ class TestSessionStateReflectsReality:
         from app.services.progress_manager import ProgressManager
 
         collector = type(get_collector("facebook_group"))()
-        collector.output_path = lambda s: self.output
         job_source = dict(source)
         job_source["params"] = {**source["params"], "base_url": base_url}
         job_source["state_file"] = self.state

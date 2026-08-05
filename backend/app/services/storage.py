@@ -91,8 +91,31 @@ CREATE TABLE IF NOT EXISTS schedules (
     history_json TEXT NOT NULL DEFAULT '[]'
 );
 
+-- 帖子。**故意不挂 sources 外键**：删数据源不能让历史任务结果变空白，
+-- 而 ON DELETE CASCADE 正好会干这件事。这与改造前「删源后落盘 JSON 仍在」一致
+CREATE TABLE IF NOT EXISTS posts (
+    source_id          TEXT NOT NULL,
+    fingerprint        TEXT NOT NULL,
+    -- 采集顺序。整条处理链有 8 处依赖「扁平数组的下标即顺序」，入库后没有数组了，
+    -- 由它完整承担：按 source 单调递增、已有帖子的 seq 永不变、新帖追加在后
+    seq                INTEGER NOT NULL,
+    username           TEXT NOT NULL DEFAULT '',
+    timestamp          TEXT NOT NULL DEFAULT '',
+    content            TEXT NOT NULL DEFAULT '',
+    translation        TEXT NOT NULL DEFAULT '',
+    page_number        INTEGER NOT NULL DEFAULT 1,
+    message_id         TEXT NOT NULL DEFAULT '',
+    parent_fingerprint TEXT,
+    reply_level        INTEGER NOT NULL DEFAULT 0,
+    images_json        TEXT NOT NULL DEFAULT '[]',
+    translated         INTEGER NOT NULL DEFAULT 0,
+    sentiment_at       TEXT,
+    PRIMARY KEY (source_id, fingerprint)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_posts_source_seq ON posts(source_id, seq);
 """
 
 
@@ -121,7 +144,7 @@ def init_db():
 MIGRATED_DIR_NAME = "_migrated_backup"
 
 
-def _retire(path: str) -> None:
+def retire_file(path: str) -> None:
     """迁移成功的源文件移进备份目录，不直接删。
 
     留一份让人能自己核对；确认无误后由用户清掉。
@@ -147,7 +170,7 @@ def _migrate_app_config() -> None:
         if cfg.get("api_key"):
             set_app_config("llm", cfg)
             logger.info("LLM 配置已迁入 app_config 表")
-        _retire(path)
+        retire_file(path)
     except Exception as e:
         logger.error("迁移 config.json 失败: %s", e)
 
@@ -165,9 +188,26 @@ def _migrate_schedules() -> None:
         for cfg in configs:
             save_schedule(cfg)
         logger.info("已迁移 %d 条定时任务配置到 SQLite", len(configs))
-        _retire(path)
+        retire_file(path)
     except Exception as e:
         logger.error("迁移 scheduled_tasks.json 失败: %s", e)
+
+
+def migrate_posts_file(source_id: str, path: str) -> int:
+    """把一个来源的落盘 JSON 搬进 posts 表，seq 取数组下标。
+
+    幂等：该来源已有帖子就跳过 —— 重跑不能把 seq 洗牌，那会让所有历史结论错位。
+    """
+    if not os.path.exists(path) or count_posts(source_id) > 0:
+        return 0
+    with open(path, "r", encoding="utf-8") as f:
+        loaded = json.load(f)
+    posts = loaded.get("posts") or []
+    for p in posts:
+        p.setdefault("source", source_id)
+    added = upsert_posts(source_id, posts)
+    logger.info("来源 %s 的 %d 条帖子已迁入 posts 表", source_id, added)
+    return added
 
 
 def migrate_from_json():
@@ -504,6 +544,215 @@ def drop_legacy_sentiment_table() -> None:
         logger.info("旧 sentiment 表已删除")
     except Exception as e:
         logger.warning("删除旧 sentiment 表失败: %s", e)
+    finally:
+        conn.close()
+
+
+# ===== 帖子（原「项目根目录 {collector}_{id}.json」）=====
+
+_POST_COLS = (
+    "username", "timestamp", "content", "translation", "page_number",
+    "message_id", "parent_fingerprint", "reply_level",
+)
+
+
+def _row_to_post(row) -> dict:
+    post = {
+        "source": row["source_id"],
+        "fingerprint": row["fingerprint"],
+        "username": row["username"],
+        "timestamp": row["timestamp"],
+        "content": row["content"],
+        "translation": row["translation"],
+        "page_number": row["page_number"],
+        "message_id": row["message_id"],
+        "parent_fingerprint": row["parent_fingerprint"],
+        "reply_level": row["reply_level"],
+    }
+    images = json.loads(row["images_json"] or "[]")
+    if images:
+        post["images"] = images
+    # 只放已置位的键：新采到的帖子本来就没有 _processed，凭空补一个空壳会让
+    # 「这条处理过没有」多出一种表示形态
+    processed = {}
+    if row["translated"]:
+        processed["translated"] = True
+    if row["sentiment_at"]:
+        processed["sentiment_at"] = row["sentiment_at"]
+    if processed:
+        post["_processed"] = processed
+    return post
+
+
+def load_posts(source_ids: List[str]) -> List[dict]:
+    """按 source_ids 给定的顺序取帖子，每个来源内部按 seq。
+
+    顺序即「舆情下标 / /posts 的 index 语义」依赖的那个顺序，不能改成按别的排。
+    """
+    if not source_ids:
+        return []
+    conn = _get_conn()
+    try:
+        posts = []
+        for sid in source_ids:
+            rows = conn.execute(
+                "SELECT * FROM posts WHERE source_id = ? ORDER BY seq", (sid,)
+            ).fetchall()
+            posts.extend(_row_to_post(r) for r in rows)
+        return posts
+    finally:
+        conn.close()
+
+
+def count_posts(source_id: str) -> int:
+    conn = _get_conn()
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM posts WHERE source_id = ?", (source_id,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def known_fingerprints(source_id: str) -> List[str]:
+    """交给采集脚本做增量去重。以前脚本自己读旧落盘文件，现在由 job 下发"""
+    conn = _get_conn()
+    try:
+        return [r[0] for r in conn.execute(
+            "SELECT fingerprint FROM posts WHERE source_id = ?", (source_id,)
+        )]
+    finally:
+        conn.close()
+
+
+def max_page_number(source_id: str) -> int:
+    """page 型增量（Tweakers）的续抓点。信息流类来源没有页的含义，用不到"""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT MAX(page_number) FROM posts WHERE source_id = ?", (source_id,)
+        ).fetchone()
+        return row[0] or 0
+    finally:
+        conn.close()
+
+
+def upsert_posts(source_id: str, posts: List[dict]) -> int:
+    """写入采集结果，返回新增条数。
+
+    **已存在的帖子只更新采集字段，绝不覆盖 translation / translated / sentiment_at**。
+    整体覆盖等于把已翻译的帖子重新变成新帖，下一轮再付一次翻译钱、舆情也重算一遍
+    （group_feed.js 曾经就是这么错的）。
+    """
+    if not posts:
+        return 0
+    conn = _get_conn()
+    try:
+        existing = {
+            r["fingerprint"]: r["seq"] for r in conn.execute(
+                "SELECT fingerprint, seq FROM posts WHERE source_id = ?", (source_id,)
+            )
+        }
+        next_seq = (conn.execute(
+            "SELECT MAX(seq) FROM posts WHERE source_id = ?", (source_id,)
+        ).fetchone()[0] or -1) + 1
+
+        added = 0
+        for post in posts:
+            fp = post.get("fingerprint")
+            if not fp:
+                continue
+            if fp in existing:
+                # seq 保持不变 —— 它是全链路的顺序锚点，动一下所有历史结论就错位了
+                conn.execute(
+                    """UPDATE posts SET username=?, timestamp=?, content=?, page_number=?,
+                       message_id=?, parent_fingerprint=?, reply_level=?, images_json=?
+                       WHERE source_id=? AND fingerprint=?""",
+                    (
+                        post.get("username", ""), post.get("timestamp", ""),
+                        post.get("content", ""), int(post.get("page_number", 1) or 1),
+                        post.get("message_id", ""), post.get("parent_fingerprint"),
+                        int(post.get("reply_level", 0) or 0),
+                        json.dumps(post.get("images") or [], ensure_ascii=False),
+                        source_id, fp,
+                    ),
+                )
+                continue
+            processed = post.get("_processed") or {}
+            conn.execute(
+                """INSERT INTO posts (source_id, fingerprint, seq, username, timestamp,
+                   content, translation, page_number, message_id, parent_fingerprint,
+                   reply_level, images_json, translated, sentiment_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    source_id, fp, next_seq, post.get("username", ""),
+                    post.get("timestamp", ""), post.get("content", ""),
+                    post.get("translation", ""), int(post.get("page_number", 1) or 1),
+                    post.get("message_id", ""), post.get("parent_fingerprint"),
+                    int(post.get("reply_level", 0) or 0),
+                    json.dumps(post.get("images") or [], ensure_ascii=False),
+                    1 if processed.get("translated") else 0,
+                    processed.get("sentiment_at"),
+                ),
+            )
+            existing[fp] = next_seq
+            next_seq += 1
+            added += 1
+        conn.commit()
+        return added
+    except Exception:
+        logger.exception("写入帖子失败 source=%s", source_id)
+        raise
+    finally:
+        conn.close()
+
+
+def save_translations(posts: List[dict]) -> int:
+    """把翻译结果写回。按 (source, fingerprint) 定位，与顺序无关"""
+    conn = _get_conn()
+    try:
+        updated = 0
+        for post in posts:
+            fp = post.get("fingerprint")
+            if not fp:
+                continue
+            processed = post.get("_processed") or {}
+            cur = conn.execute(
+                "UPDATE posts SET translation=?, translated=? WHERE source_id=? AND fingerprint=?",
+                (
+                    post.get("translation", ""),
+                    1 if processed.get("translated") else 0,
+                    post.get("source") or "tweakers", fp,
+                ),
+            )
+            updated += cur.rowcount
+        conn.commit()
+        return updated
+    finally:
+        conn.close()
+
+
+def mark_sentiment_analyzed(posts: List[dict]) -> int:
+    """把 _processed.sentiment_at 落库。
+
+    只写这一个字段：舆情分析不该碰 translation / translated，
+    整体覆盖会让几百条已翻译的帖子下次重新走一遍付费翻译。
+    """
+    conn = _get_conn()
+    try:
+        updated = 0
+        for post in posts:
+            at = (post.get("_processed") or {}).get("sentiment_at")
+            fp = post.get("fingerprint")
+            if not (at and fp):
+                continue
+            cur = conn.execute(
+                "UPDATE posts SET sentiment_at=? WHERE source_id=? AND fingerprint=? AND sentiment_at IS NULL",
+                (at, post.get("source") or "tweakers", fp),
+            )
+            updated += cur.rowcount
+        conn.commit()
+        return updated
     finally:
         conn.close()
 

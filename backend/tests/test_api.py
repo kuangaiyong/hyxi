@@ -542,9 +542,7 @@ class TestNestedPostsApiEndToEnd:
         storage.init_db()
         cls.client = TestClient(app)
 
-        # 两个来源各自落一份真实结构的数据文件：论坛（无评论）+ 小组（主贴带评论）
-        cls.forum_path = os.path.join(cls.tmpdir, "forum.json")
-        cls.group_path = os.path.join(cls.tmpdir, "group.json")
+        # 两个来源各自一批真实结构的数据：论坛（无评论）+ 小组（主贴带评论）
         forum = [
             {"username": f"用户{i}", "timestamp": "22-05-2026 17:0{}".format(i),
              "content": f"论坛帖子{i}", "translation": "", "page_number": 1,
@@ -568,11 +566,10 @@ class TestNestedPostsApiEndToEnd:
                     "fingerprint": f"g{i}c{j}", "source": "src_group",
                     "parent_fingerprint": root_fp, "reply_level": 1,
                 })
-        for path, posts in ((cls.forum_path, forum), (cls.group_path, group)):
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump({"total_pages": 1, "posts": posts}, f, ensure_ascii=False)
+        storage.upsert_posts("src_forum", forum)
+        storage.upsert_posts("src_group", group)
 
-        # 任务里记下来源与落盘路径，之后删掉数据源也还能读回来
+        # 任务里记下来源 id，之后即使把数据源删掉也还能按 id 读回来
         cls.task_id = "nested-e2e"
         from app.services.orchestrator import orchestrator
         orchestrator.tasks[cls.task_id] = {
@@ -582,9 +579,9 @@ class TestNestedPostsApiEndToEnd:
                 "total_posts": len(forum) + len(group),
                 "sources": [
                     {"id": "src_forum", "name": "论坛来源", "collector_id": "tweakers",
-                     "output_path": cls.forum_path, "post_count": len(forum)},
+                     "post_count": len(forum)},
                     {"id": "src_group", "name": "小组来源", "collector_id": "group_feed",
-                     "output_path": cls.group_path, "post_count": len(group)},
+                     "post_count": len(group)},
                 ],
             },
         }
@@ -702,9 +699,7 @@ class TestExportEndpointEndToEnd:
              "translation": "译A2", "page_number": 1, "fingerprint": "a2",
              "source": "src_x", "parent_fingerprint": "a", "reply_level": 1},
         ]
-        cls.data_path = os.path.join(cls.tmpdir, "src_x.json")
-        with open(cls.data_path, "w", encoding="utf-8") as f:
-            json.dump({"total_pages": 1, "posts": cls.posts}, f, ensure_ascii=False)
+        storage.upsert_posts("src_x", cls.posts)
 
         cls.task_id = "export-e2e"
         from app.services.orchestrator import orchestrator
@@ -714,7 +709,7 @@ class TestExportEndpointEndToEnd:
             "plan": [], "logs": [], "progress": 1.0, "current_step": None,
             "result": {"total_posts": 4, "sources": [
                 {"id": "src_x", "name": "小组来源:测试", "collector_id": "group_feed",
-                 "output_path": cls.data_path, "post_count": 4},
+                 "post_count": 4},
             ]},
         }
 
@@ -824,7 +819,7 @@ class TestExportEndpointEndToEnd:
         original = task["result"]["sources"]
         task["result"]["sources"] = original + [
             {"id": "src_y", "name": "论坛来源", "collector_id": "tweakers",
-             "output_path": self.data_path, "post_count": 4},
+             "post_count": 4},
         ]
         try:
             resp = self.client.get(f"/api/v1/tasks/{self.task_id}/export", params={"format": "csv"})
@@ -905,9 +900,8 @@ class TestStatsTimeRangeEndToEnd:
              "fingerprint": "t1", "source": "src_x", "page_number": 1,
              "parent_fingerprint": None, "reply_level": 0},
         ]
-        cls.path = os.path.join(cls.tmpdir, "range.json")
-        with open(cls.path, "w", encoding="utf-8") as f:
-            json.dump({"total_pages": 1, "posts": posts}, f, ensure_ascii=False)
+        # seq 按插入顺序给，读回来仍是这个乱序 —— 排序必须由 /stats 自己做
+        storage.upsert_posts("src_x", posts)
 
         cls.task_id = "range-e2e"
         from app.services.orchestrator import orchestrator
@@ -917,7 +911,7 @@ class TestStatsTimeRangeEndToEnd:
             "result": {
                 "total_posts": len(posts),
                 "sources": [{"id": "src_x", "name": "乱序来源", "collector_id": "group_feed",
-                             "output_path": cls.path, "post_count": len(posts)}],
+                             "post_count": len(posts)}],
             },
         }
         cls.orchestrator = orchestrator

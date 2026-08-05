@@ -7,7 +7,7 @@ incremental_strategy 是 watermark 而不是 page。
 from __future__ import annotations
 
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from app.collectors.base import Collector
 from app.config import settings
@@ -39,10 +39,10 @@ class GroupFeedCollector(Collector):
         },
     ]
 
-    def output_path(self, source: Dict[str, Any]) -> str:
+    def legacy_output_path(self, source: Dict[str, Any]) -> Optional[str]:
         group_id = (source.get("params") or {}).get("group_id")
         if not group_id:
-            raise ValueError("缺少 group_id 参数")
+            return None
         return os.path.join(settings.project_root, f"group_feed_{group_id}.json")
 
     def build_job(self, source: Dict[str, Any], output_path: str) -> Dict[str, Any]:
@@ -57,6 +57,8 @@ class GroupFeedCollector(Collector):
                 "headless": params.get("headless", True),
             },
             "incremental": params.get("incremental", True),
+            # 增量去重的锚点由 Python 下发。脚本不再读旧落盘文件
+            "known_fingerprints": source.get("known_fingerprints") or [],
             "output_path": output_path,
             "state_file": source.get("state_file")
             or os.path.join(settings.data_dir, "sessions", f"{source.get('id', self.id)}.json"),

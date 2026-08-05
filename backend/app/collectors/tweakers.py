@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from app.collectors.base import Collector
 from app.config import settings
@@ -36,24 +36,32 @@ class TweakersCollector(Collector):
         },
     ]
 
-    def output_path(self, source: Dict[str, Any]) -> str:
+    def legacy_output_path(self, source: Dict[str, Any]) -> Optional[str]:
         thread_id = (source.get("params") or {}).get("thread_id")
         if not thread_id:
-            raise ValueError("缺少 thread_id 参数")
+            return None
         return os.path.join(settings.project_root, f"tweakers_thread_{thread_id}.json")
 
     def build_job(self, source: Dict[str, Any], output_path: str) -> Dict[str, Any]:
         params = source.get("params") or {}
+        # 续抓点由 Python 从 posts 表算出来。脚本不再读旧落盘文件 ——
+        # 那份文件已经不存在了
+        start_page = params.get("start_page", 1)
+        if params.get("incremental", True):
+            resume = source.get("max_page_number") or 0
+            if resume >= start_page:
+                start_page = resume + 1
         return {
             "source_id": source.get("id") or self.id,
             "collector_id": self.id,
             "mode": source.get("mode", "collect"),
             "params": {
                 "thread_id": params.get("thread_id"),
-                "start_page": params.get("start_page", 1),
+                "start_page": start_page,
                 "headless": params.get("headless", True),
             },
             "incremental": params.get("incremental", True),
+            "known_fingerprints": source.get("known_fingerprints") or [],
             "output_path": output_path,
             "state_file": source.get("state_file")
             or os.path.join(settings.project_root, ".scraper_state.json"),

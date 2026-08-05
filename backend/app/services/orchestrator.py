@@ -22,8 +22,9 @@ from app.services.storage import (
     init_db, migrate_from_json, save_task, load_all_tasks,
     delete_task as db_delete_task,
     legacy_sentiment_task_ids, migrate_sentiment_blob, drop_legacy_sentiment_table,
-    discard_legacy_sentiment,
+    discard_legacy_sentiment, migrate_posts_file, retire_file,
 )
+from app.services import storage
 
 logger = get_logger(__name__)
 
@@ -39,7 +40,37 @@ class TaskOrchestrator:
         init_db()
         migrate_from_json()
         self._load_tasks()
+        self._migrate_posts()
         self._migrate_sentiment()
+
+    def _migrate_posts(self):
+        """把各来源的落盘 JSON 搬进 posts 表。
+
+        必须在 _load_tasks 之后（要读历史任务记下的路径）、_migrate_sentiment
+        之前（后者要按帖子顺序把旧结论换成身份）。
+        """
+        # 已注册的来源：文件名从 legacy_output_path() 取，不 glob 猜
+        for source in source_service.list_sources():
+            try:
+                path = get_collector(source["collector_id"]).legacy_output_path(source)
+            except (ValueError, KeyError):
+                continue
+            self._migrate_one_source(source["id"], path)
+
+        # 已被删除、但仍被历史任务引用的来源：任务结果里记着当时的落盘路径。
+        # 漏掉这一步，一次「删数据源」就会让所有引用它的历史任务结果变成空白
+        for task in self.tasks.values():
+            for entry in (task.get("result") or {}).get("sources", []):
+                self._migrate_one_source(entry.get("id"), entry.get("output_path"))
+
+    def _migrate_one_source(self, source_id: Optional[str], path: Optional[str]):
+        if not source_id or not path:
+            return
+        try:
+            if migrate_posts_file(source_id, path):
+                retire_file(path)
+        except Exception as e:
+            logger.error("迁移来源 %s 的帖子失败: %s", source_id, e)
 
     def _migrate_sentiment(self):
         """把旧的「整份 JSON 一个列」舆情结果换成按帖子身份存。
@@ -244,14 +275,13 @@ class TaskOrchestrator:
                             # 不要再包一层技术描述把它埋掉
                             await self._task_log(task_id, "error", str(e))
                             raise
-                        posts = collector.normalize(result)
-                        for p in posts:
-                            p["source"] = source["id"]
+                        # CollectorRunner 已把本轮结果并进 posts 表并回读了全量，
+                        # 顺序就是表里的 seq —— 增量抓取时这里拿到的是「历史 + 新增」
+                        posts = result.get("posts") or []
                         context.setdefault("posts", []).extend(posts)
                         context.setdefault("sources", {})[source["id"]] = {
                             "name": source["name"],
                             "collector_id": source["collector_id"],
-                            "output_path": collector.output_path(source),
                             "total_pages": result.get("total_pages", 0),
                             "post_count": len(posts),
                         }
@@ -298,7 +328,7 @@ class TaskOrchestrator:
                         else:
                             context["posts"] = already
                             await self._task_log(task_id, "info", "所有帖子已翻译，跳过")
-                        self._save_translated_json(context.get("sources", {}), context["posts"])
+                        self._save_translations(context["posts"])
 
                     elif step.action == "generate_excel":
                         posts = context.get("posts", [])
@@ -351,14 +381,14 @@ class TaskOrchestrator:
                 "total_pages": context.get("total_pages", 0),
                 "excel_name": context.get("excel_name", ""),
                 "excel_path": context.get("excel_path", ""),
-                # 记下 output_path：用户之后在数据源页删掉这个来源，历史任务的结果
-                # 也还能照原路读回来，而不是静默变成「没有数据」
+                # 记下 source_id：用户之后在数据源页删掉这个来源，历史任务的结果
+                # 也还能按 id 从 posts 表读回来，而不是静默变成「没有数据」
+                # （posts 表刻意没挂 sources 外键，就是为了这个）
                 "sources": [
                     {
                         "id": sid,
                         "name": m["name"],
                         "collector_id": m["collector_id"],
-                        "output_path": m["output_path"],
                         "post_count": m["post_count"],
                     }
                     for sid, m in sources_meta.items()
@@ -393,23 +423,13 @@ class TaskOrchestrator:
             if llm_service:
                 await llm_service.close()
 
-    def _save_translated_json(self, sources_meta: dict, posts: list):
-        """把翻译结果按来源拆回各自的落盘文件。
+    def _save_translations(self, posts: list):
+        """把翻译结果写回 posts 表。
 
-        多来源之后 posts 是跨源拼起来的，整锅写回任何一个文件都会污染别的来源。
+        按 (source, fingerprint) 定位逐条更新，不碰其它字段 —— 改造前是整锅写回
+        落盘文件，多来源之后那样做会污染别的来源。
         """
-        for source_id, meta in sources_meta.items():
-            json_path = meta.get("output_path")
-            if not json_path or not os.path.exists(json_path):
-                continue
-            mine = [p for p in posts if p.get("source", source_id) == source_id]
-            if not mine:
-                continue
-            with open(json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            data["posts"] = mine
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+        storage.save_translations(posts)
 
     async def _task_log(self, task_id: str, level: str, message: str):
         """记录日志到任务并发送 SSE"""
@@ -520,32 +540,21 @@ class TaskOrchestrator:
 
 
 def _load_posts_from_sources(sources: List[dict]):
-    """从各来源已落盘的 JSON 兜底加载，返回 (posts, sources_meta)。
+    """从 posts 表加载，返回 (posts, sources_meta)。
 
-    支持「只翻译已有数据」这类不带 collect 步骤的任务。每条帖子补上 source 标记，
-    否则跨源合并后分不清谁是谁。
+    支持「只翻译已有数据」这类不带 collect 步骤的任务。
     """
     posts: List[dict] = []
     meta: Dict[str, dict] = {}
     for source in sources:
-        collector = get_collector(source["collector_id"])
-        try:
-            path = collector.output_path(source)
-        except ValueError:
+        mine = storage.load_posts([source["id"]])
+        if not mine:
             continue
-        if not os.path.exists(path):
-            continue
-        with open(path, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
-        mine = loaded.get("posts", [])
-        for p in mine:
-            p.setdefault("source", source["id"])
         posts.extend(mine)
         meta[source["id"]] = {
             "name": source["name"],
             "collector_id": source["collector_id"],
-            "output_path": path,
-            "total_pages": loaded.get("total_pages", 0),
+            "total_pages": max((p.get("page_number") or 1) for p in mine),
             "post_count": len(mine),
         }
     return posts, meta
@@ -555,32 +564,13 @@ def load_task_posts(task: dict) -> List[dict]:
     """一个任务的全量扁平帖子，顺序即「舆情下标 / index 语义」依赖的那个顺序。
 
     任务里记了采过哪些源就只读那几个，没记（比如还没跑完）就退回全部已注册的源。
+    **按 source_id 直接查表**，来源有没有从注册表里删掉都读得到 —— 否则一次
+    「删数据源」会把所有引用它的历史任务结果一起变成空白。
     """
     recorded = (task.get("result") or {}).get("sources", [])
     if not recorded:
-        posts, _meta = _load_posts_from_sources(source_service.list_sources())
-        return posts
-
-    registered = {s["id"]: s for s in source_service.list_sources()}
-    posts: List[dict] = []
-    for entry in recorded:
-        sid = entry.get("id")
-        source = registered.get(sid)
-        if source:
-            mine, _meta = _load_posts_from_sources([source])
-            posts.extend(mine)
-            continue
-        # 来源已被用户删除。任务结果里记了当时的落盘路径，照原路读回来 ——
-        # 否则一次「删数据源」会把所有引用它的历史任务结果一起变成空白
-        path = entry.get("output_path")
-        if not path or not os.path.exists(path):
-            continue
-        with open(path, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
-        for p in loaded.get("posts", []):
-            p.setdefault("source", sid)
-        posts.extend(loaded.get("posts", []))
-    return posts
+        return storage.load_posts([s["id"] for s in source_service.list_sources()])
+    return storage.load_posts([e["id"] for e in recorded if e.get("id")])
 
 
 def _merge_by_fingerprint(source_posts: list, translated: list) -> list:

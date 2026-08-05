@@ -11,7 +11,10 @@ from app.services.post_tree import post_key
 from app.services.progress_manager import ProgressManager
 from app.services.llm_service import LLMService
 from app.services.llm_utils import get_llm_service
-from app.services.storage import save_sentiment as db_save_sentiment
+from app.services.storage import (
+    save_sentiment as db_save_sentiment,
+    mark_sentiment_analyzed as db_mark_sentiment_analyzed,
+)
 from app.models import LLMConfig
 from app.config import settings
 
@@ -19,48 +22,6 @@ logger = logging.getLogger("hyxi.sentiment")
 
 BATCH_SIZE = 3  # 详细分析每次发送的帖子数
 
-
-def _source_output_paths() -> List[str]:
-    """所有已注册数据源的落盘文件（存在的那些）"""
-    from app.services import source_service
-
-    paths = []
-    for source in source_service.list_sources():
-        try:
-            path = get_collector(source["collector_id"]).output_path(source)
-        except (ValueError, KeyError):
-            continue
-        if os.path.exists(path):
-            paths.append(path)
-    return paths
-
-
-def _sync_processed_flags(json_path: str, posts: list) -> int:
-    """把帖子的 _processed 标记按指纹合并回源 JSON。
-
-    必须是合并而非替换：舆情分析只带 sentiment_at，整体覆盖会抹掉 translated
-    标记，导致几百条已翻译的帖子下次重新走一遍付费翻译。
-    """
-    with open(json_path, "r", encoding="utf-8") as f:
-        jdata = json.load(f)
-    jposts = jdata.get("posts", [])
-    by_fp = {jp.get("fingerprint"): jp for jp in jposts if jp.get("fingerprint")}
-
-    updated = 0
-    for p in posts:
-        jp = by_fp.get(p.get("fingerprint"))
-        if jp is not None:
-            jp.setdefault("_processed", {}).update(p.get("_processed", {}))
-            updated += 1
-
-    if updated > 0:
-        jdata["posts"] = jposts
-        # 源数据文件写坏就再也拿不回来了，先写临时文件再原子替换
-        tmp_path = json_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(jdata, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, json_path)
-    return updated
 
 # 维度必须是封闭集合。放任 LLM 自由生成会把 top_dimensions 碎成上百个近义标签，
 # 跨来源对比直接失效 —— 维度表的全部价值就在于它是封闭的。
@@ -361,18 +322,13 @@ class SentimentService:
         # (source_id, fingerprint) —— 下标只在写入现场有意义
         db_save_sentiment(task_id, output, all_posts or posts)
 
-        # 保存帖子的 _processed 标记回源 JSON（按指纹匹配）。
-        # 不再 glob `tweakers_thread_*.json` —— 文件名只有 Collector.output_path() 一个来源。
-        # 多来源之后一批帖子会横跨多个文件，不能匹配够数就 break。
-        synced = 0
-        for path in _source_output_paths():
-            try:
-                synced += _sync_processed_flags(path, posts)
-                if synced >= len(posts):
-                    break
-            except Exception as e:
-                # 单个文件损坏不该让整轮分析结果丢失
-                logger.warning("回写 _processed 标记失败 %s: %s", path, e)
+        # 把 sentiment_at 落到 posts 表。只写这一个字段 —— 舆情分析不该碰
+        # translation / translated，否则几百条已翻译的帖子下次要重新付费翻译
+        try:
+            db_mark_sentiment_analyzed(posts)
+        except Exception as e:
+            # 标记没落上只会让下一轮重复分析这几条，比让整轮结果丢失轻得多
+            logger.warning("回写 sentiment_at 失败: %s", e)
 
         await progress.emit(task_id, "log", {
             "level": "success",

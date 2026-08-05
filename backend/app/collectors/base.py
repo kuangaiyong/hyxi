@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from app.config import settings
 
@@ -27,9 +27,14 @@ class Collector:
     def script_path(self) -> str:
         return os.path.join(settings.project_root, "collectors", self.script)
 
-    def output_path(self, source: Dict[str, Any]) -> str:
-        """采集结果的落盘位置。全项目唯一的文件名来源，调用方不再自己拼。"""
-        raise NotImplementedError
+    def legacy_output_path(self, source: Dict[str, Any]) -> Optional[str]:
+        """改造前那个长期落盘文件的位置。**只供一次性迁移用**。
+
+        帖子现在存在 posts 表里，脚本写的是一个用完即删的交接文件（路径由
+        CollectorRunner 现生成）。这个方法留着是为了让老部署升上来时还能找到
+        自己的历史数据 —— 不能靠 glob 猜文件名，那正是改造前去掉的东西。
+        """
+        return None
 
     def build_job(self, source: Dict[str, Any], output_path: str) -> Dict[str, Any]:
         """构造传给 Node 脚本的 job —— 唯一允许每个来源各不相同的地方，纯数据无逻辑。"""

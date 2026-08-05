@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from app.collectors.base import Collector
 from app.config import settings
@@ -46,10 +46,10 @@ class FacebookGroupCollector(Collector):
         },
     ]
 
-    def output_path(self, source: Dict[str, Any]) -> str:
+    def legacy_output_path(self, source: Dict[str, Any]) -> Optional[str]:
         group_id = (source.get("params") or {}).get("group_id")
         if not group_id:
-            raise ValueError("缺少 group_id 参数")
+            return None
         return os.path.join(settings.project_root, f"facebook_group_{group_id}.json")
 
     def session_path(self, source: Dict[str, Any]) -> str:
@@ -72,6 +72,8 @@ class FacebookGroupCollector(Collector):
                 "manual_login_timeout_ms": source.get("manual_login_timeout_ms"),
             },
             "incremental": params.get("incremental", True),
+            # 增量去重的锚点由 Python 下发。脚本不再读旧落盘文件 —— 那份文件已经不存在了
+            "known_fingerprints": source.get("known_fingerprints") or [],
             "output_path": output_path,
             "state_file": source.get("state_file") or self.session_path(source),
             # 正文图落盘根目录。脚本在下面按 source_id 分子目录，images 字段存

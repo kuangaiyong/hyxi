@@ -34,6 +34,8 @@ const CONFIG = {
     // 人工授权的等待上限。可配是为了能在验证里跑短一点，默认 5 分钟
     manualLoginTimeout: params.manual_login_timeout_ms || 5 * 60 * 1000,
     incremental: !!job.incremental,
+    // 已有指纹由 Python 从 posts 表算好下发，脚本不再读旧落盘文件
+    knownFingerprints: job.known_fingerprints || [],
     baseUrl: (job.base_url || 'https://www.facebook.com').replace(/\/+$/, ''),
     outputFile: job.output_path,
     stateFile: job.state_file,
@@ -435,23 +437,12 @@ async function main() {
     // 会话刚建立就先落一次盘：后面抓取环节出错也不必再登一次
     if (usedPath === 'password') await saveStorageState(context, CONFIG.stateFile);
 
-    // 增量：先读旧数据。信息流没有页码可续，只能重扫再按指纹去重 ——
-    // 绝不能只写这一轮抓到的，落盘文件同时承载 translation 和 _processed 标记
-    const existingPosts = [];
-    const seen = new Set();
-    if (CONFIG.incremental && fs.existsSync(CONFIG.outputFile)) {
-        try {
-            const existing = JSON.parse(fs.readFileSync(CONFIG.outputFile, 'utf-8'));
-            (existing.posts || []).forEach((p) => {
-                if (p.fingerprint && !seen.has(p.fingerprint)) {
-                    seen.add(p.fingerprint);
-                    existingPosts.push(p);
-                }
-            });
-            log(`   增量模式: 已有 ${existingPosts.length} 条，本轮只追加新出现的`);
-        } catch (e) {
-            log(`   ⚠️ 读取已有数据失败，回退到全量模式: ${e.message}`);
-        }
+    // 增量：信息流没有页码可续，只能重扫再按指纹去重。已有指纹由 job 下发
+    // （帖子的家在 posts 表里，这里没有旧文件可读）。本轮只输出新出现的，
+    // 合并交给 Python 侧的 upsert —— 它会保住已有帖子的 translation 和 _processed
+    const seen = new Set(CONFIG.knownFingerprints);
+    if (CONFIG.incremental && seen.size) {
+        log(`   增量模式: 已有 ${seen.size} 条，本轮只追加新出现的`);
     }
 
     const fresh = [];
@@ -483,7 +474,7 @@ async function main() {
             progress(batch, CONFIG.maxBatches, `批次 ${batch}/${CONFIG.maxBatches}`);
 
             // 水位线：信息流按时间倒序，整批都见过就说明已经翻到旧内容
-            if (CONFIG.incremental && existingPosts.length && added.length === 0) {
+            if (CONFIG.incremental && seen.size > fresh.length && added.length === 0) {
                 log('   已翻到历史数据，停止继续滚动');
                 break;
             }
@@ -496,7 +487,7 @@ async function main() {
     } catch (e) {
         complete = false;
         stopReason = e.message;
-        if (existingPosts.length === 0 && fresh.length === 0) {
+        if (CONFIG.knownFingerprints.length === 0 && fresh.length === 0) {
             await saveStorageState(context, CONFIG.stateFile);
             await browser.close();
             process.stderr.write(`${stopReason}\n`);
@@ -507,16 +498,15 @@ async function main() {
     await saveStorageState(context, CONFIG.stateFile);
     await browser.close();
 
-    // 历史在前、新增在后：已有帖子连同 translation 和 _processed 原样保留
-    const merged = [...existingPosts, ...fresh];
-
+    // 只输出本轮新出现的。历史数据在 posts 表里，合并由 Python 侧的 upsert 完成 ——
+    // 它按 (source_id, fingerprint) 更新，已有帖子的 translation 和 _processed 原样保留
     writeOutput(job, {
         group_id: CONFIG.groupId,
         total_pages: batch,
-        total_posts: merged.length,
+        total_posts: fresh.length,
         complete,
         stop_reason: stopReason,
-        posts: merged,
+        posts: fresh,
     });
 
     if (!complete) {

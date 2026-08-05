@@ -97,6 +97,7 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
 
 | 表 | 用途 |
 |------|------|
+| `posts` | 帖子。`seq` 承担改造前「数组下标即顺序」的全部语义 |
 | `tasks` | 任务记录（plan / result / logs 是形状可变的不透明块，留在 JSON 列里） |
 | `sentiment_runs` | 一次舆情分析的元信息 + summary（纯派生的聚合结果） |
 | `sentiment_results` | **舆情结论，按 `(task_id, source_id, fingerprint)` 存** |
@@ -109,15 +110,21 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
 |------|------|
 | `backend/data/media/{source_id}/*` | 采集下载的正文图（二进制，已 gitignore） |
 | `backend/data/logs/app.log` | 滚动日志（5MB x 3） |
-| `backend/data/jobs/*.json` | 交给采集子进程的入参，**用完即删的 IPC，不是持久化** |
+| `backend/data/jobs/{run}.json` | 交给采集子进程的入参，**用完即删的 IPC，不是持久化** |
+| `backend/data/jobs/{run}_out.json` | 采集脚本的产出，**读完入库即删的交接文件** |
 | `backend/data/sessions/{source_id}.json` | Playwright `storageState`。它只认文件路径，且是可重建的运行时缓存，丢了只是重新登录一次 |
-| `tweakers_thread_{id}.json` 等 | **项目根目录**，抓取的原始帖子数据（阶段 3 会进库） |
 
 **为什么不留双写**：同一份数据存两处、两个读者各读一份，必然长出「改了一边、另一边还是旧的」的 bug。实测踩过：修完 `sentiment_*.json` 后 `/sentiment` 仍返回旧数据，因为它读 SQLite 而 `/export` 读 JSON。
 
 **舆情结论按帖子身份存，不按下标**。下标只在写入现场有意义 —— 离开那里就没人能保证它对得上哪条帖子（已因此出过一次事故，见「常见陷阱」）。`storage.save_sentiment()` 收到的仍是下标数组，落库时立刻换成 `(source_id, fingerprint)`；`get_sentiment(task_id, posts)` 再按当前帖子顺序还原成前端要的下标数组，**API 响应形状不变**。副作用是 `total` / `failed` 现在按当前帖子实算，而不是分析那一刻冻结的数字 —— `/sentiment` 因此与 `/posts`、`/stats`、`/export` 报同一个数。
 
 `intensity` 列必须是 `NUMERIC` 不能是 `REAL`：REAL 亲和性会把整数 3 存成 3.0，导出的强度列跟着变成「3.0」。
+
+**`posts.seq` 是全链路的顺序锚点**。改造前「扁平数组的下标即顺序」这件事有 8 处依赖（增量过滤、指纹合并、翻译下标对应、舆情绝对索引、Excel、`/posts` 切片、`index` 语义、Node 端合并），入库后由它完整承担：按 source 单调递增、**已有帖子的 seq 永不变**、新帖追加在后。读取一律 `ORDER BY seq`，跨来源拼接顺序由调用方给的 `source_ids` 决定。它一洗牌，所有历史舆情结论就会错位到别的帖子上。
+
+**`posts` 故意不挂 `sources` 外键**：`ON DELETE CASCADE` 会让「删数据源」把历史任务的结果一起清空，而那正是要避免的（见「常见陷阱」）。代价是删源后帖子会留下来，与改造前「删源后落盘 JSON 仍在」一致。
+
+**采集脚本不再读旧数据**。它只输出本轮新抓到的，合并由 `storage.upsert_posts()` 做：已存在的帖子**只更新采集字段**，绝不覆盖 `translation` / `translated` / `sentiment_at`。增量所需的 `known_fingerprints` 与续抓页码由 Python 从库里算好，通过 job 文件下发。
 
 **迁移**：启动时 `migrate_from_json()` 幂等执行，源文件移进 `data/_migrated_backup/` 而不是删掉。舆情从旧的整块 JSON 列搬到键控表时，靠一条**可检验的不变量**兜底 —— 凡是 `results[i]` 有结论，第 i 条帖子必须已带 `sentiment_at`；对不上就整份跳过并保留原数据。某个来源的落盘文件被删导致结果比帖子多时，只迁对得上的前缀，尾部丢弃并打 warning。
 
@@ -311,7 +318,7 @@ translate 和 generate_excel 在 context 里没有 posts 时会**从各数据源
 
 ## 测试
 
-**203 个测试，必须全部 PASSED**（本机实测 `203 passed in 245s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**212 个测试，必须全部 PASSED**（本机实测 `212 passed in 266s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
@@ -376,6 +383,7 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 - **`_persist()` 永远不会删行**：`_save_tasks()` 在 SQLite 分支只对 `self.tasks` 里**剩余**的任务逐条 upsert，从不发 DELETE。所以任何"从 `self.tasks` 移除条目"的新逻辑都必须自己显式调 `db_delete_task()`，否则残留行会在下次启动被 `_load_tasks()` 读回来（`delete_task()` 曾因此让删除的任务重启后复活，已修）。JSON 回退分支是全量覆写，无此问题
 - **`storage.DB_PATH` 是 import 时算好的常量**：测试里只改 `settings.data_dir` **不会**改变 DB 位置，必须一并重定向 `storage.DB_PATH`，否则测试会写进真实的 `backend/data/hyxi.db`。`tests/test_core.py` 的 `_create_orchestrator()` 已这么做；`tests/test_api.py` 则是靠在 import 前改 `data_dir` 生效 —— 新增测试文件时注意这个先后顺序
 - **采集脚本的 stdout 只走 SSE，不落进 `task["logs"]`**：`CollectorRunner` 用 `progress.emit()` 转发，而 `task["logs"]` 只由 orchestrator 的 `_task_log()` 写。所以「复用会话，跳过登录」这类脚本自报的行只有在页面盯着 SSE 时看得到，任务跑完再翻记录是找不到的；要断言它就得在流上收
+- **退出码 2 的数据必须先入库再抛异常**：`CollectorRunner` 里「读交接文件 → upsert」这一段**排在退出码判断之前**。反过来写的话，脚本已经抓到并写出的那批帖子会连同临时交接文件一起被 `finally` 删掉 —— 160 页的长帖抓到第 100 页撞限流，那 100 页就白抓了，`/retry` 只能从第 1 页重来。改造前脚本写的是长期文件，Python 抛异常也不影响数据留在盘上；换成临时交接文件后这条不再自动成立。回归测试见 `TestScraperPartialExitEndToEnd::test_partial_results_are_persisted_so_retry_can_resume`
 - **爬虫退出码是契约**：`0` 完整 / `1` 硬失败（无可用数据）/ `2` 部分完成（数据已落盘，可增量续抓）/ `3` 需要人工授权（见「登录与会话」一节）。残缺时 `total_pages` 保留站点声明的真值**不再被截断点覆盖**，输出 JSON 带 `complete: false` + `stop_reason`，原因同时写 stderr 并被 `CollectorRunner` 拼进任务的 `error_message`。退出码非 0 一律让抓取步骤失败——残缺数据继续跑翻译→Excel→舆情，产出的是一份看起来完整、实际有偏的报告，比任务失败糟得多；续抓走 `POST /api/v1/tasks/{id}/retry`
 - **「第一页零帖子」也算硬失败**：全量抓取时第一页一条都提不出来（且没有历史数据可依），脚本直接抛错而不是写一份 `complete: true` 的空结果。这不是假想场景 —— IP 被封时页面返回 200 外壳、DOM 里没有任何 `.message`，改造前正是靠这条路径写出「0 条帖子、抓取成功」，下游照常翻译 0 条并导出空 Excel。站点改类名导致提取器失效时也是同一条路径
 - **爬虫 URL 页码有偏移**：`/list_messages/{id}/0` 是第 1 页，`/1` 是第 2 页（`displayToUrl` / `urlToDisplay`）；`group_feed` 的 `/batch/{n}` 同理差一位

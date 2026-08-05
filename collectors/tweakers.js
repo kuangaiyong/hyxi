@@ -23,6 +23,8 @@ const CONFIG = {
     delayMax: pacing.delay_max || 11000,
     timeout: 30000,
     incremental: !!job.incremental,
+    // 增量去重的锚点由 Python 从 posts 表算好下发，脚本不再读旧落盘文件
+    knownFingerprints: job.known_fingerprints || [],
     baseUrl: (job.base_url || 'https://gathering.tweakers.net').replace(/\/+$/, ''),
     outputFile: job.output_path,
     stateFile: job.state_file,
@@ -198,22 +200,11 @@ async function main() {
         log(`   ⚠️ 第 1~${CONFIG.startPage - 1} 页不会被抓取`);
     }
 
-    // 增量模式：加载已有数据，确定起始页
-    let existingPosts = [];
-    let existingFingerprints = new Set();
-    if (CONFIG.incremental && fs.existsSync(CONFIG.outputFile)) {
-        try {
-            const existing = JSON.parse(fs.readFileSync(CONFIG.outputFile, 'utf-8'));
-            existingPosts = existing.posts || [];
-            existingFingerprints = new Set(existingPosts.map(p => p.fingerprint).filter(Boolean));
-            const maxPage = Math.max(...existingPosts.map(p => p.page_number || 1), 0);
-            if (maxPage >= CONFIG.startPage) {
-                CONFIG.startPage = maxPage + 1;
-                log(`   增量模式: 已有 ${existingPosts.length} 条帖子，最大页码 ${maxPage}，从第 ${CONFIG.startPage} 页开始`);
-            }
-        } catch (e) {
-            log(`   ⚠️ 读取已有数据失败，回退到全量模式: ${e.message}`);
-        }
+    // 增量所需的信息由 job 下发：帖子存在 posts 表里，脚本这边没有旧文件可读。
+    // 续抓页码已由 Python 算进 CONFIG.startPage
+    const existingFingerprints = new Set(CONFIG.knownFingerprints);
+    if (CONFIG.incremental && existingFingerprints.size) {
+        log(`   增量模式: 已有 ${existingFingerprints.size} 条帖子，从第 ${CONFIG.startPage} 页开始`);
     }
 
     const browser = await launchBrowser(CONFIG.headless);
@@ -249,14 +240,14 @@ async function main() {
 
         if (posts.length > 0) {
             log(`  📝 第1条: [${posts[0].username}] ${posts[0].timestamp} — ${posts[0].content.substring(0, 100)}...`);
-        } else if (existingPosts.length === 0) {
+        } else if (existingFingerprints.size === 0) {
             // 一条都没拿到又没有历史数据，继续走下去会写出一份 complete:true 的空结果，
             // 下游会把它当成「这个帖子本来就是空的」照常翻译、导出
             throw new Error(`第 ${CONFIG.startPage} 页未提取到任何帖子（可能被目标站拦截或页面结构已变化）`);
         } else {
             // 增量模式下起始页是 maxPage+1，超出末尾时本来就该是空的——这是「没有新回帖」，
             // 不是残缺，历史数据完好，complete 仍然为 true
-            log(`  起始页无新帖，已有 ${existingPosts.length} 条历史数据`);
+            log(`  起始页无新帖，已有 ${existingFingerprints.size} 条历史数据`);
         }
 
         // 检测总页数
@@ -380,28 +371,34 @@ async function main() {
         post._processed = post._processed || { translated: false, sentiment_at: null };
     }
 
-    let mergedPosts;
-    if (CONFIG.incremental && existingPosts.length > 0) {
-        const newPosts = allPosts.filter(p => !existingFingerprints.has(p.fingerprint));
-        mergedPosts = [...existingPosts, ...newPosts];
-        log(`   增量合并: 已有 ${existingPosts.length} + 新增 ${newPosts.length} = 总计 ${mergedPosts.length}`);
-    } else {
-        mergedPosts = allPosts;
+    // 只输出本轮抓到的：历史数据在 posts 表里，合并由 Python 侧的 upsert 完成
+    // （它会保住已有帖子的 translation 和 _processed 标记）
+    const seenThisRound = new Set();
+    const freshPosts = [];
+    for (const p of allPosts) {
+        // 翻页期间帖子总数变化会让同一条回帖跨页出现两次，同一批里必须先自去重
+        if (seenThisRound.has(p.fingerprint)) continue;
+        seenThisRound.add(p.fingerprint);
+        if (CONFIG.incremental && existingFingerprints.has(p.fingerprint)) continue;
+        freshPosts.push(p);
+    }
+    if (CONFIG.incremental) {
+        log(`   增量: 本轮提取 ${allPosts.length} 条，其中新增 ${freshPosts.length} 条`);
     }
 
     // ===== 保存 =====
-    const uniqueUsers = new Set(mergedPosts.map(p => p.username));
+    const uniqueUsers = new Set(freshPosts.map(p => p.username));
     const result = {
         thread_id: CONFIG.threadId,
         thread_url: `${CONFIG.baseUrl}/forum/list_messages/${CONFIG.threadId}/`,
         total_pages: detectedTotalPages,
-        total_posts: mergedPosts.length,
+        total_posts: freshPosts.length,
         pages_fetched: new Set(allPosts.map(p => p.page_number)).size,
         unique_users: uniqueUsers.size,
         complete: !incomplete,
         stop_reason: stopReason,
         extracted_at: new Date().toISOString(),
-        posts: mergedPosts,
+        posts: freshPosts,
     };
 
     writeOutput(job, result);

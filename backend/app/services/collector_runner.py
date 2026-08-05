@@ -13,6 +13,7 @@ from typing import Any, Dict
 
 from app.collectors.base import Collector
 from app.config import settings
+from app.services import storage
 from app.services.progress_manager import ProgressManager
 
 logger = logging.getLogger("hyxi.collector")
@@ -84,7 +85,21 @@ class CollectorRunner:
         progress: ProgressManager,
         step_index: int = 0,
     ) -> dict:
-        output_path = collector.output_path(source)
+        jobs_dir = os.path.join(settings.data_dir, "jobs")
+        os.makedirs(jobs_dir, exist_ok=True)
+        run_id = f"{task_id}_{uuid.uuid4().hex[:8]}"
+        # 脚本的产出是一个**用完即删的交接文件**，不再是长期落盘的数据文件：
+        # 帖子的家在 posts 表里。JS 侧的契约没变，还是「写 job.output_path」
+        output_path = os.path.join(jobs_dir, f"{run_id}_out.json")
+
+        source_id = source.get("id") or collector.id
+        if source.get("mode") != "login_only":
+            # 增量所需的信息由 Python 从库里算好下发。脚本以前是自己读旧落盘文件的，
+            # 那份文件现在不存在了
+            source = dict(source)
+            source["known_fingerprints"] = storage.known_fingerprints(source_id)
+            source["max_page_number"] = storage.max_page_number(source_id)
+
         job = collector.build_job(source, output_path)
 
         script_path = collector.script_path()
@@ -98,9 +113,7 @@ class CollectorRunner:
         ):
             raise ValueError("缺少 Node 依赖 playwright。请在项目根目录执行 npm ci 后重试。")
 
-        jobs_dir = os.path.join(settings.data_dir, "jobs")
-        os.makedirs(jobs_dir, exist_ok=True)
-        job_file = os.path.join(jobs_dir, f"{task_id}_{uuid.uuid4().hex[:8]}.json")
+        job_file = os.path.join(jobs_dir, f"{run_id}.json")
         with open(job_file, "w", encoding="utf-8") as f:
             json.dump(job, f, ensure_ascii=False)
 
@@ -109,11 +122,13 @@ class CollectorRunner:
                 task_id, collector, source, job_file, output_path, progress, step_index
             )
         finally:
-            # job 文件将来会携带凭据引用，不留在磁盘上
-            try:
-                os.remove(job_file)
-            except OSError:
-                pass
+            # 两个都是进程间通信的临时文件，用完即删：job 携带凭据引用，
+            # 交接文件里是已经入库的帖子
+            for path in (job_file, output_path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
     @staticmethod
     def _child_env(collector: Collector, source: Dict[str, Any]) -> Dict[str, str]:
@@ -271,6 +286,23 @@ class CollectorRunner:
                     source_id, source.get("name") or source_id, reason
                 )
 
+            # **入库必须在退出码判断之前**。退出码 2 是「部分完成，数据已落盘」——
+            # 脚本在退出前已经把本轮抓到的写进交接文件了。先判退出码就 raise 的话，
+            # 这批数据会连同交接文件一起被 finally 删掉，/retry 只能从第 1 页重抓一遍
+            # （160 页的长帖抓到第 100 页限流，那 100 页就白抓了）
+            data = None
+            if source.get("mode") != "login_only" and os.path.exists(output_path):
+                with open(output_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                # **已存在的帖子只更新采集字段**，绝不覆盖 translation 和 _processed
+                # 标记 —— 整体覆盖等于把已翻译的帖子重新变成新帖，下一轮再付一次翻译钱
+                posts = collector.normalize(data)
+                for p in posts:
+                    p["source"] = source_id
+                added = storage.upsert_posts(source_id, posts)
+                data["posts"] = storage.load_posts([source_id])
+                data["total_posts"] = len(data["posts"])
+
             if proc.returncode != 0:
                 # 脚本用 stderr 说明中断原因（限流 / 重定向 / 页面异常），不带上就只剩一个退出码
                 lines = stderr_text.strip().splitlines()
@@ -284,16 +316,13 @@ class CollectorRunner:
                 })
                 return {"mode": "login_only", "authorized": True}
 
-            if not os.path.exists(output_path):
+            if data is None:
                 raise Exception(f"输出文件未生成: {output_path}")
-
-            with open(output_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
 
             await progress.emit(task_id, "step_progress", {
                 "step": step_index,
                 "progress": 1.0,
-                "message": f"采集完成: {data.get('total_posts', 0)} 条帖子",
+                "message": f"采集完成: 本轮新增 {added} 条，共 {data['total_posts']} 条",
             })
 
             return data

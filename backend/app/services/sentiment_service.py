@@ -127,6 +127,41 @@ class SentimentService:
     """LLM 舆情分析"""
 
     @staticmethod
+    def _to_absolute(
+        results: list,
+        pending: list,
+        existing_results: list,
+        fp_to_idx: dict,
+        total_all: int,
+    ) -> list:
+        """把「待分析批次内的下标」映射回全量帖子数组的绝对下标。
+
+        键用 source:fingerprint —— 只用 fingerprint 会跨来源碰撞，把 A 平台的结论
+        盖到 B 平台的帖子上。
+
+        **开关只能是 fp_to_idx，不能是 existing_results**：本任务第一次跑舆情时
+        existing_results 必然是空的，而 pending 完全可能只是全量的一小撮 ——
+        `_processed.sentiment_at` 写在**源文件**里、跨任务共享，同一批数据被别的
+        任务分析过之后，新任务的 pending 只剩新帖。那种情况下不重映射，存下去的
+        就是一个批次内下标的数组被当成绝对下标用：结论整体贴到别人身上，页面和
+        导出都看不出异常。实测任务 7d24786f 就是这么坏的 —— 90 条帖子只存下 3 条
+        结果，首条显示「未分析」，另两条挂在了完全无关的帖子上。
+        """
+        if not fp_to_idx:
+            return results
+        full = list(existing_results or [])
+        while len(full) < total_all:
+            full.append(None)
+        for local_idx, post in enumerate(pending):
+            r = results[local_idx]
+            if not (r and r.get("sentiment")):
+                continue
+            abs_idx = fp_to_idx.get(post_key(post))
+            if abs_idx is not None and abs_idx < len(full):
+                full[abs_idx] = r
+        return full
+
+    @staticmethod
     async def analyze(
         task_id: str,
         posts: list,
@@ -295,23 +330,11 @@ class SentimentService:
                 if not processed.get("sentiment_at"):
                     processed["sentiment_at"] = now_iso
 
-        # 合并已有结果（增量模式）：用指纹匹配绝对位置
-        if existing_results and fp_to_idx:
-            full_results = list(existing_results)
-            # 确保 full_results 长度 = max(existing, all_posts 总数)
-            all_total = len(fp_to_idx)
-            while len(full_results) < all_total:
-                full_results.append(None)
-
-            # 将新分析结果按 source:fingerprint 映射到绝对位置。
-            # 只用 fingerprint 会跨来源碰撞，把 A 平台的结论盖到 B 平台的帖子上。
-            for i, (orig_idx_in_pending, __p) in enumerate(non_empty):
-                r = results[orig_idx_in_pending]
-                if r and r.get("sentiment"):
-                    abs_idx = fp_to_idx.get(post_key(posts[orig_idx_in_pending]))
-                    if abs_idx is not None and abs_idx < len(full_results):
-                        full_results[abs_idx] = r
-            results = full_results
+        # 把「待分析批次内的下标」映射回全量数组的绝对下标
+        total_all = len(all_posts) if all_posts else len(fp_to_idx or {})
+        results = SentimentService._to_absolute(
+            results, posts, existing_results, fp_to_idx, total_all
+        )
 
         # 保存结果到 JSON
         sentiment_path = os.path.join(settings.data_dir, f"sentiment_{task_id}.json")

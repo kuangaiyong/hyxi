@@ -715,6 +715,88 @@ def _export_meta(**over):
     return meta
 
 
+class TestSentimentAbsoluteIndexEndToEnd:
+    """舆情结果数组的下标必须是全量帖子数组里的绝对位置。
+
+    页面和导出都按下标反查帖子。存成「待分析批次内的下标」不会报任何错，
+    只会让每条结论悄悄挂到别人身上。
+    """
+
+    @staticmethod
+    def _post(fp, content="内容"):
+        return {"username": "u", "timestamp": "02-06-2026 09:00", "content": content,
+                "fingerprint": fp, "source": "src_x", "parent_fingerprint": None}
+
+    def _fixture(self, pending_idx):
+        """5 条全量帖子，其中若干条本轮待分析"""
+        from app.services.post_tree import post_key
+        all_posts = [self._post(f"f{i}") for i in range(5)]
+        fp_to_idx = {post_key(p): i for i, p in enumerate(all_posts)}
+        pending = [all_posts[i] for i in pending_idx]
+        return all_posts, fp_to_idx, pending
+
+    def test_first_run_over_already_analyzed_data_uses_absolute_indices(self):
+        """**根因用例**：本任务第一次跑舆情，但源数据已被别的任务分析过。
+
+        `_processed.sentiment_at` 是写在**源文件**里的、跨任务共享，所以新任务的
+        pending 只剩没分析过的那几条，而本任务的 existing_results 是空的。
+        一旦拿 existing_results 当「要不要重映射」的开关，这一轮就会把批次内下标
+        当成绝对下标存盘。
+        """
+        from app.services.sentiment_service import SentimentService
+
+        all_posts, fp_to_idx, pending = self._fixture([3])       # 只有第 4 条待分析
+        r3 = {"sentiment": "negative", "intensity": 3, "reason_cn": "属于f3", "dimensions": []}
+
+        out = SentimentService._to_absolute([r3], pending, [], fp_to_idx, len(all_posts))
+
+        assert len(out) == 5, f"结果数组必须与全量帖子等长，实际 {len(out)}"
+        assert out[3] == r3, "结论要落在第 4 条帖子上"
+        assert [out[i] for i in (0, 1, 2, 4)] == [None] * 4, "其余位置必须留空"
+
+    def test_incremental_run_merges_into_existing(self):
+        """常规增量：已有结果原样保留，新结论按指纹落到各自的绝对位置"""
+        from app.services.sentiment_service import SentimentService
+
+        all_posts, fp_to_idx, pending = self._fixture([1, 4])
+        existing = [{"sentiment": "positive", "intensity": 4, "reason_cn": "属于f0", "dimensions": []},
+                    None, None, None, None]
+        r1 = {"sentiment": "neutral", "intensity": 2, "reason_cn": "属于f1", "dimensions": []}
+        r4 = {"sentiment": "negative", "intensity": 5, "reason_cn": "属于f4", "dimensions": []}
+
+        out = SentimentService._to_absolute([r1, r4], pending, existing, fp_to_idx, len(all_posts))
+
+        assert out[0]["reason_cn"] == "属于f0"
+        assert out[1]["reason_cn"] == "属于f1"
+        assert out[4]["reason_cn"] == "属于f4"
+        assert out[2] is None and out[3] is None
+
+    def test_fresh_task_analyzing_everything_is_unchanged(self):
+        """全量首跑时批次内下标本来就等于绝对下标，不能被搬错位"""
+        from app.services.sentiment_service import SentimentService
+
+        all_posts, fp_to_idx, pending = self._fixture([0, 1, 2, 3, 4])
+        results = [{"sentiment": "neutral", "intensity": 1, "reason_cn": f"属于f{i}", "dimensions": []}
+                   for i in range(5)]
+
+        out = SentimentService._to_absolute(results, pending, [], fp_to_idx, len(all_posts))
+
+        assert [r["reason_cn"] for r in out] == [f"属于f{i}" for i in range(5)]
+
+    def test_empty_content_post_does_not_shift_the_rest(self):
+        """空内容帖不会被送去分析，它在批次里的那个空位不能把后面的结论顶偏"""
+        from app.services.sentiment_service import SentimentService
+
+        all_posts, fp_to_idx, pending = self._fixture([2, 3])
+        pending[0]["content"] = ""                       # 第 3 条是空帖，不分析
+        r3 = {"sentiment": "positive", "intensity": 4, "reason_cn": "属于f3", "dimensions": []}
+
+        out = SentimentService._to_absolute([None, r3], pending, [], fp_to_idx, len(all_posts))
+
+        assert out[2] is None
+        assert out[3] == r3, "空帖占位不能让后一条结论落到它自己的位置上"
+
+
 class TestExportWorkbookEndToEnd:
     """用户下载到的那份报告 —— 结构、排版与脏数据容错"""
 

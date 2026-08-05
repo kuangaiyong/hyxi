@@ -2,11 +2,9 @@
 
 import json
 import re
-import os
 import asyncio
 import logging
 from typing import List, Optional
-from app.collectors import get_collector
 from app.services.post_tree import post_key
 from app.services.progress_manager import ProgressManager
 from app.services.llm_service import LLMService
@@ -16,7 +14,6 @@ from app.services.storage import (
     mark_sentiment_analyzed as db_mark_sentiment_analyzed,
 )
 from app.models import LLMConfig
-from app.config import settings
 
 logger = logging.getLogger("hyxi.sentiment")
 

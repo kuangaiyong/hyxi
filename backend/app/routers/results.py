@@ -1,9 +1,7 @@
 """结果查询端点"""
 
-import os
 import re
 import csv
-import json
 from io import StringIO
 from collections import Counter
 from datetime import datetime
@@ -11,7 +9,6 @@ from urllib.parse import quote
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 from app.models import PostsResponse, PostData, TaskStats
-from app.config import settings
 from app.services import source_service, storage
 from app.services.excel_service import (
     ExcelService, EXPORT_COLUMNS, SENTIMENT_CN, UNANALYZED,

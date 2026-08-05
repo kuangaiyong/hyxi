@@ -1,7 +1,5 @@
 """定时任务调度服务 - 基于 APScheduler + SQLite"""
 
-import os
-import json
 import uuid
 import asyncio
 import logging

@@ -336,8 +336,6 @@ class SentimentService:
             results, posts, existing_results, fp_to_idx, total_all
         )
 
-        # 保存结果到 JSON
-        sentiment_path = os.path.join(settings.data_dir, f"sentiment_{task_id}.json")
         # 全量总数：优先用 fp_to_idx 的长度（最准确），其次为已有结果+本次分析数
         if fp_to_idx:
             all_total = len(fp_to_idx)
@@ -359,15 +357,9 @@ class SentimentService:
             "results": results,
         }
 
-        os.makedirs(os.path.dirname(sentiment_path), exist_ok=True)
-        with open(sentiment_path, "w", encoding="utf-8") as f:
-            json.dump(output, f, ensure_ascii=False, indent=2)
-
-        # 同时保存到 SQLite
-        try:
-            db_save_sentiment(task_id, output)
-        except Exception:
-            pass
+        # 落库。results 的下标在这里还对得上 all_posts，存储层立刻把它换成
+        # (source_id, fingerprint) —— 下标只在写入现场有意义
+        db_save_sentiment(task_id, output, all_posts or posts)
 
         # 保存帖子的 _processed 标记回源 JSON（按指纹匹配）。
         # 不再 glob `tweakers_thread_*.json` —— 文件名只有 Collector.output_path() 一个来源。

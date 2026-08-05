@@ -1,13 +1,15 @@
 # 敏感配置
 .env
 .scraper_state.json
+
+# 运行时数据。持久化已统一到 hyxi.db，下面几条 JSON 是迁移前的遗留形态，
+# 保留规则是为了让老部署升上来时不会把它们误提交
 backend/data/config.json
 backend/data/scheduler.db
-
-# 运行时数据
 backend/data/tasks.json
 backend/data/scheduled_tasks.json
 backend/data/sentiment_*.json
+backend/data/_migrated_backup/
 backend/data/exports/
 backend/data/hyxi.db*
 backend/data/logs/

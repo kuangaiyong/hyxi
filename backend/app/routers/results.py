@@ -12,12 +12,12 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 from app.models import PostsResponse, PostData, TaskStats
 from app.config import settings
-from app.services import source_service
+from app.services import source_service, storage
 from app.services.excel_service import (
     ExcelService, EXPORT_COLUMNS, SENTIMENT_CN, UNANALYZED,
 )
 from app.services.post_tree import build_tree, order_by_thread, post_key
-from app.services.orchestrator import orchestrator, _load_posts_from_sources
+from app.services.orchestrator import orchestrator, load_task_posts
 
 router = APIRouter(prefix="/api/v1/tasks/{task_id}", tags=["结果"])
 
@@ -44,40 +44,6 @@ def _get_task_or_404(task_id: str):
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
     return task
-
-
-def _load_posts_from_json(task: dict) -> list:
-    """从各数据源已落盘的 JSON 兜底加载。
-
-    不再靠猜 thread_id、也不再 glob `tweakers_thread_*.json` —— 文件名只有
-    `Collector.output_path()` 一个来源。任务里记了采过哪些源就只读那几个，
-    没记（比如任务还没跑完）就退回全部已注册的源。
-    """
-    recorded = (task.get("result") or {}).get("sources", [])
-    if not recorded:
-        posts, _meta = _load_posts_from_sources(source_service.list_sources())
-        return posts
-
-    registered = {s["id"]: s for s in source_service.list_sources()}
-    posts = []
-    for entry in recorded:
-        sid = entry.get("id")
-        source = registered.get(sid)
-        if source:
-            mine, _meta = _load_posts_from_sources([source])
-            posts.extend(mine)
-            continue
-        # 来源已被用户删除。任务结果里记了当时的落盘路径，照原路读回来 ——
-        # 否则一次「删数据源」会把所有引用它的历史任务结果一起变成空白
-        path = entry.get("output_path")
-        if not path or not os.path.exists(path):
-            continue
-        with open(path, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
-        for p in loaded.get("posts", []):
-            p.setdefault("source", sid)
-        posts.extend(loaded.get("posts", []))
-    return posts
 
 
 def _source_names(task: dict = None) -> dict:
@@ -164,7 +130,7 @@ async def get_posts(
     # 优先从内存，fallback 到各数据源落盘的 JSON
     posts = (task.get("result") or {}).get("posts") or []
     if not posts:
-        posts = _load_posts_from_json(task)
+        posts = load_task_posts(task)
 
     roots, children = build_tree(posts)
     hit_keys = set()
@@ -222,7 +188,7 @@ async def get_post_detail(task_id: str, post_index: int):
     result = task.get("result") or {}
     posts = result.get("posts") or []
     if not posts:
-        posts = _load_posts_from_json(task)
+        posts = load_task_posts(task)
 
     if post_index < 0 or post_index >= len(posts):
         raise HTTPException(status_code=404, detail="帖子不存在")
@@ -236,7 +202,7 @@ async def get_stats(task_id: str):
     task = _get_task_or_404(task_id)
     posts = (task.get("result") or {}).get("posts") or []
     if not posts:
-        posts = _load_posts_from_json(task)
+        posts = load_task_posts(task)
 
     usernames = [p.get("username", "") for p in posts]
     counter = Counter(usernames)
@@ -266,17 +232,13 @@ async def get_stats(task_id: str):
 
 # ===== 导出 =====
 
-def _own_sentiment(task_id: str) -> dict:
-    """只读本任务自己的舆情文件。
+def _own_sentiment(task_id: str, posts: list) -> dict:
+    """只读本任务自己的舆情结论，按 posts 顺序还原成下标数组。
 
-    **不走 get_sentiment() 那套跨任务 fallback** —— 页面上拿别的任务的结论顶一下还算
-    有点用，把它写进一份署着本任务名的报告里则是彻底的错。
+    **不取别的任务的结果来顶** —— 页面上顶一下还算有点用，写进一份署着本任务名的
+    报告里则是彻底的错。
     """
-    path = os.path.join(settings.data_dir, f"sentiment_{task_id}.json")
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return storage.get_sentiment(task_id, posts) or {}
 
 
 def _export_rows(task: dict, posts: list, results: list) -> list:
@@ -343,11 +305,11 @@ async def export_report(task_id: str, format: str = Query("xlsx")):
     task = _get_task_or_404(task_id)
     posts = (task.get("result") or {}).get("posts") or []
     if not posts:
-        posts = _load_posts_from_json(task)
+        posts = load_task_posts(task)
     if not posts:
         raise HTTPException(status_code=404, detail="无帖子数据")
 
-    sentiment = _own_sentiment(task_id)
+    sentiment = _own_sentiment(task_id, posts)
     rows = _export_rows(task, posts, sentiment.get("results") or [])
 
     if fmt == "csv":
@@ -387,7 +349,7 @@ async def trigger_sentiment_analysis(task_id: str):
     result = task.get("result") or {}
     posts = result.get("posts") or []
     if not posts:
-        posts = _load_posts_from_json(task)
+        posts = load_task_posts(task)
     if not posts:
         raise HTTPException(status_code=400, detail="没有可分析的帖子数据")
 
@@ -404,13 +366,8 @@ async def trigger_sentiment_analysis(task_id: str):
             msg = f"所有有内容的帖子已完成舆情分析（{pending_empty} 条空内容帖子已跳过）"
         return {"message": msg, "task_id": task_id, "status": "completed"}
 
-    # 只读本任务自己的舆情文件：猜来的文件会被当作 existing_results 合并后写回目标任务
-    existing_results = {}
-    sentiment_path = os.path.join(settings.data_dir, f"sentiment_{task_id}.json")
-    if os.path.exists(sentiment_path):
-        with open(sentiment_path, "r", encoding="utf-8") as f:
-            existing_data = json.load(f)
-            existing_results = existing_data.get("results", [])
+    # 只取本任务自己的结论：别的任务的结果被当作 existing_results 合并后会写回本任务
+    existing_results = _own_sentiment(task_id, posts).get("results") or []
 
     # 后台启动分析（仅分析增量帖子，合并已有结果）
     orchestrator.run_sentiment_async(task_id, posts, pending, existing_results)
@@ -428,21 +385,19 @@ async def trigger_sentiment_analysis(task_id: str):
 
 @router.get("/sentiment")
 async def get_sentiment_result(task_id: str):
-    """获取舆情分析结果（优先 SQLite，其次本任务的 JSON 文件）"""
-    # 校验任务存在：task_id 会被拼进文件路径，未校验则可构造穿越路径读取任意文件
-    _get_task_or_404(task_id)
+    """获取舆情分析结果。
 
-    # 优先从 SQLite 获取
-    from app.services.storage import get_sentiment
-    result = get_sentiment(task_id)
+    结论按帖子身份存，这里按当前帖子顺序还原成前端要的下标数组。
+    """
+    task = _get_task_or_404(task_id)
+
+    posts = (task.get("result") or {}).get("posts") or []
+    if not posts:
+        posts = load_task_posts(task)
+
+    result = _own_sentiment(task_id, posts)
     if result:
         return result
-
-    # Fallback: JSON 文件
-    sentiment_path = os.path.join(settings.data_dir, f"sentiment_{task_id}.json")
-    if os.path.exists(sentiment_path):
-        with open(sentiment_path, "r", encoding="utf-8") as f:
-            return json.load(f)
 
     # 检查是否正在分析
     if orchestrator.is_sentiment_running(task_id):

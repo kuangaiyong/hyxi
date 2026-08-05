@@ -727,18 +727,22 @@ class TestExportEndpointEndToEnd:
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 
     def _write_sentiment(self, results):
-        """舆情结果按**扁平数组**下标对齐（下标来自 enumerate(all_posts)）"""
-        path = os.path.join(self.tmpdir, f"sentiment_{self.task_id}.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"total": len(results), "success": len(results), "failed": 0,
-                       "summary": {"top_dimensions": []}, "results": results}, f,
-                      ensure_ascii=False)
-        return path
+        """入库时 results 仍按**扁平数组**下标给（下标来自 enumerate(all_posts)），
+        存储层负责换成 (source_id, fingerprint)"""
+        self.storage.save_sentiment(self.task_id, {
+            "analyzed_at": "2026-08-05T10:00:00",
+            "summary": {"top_dimensions": []},
+            "results": results,
+        }, self.posts)
 
     def _drop_sentiment(self):
-        path = os.path.join(self.tmpdir, f"sentiment_{self.task_id}.json")
-        if os.path.exists(path):
-            os.remove(path)
+        conn = self.storage._get_conn()
+        try:
+            conn.execute("DELETE FROM sentiment_runs WHERE task_id = ?", (self.task_id,))
+            conn.execute("DELETE FROM sentiment_results WHERE task_id = ?", (self.task_id,))
+            conn.commit()
+        finally:
+            conn.close()
 
     def _csv_rows(self):
         import csv as _csv

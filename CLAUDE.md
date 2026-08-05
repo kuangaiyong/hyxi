@@ -65,7 +65,7 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
     │
     ├── app/routers/config.py      LLM 配置 CRUD + 连接测试 + 重置
     ├── app/routers/tasks.py       任务提交/列表/取消/删除/重试 + SSE 进度流
-    ├── app/routers/results.py     帖子查询(含搜索)/统计/CSV+JSON+Excel下载 + 舆情触发
+    ├── app/routers/results.py     帖子查询(含搜索)/统计/唯一导出口 + 舆情触发与查询
     ├── app/routers/schedules.py   定时任务 CRUD + 预设 + 手动触发
     ├── app/routers/sources.py     数据源 CRUD + 采集器清单 + 凭据录入/清除
     │
@@ -78,35 +78,48 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
     ├── app/services/collector_runner.py 驱动 Node 采集脚本（job.json + NDJSON，超时 + 取消清理）
     ├── app/services/post_tree.py       跨来源索引键 + 出口组树（存储层始终扁平）
     ├── app/services/translator_service.py LLM 翻译（5 条/批 + 失败条目单条重译）
-    ├── app/services/sentiment_service.py  LLM 舆情分析（3 条/批，双写 JSON + SQLite）
+    ├── app/services/sentiment_service.py  LLM 舆情分析（3 条/批，结论按帖子身份落库）
     ├── app/services/excel_service.py   openpyxl 生成双语 Excel + 舆情报告
-    ├── app/services/storage.py         SQLite 存储层（tasks/sentiment/sources/credentials）
+    ├── app/services/storage.py         SQLite 存储层（全部持久化，见「持久化」一节）
     ├── app/services/progress_manager.py SSE 事件广播 (asyncio.Queue pub/sub 单例)
     └── app/services/scheduler_service.py APScheduler（SQLAlchemyJobStore，Asia/Shanghai）
 ```
 
-三个模块级全局单例：`orchestrator`、`progress_manager`、`scheduler_service`。`orchestrator` 在 **import 时**就执行 `init_db()` + `migrate_from_json()` + 加载历史任务，所以测试里改 `settings.data_dir` 必须在 import orchestrator **之前**完成（`tests/test_api.py` 的 `setup_class` 就是这个顺序）。
+三个模块级全局单例：`orchestrator`、`progress_manager`、`scheduler_service`。`orchestrator` 在 **import 时**就执行 `init_db()` + `migrate_from_json()` + 加载历史任务 + 舆情迁移，所以测试里改 `settings.data_dir` 与 `storage.DB_PATH` 必须在 import orchestrator **之前**完成（`tests/test_api.py` 的 `setup_class` 就是这个顺序）。
+
+`orchestrator = TaskOrchestrator()` **必须留在 orchestrator.py 末尾**：`__init__` 里的舆情迁移要调用同模块的 `load_task_posts()`，在它定义之前实例化会得到一串 `NameError`（实测踩过，靠 `except` 兜住才没炸出来）。
 
 配置走 pydantic-settings，环境变量前缀 **`TWEAKERS_`**（如 `TWEAKERS_MAX_CONCURRENT_TASKS=2`）。默认 `max_concurrent_tasks=1`、`task_timeout_minutes=30`。
 
 ## 持久化
 
-| 存储 | 用途 |
+**业务数据一律进 `backend/data/hyxi.db`（WAL 模式），不再有 JSON 存储。**
+
+| 表 | 用途 |
 |------|------|
-| `backend/data/hyxi.db` | **主存储** — tasks / sentiment / sources / credentials 四张表（WAL 模式） |
-| `backend/data/config.json` | LLM API 配置（含明文 API Key，已 gitignore） |
-| `backend/data/tasks.json` | JSON 回退存储（仅 SQLite 不可用时启用） |
-| `backend/data/sentiment_{task_id}.json` | 舆情结果（与 DB 双写） |
-| `backend/data/scheduler.db` | APScheduler job store |
-| `backend/data/scheduled_tasks.json` | 定时任务业务配置（与 job store 分离） |
-| `backend/data/exports/*.xlsx` | 生成的 Excel |
-| `backend/data/media/{source_id}/*` | 采集时下载的正文图（已 gitignore） |
+| `tasks` | 任务记录（plan / result / logs 是形状可变的不透明块，留在 JSON 列里） |
+| `sentiment_runs` | 一次舆情分析的元信息 + summary（纯派生的聚合结果） |
+| `sentiment_results` | **舆情结论，按 `(task_id, source_id, fingerprint)` 存** |
+| `sources` / `credentials` | 数据源与加密凭据，`ON DELETE CASCADE` |
+| `app_config` | LLM 配置，按 `llm.api_key` / `llm.base_url` / `llm.model_name` 分列 |
+| `schedules` | 定时任务业务配置 |
+| `apscheduler_jobs` | APScheduler 自建，调度触发器 |
+
+| 非数据库文件 | 说明 |
+|------|------|
+| `backend/data/media/{source_id}/*` | 采集下载的正文图（二进制，已 gitignore） |
 | `backend/data/logs/app.log` | 滚动日志（5MB x 3） |
-| `tweakers_thread_{id}.json` | **项目根目录**，抓取的原始帖子数据，也是翻译结果的落盘位置 |
+| `backend/data/jobs/*.json` | 交给采集子进程的入参，**用完即删的 IPC，不是持久化** |
+| `backend/data/sessions/{source_id}.json` | Playwright `storageState`。它只认文件路径，且是可重建的运行时缓存，丢了只是重新登录一次 |
+| `tweakers_thread_{id}.json` 等 | **项目根目录**，抓取的原始帖子数据（阶段 3 会进库） |
 
-**存储策略**：启动时 `init_db()` 建表，然后 `migrate_from_json()` 在 tasks 表为空时把历史 JSON 迁进来。DB 不可用则整体回退 JSON（`self._db_ready` 开关）。每次任务变更走 `_persist()` → 对所有内存任务逐条 upsert。
+**为什么不留双写**：同一份数据存两处、两个读者各读一份，必然长出「改了一边、另一边还是旧的」的 bug。实测踩过：修完 `sentiment_*.json` 后 `/sentiment` 仍返回旧数据，因为它读 SQLite 而 `/export` 读 JSON。
 
-定时任务是**双份存储**：调度触发器在 `scheduler.db`，业务配置（description / interval / enabled / history）在 `scheduled_tasks.json`。改定时任务逻辑时两边要同步（`SchedulerService.update()` 就是先写 JSON，再 `remove_job` + `_add_job`）。
+**舆情结论按帖子身份存，不按下标**。下标只在写入现场有意义 —— 离开那里就没人能保证它对得上哪条帖子（已因此出过一次事故，见「常见陷阱」）。`storage.save_sentiment()` 收到的仍是下标数组，落库时立刻换成 `(source_id, fingerprint)`；`get_sentiment(task_id, posts)` 再按当前帖子顺序还原成前端要的下标数组，**API 响应形状不变**。副作用是 `total` / `failed` 现在按当前帖子实算，而不是分析那一刻冻结的数字 —— `/sentiment` 因此与 `/posts`、`/stats`、`/export` 报同一个数。
+
+`intensity` 列必须是 `NUMERIC` 不能是 `REAL`：REAL 亲和性会把整数 3 存成 3.0，导出的强度列跟着变成「3.0」。
+
+**迁移**：启动时 `migrate_from_json()` 幂等执行，源文件移进 `data/_migrated_backup/` 而不是删掉。舆情从旧的整块 JSON 列搬到键控表时，靠一条**可检验的不变量**兜底 —— 凡是 `results[i]` 有结论，第 i 条帖子必须已带 `sentiment_at`；对不上就整份跳过并保留原数据。某个来源的落盘文件被删导致结果比帖子多时，只迁对得上的前缀，尾部丢弃并打 warning。
 
 ## 数据源与凭据
 
@@ -241,7 +254,7 @@ GET    /api/v1/tasks/{id}/stats        任务统计
 GET    /api/v1/tasks/{id}/export       **唯一的导出口**（?format=xlsx|csv）
 
 POST   /api/v1/tasks/{id}/sentiment           触发舆情分析（增量）
-GET    /api/v1/tasks/{id}/sentiment           获取舆情结果（含跨任务 fallback）
+GET    /api/v1/tasks/{id}/sentiment           获取舆情结果（只读本任务）
 GET    /api/v1/tasks/{id}/sentiment/events    舆情分析 SSE 流
 
 GET    /api/v1/config                LLM 配置（不含 api_key）
@@ -298,7 +311,7 @@ translate 和 generate_excel 在 context 里没有 posts 时会**从各数据源
 
 ## 测试
 
-**187 个测试，必须全部 PASSED**（本机实测 `187 passed in 264s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**203 个测试，必须全部 PASSED**（本机实测 `203 passed in 245s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
@@ -328,10 +341,9 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 
 - **增量机制**：每个帖子有 fingerprint，各步骤执行前检查 `_processed` 标记跳过已处理帖子
 - **SSE 进度推送**：`progress_manager` 按 task_id 做 pub/sub，30s 无事件发 `: keepalive` 注释帧防代理断连
-- **舆情按 task_id 命名但跨任务复用**：`get_sentiment()` 先查本任务，查不到则 fallback 到最新一条舆情数据；`_find_sentiment_file()` 还会用「帖子总数匹配」猜哪个文件对应当前数据
-- **舆情双写**：结果同时写 SQLite 和 JSON 文件；但 `/export` 只读 `sentiment_{task_id}.json`，不读 DB
+- **舆情结果只属于本任务，绝不跨任务顶替**：曾经查不到就 fallback 到最新一条，而那份结果是按别的任务的帖子列表编号的，取来与当前帖子完全对不上；更糟的是增量分析会把它当作 `existing_results` 合并后持久化，直接污染目标任务
 - **导出只有一个口**：`GET /export?format=xlsx|csv` 出一份含原文 + 译文 + 舆情结论的文件，界面入口只在舆情页。**报告每次下载现算、不落盘**（`ExcelService.build_export` 返回字节流）——落盘既会在 `exports/` 堆垃圾，两个人同时下载还会撞成一个在写另一个在读。流水线的 `generate_excel` 步骤照旧生成它自己那份，但那份不再被任何人下载
-- **导出取舆情不走 `get_sentiment()` 的跨任务 fallback**：页面上拿别的任务的结论顶一下还算有点用，把它写进一份署着本任务名的报告里则是彻底的错，所以 `_own_sentiment()` 只读本任务的文件
+- **导出取舆情不走 `get_sentiment()` 的跨任务 fallback**：页面上拿别的任务的结论顶一下还算有点用，把它写进一份署着本任务名的报告里则是彻底的错，所以 `_own_sentiment()` 只读本任务的结论
 - **LLM 重试分两层，别混为一谈**：`_retry_with_backoff` 是**传输层**指数退避（3 次，1s/2s/4s），只管 429/5xx；**解析失败是另一回事**——批量输出靠分隔符切分，LLM 偶尔在某一段吐出非 JSON，那一条会被记成 `{"sentiment": null, "reason_cn": "解析失败"}`。翻译和舆情都在批量之后补一轮**单条重试**（单条不必切分隔符，解析可靠得多），实测真实任务里 88 条中的 2 条因此救回。单条重试必须复用批量那份 prompt 片段（`_post_block`），来源标签和父贴上文少给一样就成了另一道题
 - **翻译用 LLM 而非 Google Translate**：5 条/批 + `---POST_SEPARATOR---` 切分，解析失败的条目再单条重译。源文本可能是荷兰语或英语且批内混杂，**「译文与原文一字不差且原文非中文」判为漏译**，走同一条单条重译队列
 - **舆情维度是封闭集合**：`DEFAULT_DIMENSIONS` 那 14 个。`_normalize_dimensions()` 把 LLM 返回的标签对齐回去（实测它会把 `认证/合规(如Synergrid)` 简写成 `认证/合规`，于是同一维度在 `top_dimensions` 和 `cross_source` 里各占一行），对不上的直接丢弃。维度表的全部价值就在于它封闭，一碎成近义标签跨来源对比就废了

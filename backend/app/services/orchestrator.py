@@ -18,7 +18,12 @@ from app.services.collector_runner import CollectorRunner, ManualAuthRequired
 from app.services.translator_service import TranslatorService
 from app.services.excel_service import ExcelService
 from app.services.progress_manager import progress_manager
-from app.services.storage import init_db, migrate_from_json, save_task, load_all_tasks, delete_task as db_delete_task
+from app.services.storage import (
+    init_db, migrate_from_json, save_task, load_all_tasks,
+    delete_task as db_delete_task,
+    legacy_sentiment_task_ids, migrate_sentiment_blob, drop_legacy_sentiment_table,
+    discard_legacy_sentiment,
+)
 
 logger = get_logger(__name__)
 
@@ -34,6 +39,29 @@ class TaskOrchestrator:
         init_db()
         migrate_from_json()
         self._load_tasks()
+        self._migrate_sentiment()
+
+    def _migrate_sentiment(self):
+        """把旧的「整份 JSON 一个列」舆情结果换成按帖子身份存。
+
+        放在 _load_tasks 之后：映射需要每个任务当时那批帖子，而那要先有任务记录。
+        """
+        pending = legacy_sentiment_task_ids()
+        if not pending:
+            return
+        for task_id in pending:
+            task = self.tasks.get(task_id)
+            if not task:
+                # 任务已被删除，这份结论从任何接口都够不着了。留着它只会挡住
+                # 旧表的 DROP，让「整份 JSON 一个列」那套永远清不干净
+                logger.warning("舆情 %s 对应的任务已不存在，丢弃这份孤儿结果", task_id)
+                discard_legacy_sentiment(task_id)
+                continue
+            try:
+                migrate_sentiment_blob(task_id, load_task_posts(task))
+            except Exception as e:
+                logger.error("迁移舆情 %s 失败: %s", task_id, e)
+        drop_legacy_sentiment_table()
 
     # ===== 持久化 =====
 
@@ -490,9 +518,6 @@ class TaskOrchestrator:
         asyncio.create_task(_run())
 
 
-# 全局单例
-orchestrator = TaskOrchestrator()
-
 
 def _load_posts_from_sources(sources: List[dict]):
     """从各来源已落盘的 JSON 兜底加载，返回 (posts, sources_meta)。
@@ -524,6 +549,38 @@ def _load_posts_from_sources(sources: List[dict]):
             "post_count": len(mine),
         }
     return posts, meta
+
+
+def load_task_posts(task: dict) -> List[dict]:
+    """一个任务的全量扁平帖子，顺序即「舆情下标 / index 语义」依赖的那个顺序。
+
+    任务里记了采过哪些源就只读那几个，没记（比如还没跑完）就退回全部已注册的源。
+    """
+    recorded = (task.get("result") or {}).get("sources", [])
+    if not recorded:
+        posts, _meta = _load_posts_from_sources(source_service.list_sources())
+        return posts
+
+    registered = {s["id"]: s for s in source_service.list_sources()}
+    posts: List[dict] = []
+    for entry in recorded:
+        sid = entry.get("id")
+        source = registered.get(sid)
+        if source:
+            mine, _meta = _load_posts_from_sources([source])
+            posts.extend(mine)
+            continue
+        # 来源已被用户删除。任务结果里记了当时的落盘路径，照原路读回来 ——
+        # 否则一次「删数据源」会把所有引用它的历史任务结果一起变成空白
+        path = entry.get("output_path")
+        if not path or not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        for p in loaded.get("posts", []):
+            p.setdefault("source", sid)
+        posts.extend(loaded.get("posts", []))
+    return posts
 
 
 def _merge_by_fingerprint(source_posts: list, translated: list) -> list:
@@ -618,3 +675,6 @@ def _resolve_start_page(task: dict, params: dict) -> Optional[int]:
     return ignored if ignored is not None and ignored != resolved else None
 
 
+# 全局单例。**必须放在文件末尾**：__init__ 里的舆情迁移要调用下面那些模块级函数，
+# 在它们定义之前实例化会得到一串 NameError（实测就是这样，靠 except 兜住才没炸）
+orchestrator = TaskOrchestrator()

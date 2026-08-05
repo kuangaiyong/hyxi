@@ -6,6 +6,7 @@ import json
 import tempfile
 import shutil
 import hashlib
+import pytest
 from io import BytesIO
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -791,6 +792,72 @@ class TestJsonToSqliteMigrationEndToEnd:
         assert self.storage.get_app_config("llm") == {}
         assert self.storage.load_schedules() == []
 
+    # ===== 舆情：整份 JSON 一个列 → 按帖子身份存 =====
+
+    def _post(self, fp, analyzed=True):
+        p = {"fingerprint": fp, "source": "src_x", "content": f"内容{fp}"}
+        if analyzed:
+            p["_processed"] = {"sentiment_at": "2026-08-01T10:00:00"}
+        return p
+
+    def _seed_legacy(self, task_id, results):
+        conn = self.storage._get_conn()
+        try:
+            conn.execute("""CREATE TABLE IF NOT EXISTS sentiment (
+                task_id TEXT PRIMARY KEY, data_json TEXT NOT NULL, created_at TEXT NOT NULL)""")
+            conn.execute(
+                "INSERT OR REPLACE INTO sentiment VALUES (?,?,?)",
+                (task_id, json.dumps({
+                    "task_id": task_id, "analyzed_at": "2026-08-01T10:00:00",
+                    "summary": {"top_dimensions": []}, "results": results,
+                }, ensure_ascii=False), "2026-08-01T10:00:00"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_legacy_blob_becomes_identity_keyed(self):
+        posts = [self._post("p1"), self._post("p2")]
+        self._seed_legacy("t", [
+            {"sentiment": "positive", "intensity": 4, "reason_cn": "属于p1", "dimensions": []},
+            {"sentiment": "negative", "intensity": 3, "reason_cn": "属于p2", "dimensions": []},
+        ])
+        assert self.storage.migrate_sentiment_blob("t", posts) is True
+
+        got = self.storage.get_sentiment("t", posts)
+        assert [r["reason_cn"] for r in got["results"]] == ["属于p1", "属于p2"]
+        # intensity 必须还是整数：REAL 亲和性会存成 4.0，导出的强度列跟着变成「4.0」
+        assert got["results"][0]["intensity"] == 4
+        assert isinstance(got["results"][0]["intensity"], int)
+
+    def test_deleted_source_keeps_the_surviving_prefix(self):
+        """某个来源的落盘文件被删后结果比帖子多。尾部救不回来，前缀不该跟着陪葬"""
+        posts = [self._post("p1"), self._post("p2")]
+        self._seed_legacy("t", [
+            {"sentiment": "positive", "intensity": 4, "reason_cn": "属于p1", "dimensions": []},
+            {"sentiment": "negative", "intensity": 3, "reason_cn": "属于p2", "dimensions": []},
+            {"sentiment": "neutral", "intensity": 1, "reason_cn": "归属帖子已不存在", "dimensions": []},
+        ])
+        assert self.storage.migrate_sentiment_blob("t", posts) is True
+
+        got = self.storage.get_sentiment("t", posts)
+        assert [r["reason_cn"] for r in got["results"]] == ["属于p1", "属于p2"]
+        assert got["total"] == 2
+
+    def test_misaligned_blob_is_refused(self):
+        """有结论的位置上帖子却没有 sentiment_at —— 下标对不上，整份放弃。
+
+        宁可留一份没迁进来的，也不能把结论安到别人身上（线上出过这个事故）。
+        """
+        posts = [self._post("p1"), self._post("p2", analyzed=False)]
+        self._seed_legacy("t", [
+            {"sentiment": "positive", "intensity": 4, "reason_cn": "属于p1", "dimensions": []},
+            {"sentiment": "negative", "intensity": 3, "reason_cn": "凭空多出来的结论", "dimensions": []},
+        ])
+        assert self.storage.migrate_sentiment_blob("t", posts) is False
+        assert self.storage.get_sentiment("t", posts) is None
+        assert self.storage.legacy_sentiment_task_ids() == ["t"], "原始数据必须留着"
+
 
 class TestSentimentAbsoluteIndexEndToEnd:
     """舆情结果数组的下标必须是全量帖子数组里的绝对位置。
@@ -1408,14 +1475,107 @@ class TestSentimentIsolationEndToEnd:
         self.storage.DB_PATH = self._old_db
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
+    @staticmethod
+    def _posts(*fps):
+        return [{"fingerprint": f, "source": "src_x", "content": f"内容{f}"} for f in fps]
+
     def test_missing_task_does_not_fall_back_to_another_task(self):
+        posts = self._posts("a1", "a2")
         self.storage.save_sentiment("task-a", {
             "task_id": "task-a", "total": 2, "analyzed_at": "2026-07-30T10:00:00",
             "results": [{"sentiment": "positive"}, {"sentiment": "negative"}],
-        })
-        assert self.storage.get_sentiment("task-a")["task_id"] == "task-a"
+        }, posts)
+        assert self.storage.get_sentiment("task-a", posts)["task_id"] == "task-a"
         # 曾经在这里回退返回最新一条，索引与本任务帖子对不上还会被合并写回
-        assert self.storage.get_sentiment("task-b") is None
+        assert self.storage.get_sentiment("task-b", posts) is None
+
+    def test_results_follow_the_post_not_the_row(self):
+        """结论按 (source_id, fingerprint) 存，帖子顺序变了也不会串位。
+
+        存下标那版做不到这件事 —— 这正是上一个线上 bug 的形状。
+        """
+        posts = self._posts("p1", "p2", "p3")
+        self.storage.save_sentiment("t", {
+            "analyzed_at": "2026-08-05T10:00:00",
+            "results": [
+                {"sentiment": "positive", "intensity": 5, "reason_cn": "属于p1", "dimensions": ["价格/性价比"]},
+                {"sentiment": "negative", "intensity": 4, "reason_cn": "属于p2", "dimensions": []},
+                {"sentiment": "neutral", "intensity": 2, "reason_cn": "属于p3", "dimensions": []},
+            ],
+        }, posts)
+
+        # 换个顺序读回来，结论必须跟着各自的帖子走
+        shuffled = self._posts("p3", "p1", "p2")
+        got = self.storage.get_sentiment("t", shuffled)
+        assert [r["reason_cn"] for r in got["results"]] == ["属于p3", "属于p1", "属于p2"]
+        assert got["results"][0]["dimensions"] == []
+        assert got["results"][1]["dimensions"] == ["价格/性价比"]
+
+    def test_new_posts_read_back_as_unanalyzed(self):
+        """后来新采到的帖子没有结论，占位必须是 None 而不是顶上别人的"""
+        posts = self._posts("p1", "p2")
+        self.storage.save_sentiment("t", {
+            "analyzed_at": "2026-08-05T10:00:00",
+            "results": [{"sentiment": "positive", "reason_cn": "属于p1"},
+                        {"sentiment": "negative", "reason_cn": "属于p2"}],
+        }, posts)
+
+        grown = self._posts("p1", "p2", "p3", "p4")
+        got = self.storage.get_sentiment("t", grown)
+        assert [r and r["reason_cn"] for r in got["results"]] == ["属于p1", "属于p2", None, None]
+        assert got["total"] == 4 and got["success"] == 2 and got["failed"] == 2
+
+    def test_duplicate_identity_does_not_wipe_the_whole_round(self):
+        """同一批里出现两条 (source_id, fingerprint) 相同的帖子，不能把整轮结论搞没。
+
+        指纹只吃 username|timestamp|content[:100]，翻页错位就能撞上。裸 INSERT 会抛
+        IntegrityError 让事务整个回滚 —— 花钱算出来的结论一条都不落库，而任务还在
+        报「分析完成」。
+        """
+        posts = [
+            {"fingerprint": "dup", "source": "src_x", "content": "同一条帖子"},
+            {"fingerprint": "dup", "source": "src_x", "content": "同一条帖子"},
+            {"fingerprint": "other", "source": "src_x", "content": "另一条"},
+        ]
+        self.storage.save_sentiment("t", {
+            "analyzed_at": "2026-08-05T10:00:00",
+            "results": [{"sentiment": "positive", "reason_cn": "第一次"},
+                        {"sentiment": "negative", "reason_cn": "第二次"},
+                        {"sentiment": "neutral", "reason_cn": "属于other"}],
+        }, posts)
+
+        got = self.storage.get_sentiment("t", posts)
+        assert got is not None, "整轮结论被回滚掉了"
+        # 后写覆盖先写，与项目里其它按 post_key 建映射的地方口径一致
+        assert got["results"][0]["reason_cn"] == "第二次"
+        assert got["results"][2]["reason_cn"] == "属于other", "撞键把后面的记录一起带没了"
+
+    def test_save_failure_is_not_swallowed(self):
+        """存不下就必须抛。吞掉异常会让任务报「完成」而库里空空如也"""
+        import sqlite3
+        self.storage.DB_PATH = os.path.join(self.tmpdir, "nonexistent", "no.db")
+        try:
+            with pytest.raises(Exception):
+                self.storage.save_sentiment("t", {
+                    "analyzed_at": "2026-08-05T10:00:00",
+                    "results": [{"sentiment": "positive", "reason_cn": "x"}],
+                }, [{"fingerprint": "p1", "source": "src_x"}])
+        finally:
+            self.storage.DB_PATH = os.path.join(self.tmpdir, "hyxi.db")
+
+    def test_same_fingerprint_across_sources_does_not_collide(self):
+        """指纹不含来源，只按指纹存会让两个平台的同名空帖互相覆盖"""
+        posts = [
+            {"fingerprint": "same", "source": "src_a", "content": "A 平台"},
+            {"fingerprint": "same", "source": "src_b", "content": "B 平台"},
+        ]
+        self.storage.save_sentiment("t", {
+            "analyzed_at": "2026-08-05T10:00:00",
+            "results": [{"sentiment": "positive", "reason_cn": "属于A"},
+                        {"sentiment": "negative", "reason_cn": "属于B"}],
+        }, posts)
+        got = self.storage.get_sentiment("t", posts)
+        assert [r["reason_cn"] for r in got["results"]] == ["属于A", "属于B"]
 
 
 class TestProgressManagerResourceEndToEnd:

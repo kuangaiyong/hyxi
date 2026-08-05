@@ -29,10 +29,31 @@ CREATE TABLE IF NOT EXISTS tasks (
     completed_at TEXT
 );
 
-CREATE TABLE IF NOT EXISTS sentiment (
+-- 旧的 sentiment 表（整份结果连同按下标排列的 results 数组塞在一个 JSON 列里）
+-- 刻意不在这里建：它只应该由老库遗留下来，迁完就 DROP。写进 SCHEMA 会让它
+-- 每次启动又长回来，于是「读哪一份」永远是个选择题
+
+-- 一次舆情分析的元信息。summary 是纯派生的聚合结果，整体读写、不参与查询，
+-- 按前面定的边界可以留在 JSON 列里
+CREATE TABLE IF NOT EXISTS sentiment_runs (
     task_id TEXT PRIMARY KEY,
-    data_json TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    analyzed_at TEXT NOT NULL,
+    summary_json TEXT NOT NULL DEFAULT '{}'
+);
+
+-- 结论**按帖子身份存**，不按下标。下标一旦离开写入现场就没人能保证它还对得上：
+-- 已经因此出过一次事故（批次内下标被当成全量位置存盘，结论整体挂到别人身上）
+CREATE TABLE IF NOT EXISTS sentiment_results (
+    task_id         TEXT NOT NULL,
+    source_id       TEXT NOT NULL,
+    fingerprint     TEXT NOT NULL,
+    sentiment       TEXT,
+    -- NUMERIC 而非 REAL：REAL 亲和性会把整数 3 存成 3.0，导出的强度列于是从
+    -- 「3」变成「3.0」。NUMERIC 保留原样，整数还是整数
+    intensity       NUMERIC,
+    reason_cn       TEXT NOT NULL DEFAULT '',
+    dimensions_json TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (task_id, source_id, fingerprint)
 );
 
 CREATE TABLE IF NOT EXISTS sources (
@@ -72,7 +93,6 @@ CREATE TABLE IF NOT EXISTS schedules (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_sentiment_created ON sentiment(created_at DESC);
 """
 
 
@@ -296,37 +316,194 @@ def delete_task(task_id: str) -> bool:
 
 # ===== Sentiment CRUD =====
 
-def save_sentiment(task_id: str, data: dict):
-    """保存舆情分析结果"""
+def _post_identity(post: dict) -> tuple:
+    """(source_id, fingerprint)。与 post_tree.post_key() 同一套口径，
+    历史数据没有 source 时缺省填 tweakers"""
+    return (post.get("source") or "tweakers", post.get("fingerprint") or "")
+
+
+def save_sentiment(task_id: str, data: dict, posts: List[dict]) -> None:
+    """保存舆情分析结果。
+
+    `data["results"]` 按扁平数组下标排列，落库时立刻换成 (source_id, fingerprint)。
+    **下标只在写入现场有意义** —— 离开这里就再没人能保证它对得上哪条帖子。
+    """
+    results = data.get("results") or []
+    rows = []
+    for i, post in enumerate(posts):
+        if i >= len(results):
+            break
+        r = results[i]
+        if not r:
+            continue
+        source_id, fingerprint = _post_identity(post)
+        if not fingerprint:
+            continue
+        rows.append((
+            task_id, source_id, fingerprint, r.get("sentiment"), r.get("intensity"),
+            r.get("reason_cn") or "",
+            json.dumps(r.get("dimensions") or [], ensure_ascii=False),
+        ))
+
     conn = _get_conn()
     try:
         conn.execute(
-            "INSERT OR REPLACE INTO sentiment (task_id, data_json, created_at) VALUES (?,?,?)",
-            (task_id, json.dumps(data, ensure_ascii=False), data.get("analyzed_at", datetime.now().isoformat())),
+            "INSERT OR REPLACE INTO sentiment_runs (task_id, analyzed_at, summary_json) VALUES (?,?,?)",
+            (task_id, data.get("analyzed_at") or datetime.now().isoformat(),
+             json.dumps(data.get("summary") or {}, ensure_ascii=False)),
+        )
+        # 整轮覆盖：analyze() 传进来的 results 已经是「已有结果 + 本轮新增」的全量
+        conn.execute("DELETE FROM sentiment_results WHERE task_id = ?", (task_id,))
+        # OR REPLACE 而非裸 INSERT：同一批 posts 里出现两条 (source_id, fingerprint)
+        # 相同的记录并非不可能（指纹只吃 username|timestamp|content[:100]，翻页错位
+        # 就能撞上）。裸 INSERT 会抛 IntegrityError 让整个事务回滚 —— 这一轮
+        # 花钱算出来的结论一条都存不下，而调用方还在报「分析完成」
+        conn.executemany(
+            """INSERT OR REPLACE INTO sentiment_results
+               (task_id, source_id, fingerprint, sentiment, intensity, reason_cn, dimensions_json)
+               VALUES (?,?,?,?,?,?,?)""",
+            rows,
         )
         conn.commit()
     except Exception as e:
+        # 必须往上抛：结论只在内存里，存不下就是真的没了。吞掉异常会让任务
+        # 报「完成」而库里空空如也，用户永远不知道该重跑
         logger.error("保存舆情结果失败: %s", str(e))
+        raise
     finally:
         conn.close()
 
 
-def get_sentiment(task_id: str) -> Optional[dict]:
-    """获取舆情分析结果
+def get_sentiment(task_id: str, posts: List[dict]) -> Optional[dict]:
+    """按 posts 的顺序重建 results 数组，返回与旧版逐字段一致的结构。
 
-    只按 task_id 精确匹配。曾经在查不到时回退返回最新一条，但结果里的 index 是按各自
-    任务的帖子列表编号的，跨任务取来会与当前帖子完全对不上；更糟的是增量分析会把它
-    当作 existing_results 合并后持久化，直接污染目标任务。
+    只按 task_id 精确匹配。曾经在查不到时回退返回最新一条，但那份结果是按别的
+    任务的帖子列表编号的，取来与当前帖子完全对不上；更糟的是增量分析会把它当作
+    existing_results 合并后持久化，直接污染目标任务。
     """
     conn = _get_conn()
     try:
-        row = conn.execute("SELECT * FROM sentiment WHERE task_id = ?", (task_id,)).fetchone()
-        if row:
-            return json.loads(row["data_json"])
-        return None
+        run = conn.execute(
+            "SELECT * FROM sentiment_runs WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if not run:
+            return None
+        by_identity = {
+            (r["source_id"], r["fingerprint"]): {
+                "sentiment": r["sentiment"],
+                "intensity": r["intensity"],
+                "reason_cn": r["reason_cn"],
+                "dimensions": json.loads(r["dimensions_json"] or "[]"),
+            }
+            for r in conn.execute(
+                "SELECT * FROM sentiment_results WHERE task_id = ?", (task_id,)
+            ).fetchall()
+        }
     except Exception as e:
         logger.error("获取舆情结果失败: %s", str(e))
         return None
+    finally:
+        conn.close()
+
+    results = [by_identity.get(_post_identity(p)) for p in posts]
+    return {
+        "task_id": task_id,
+        "analyzed_at": run["analyzed_at"],
+        "total": len(posts),
+        "success": sum(1 for r in results if r and r.get("sentiment")),
+        "failed": sum(1 for r in results if not r or not r.get("sentiment")),
+        "summary": json.loads(run["summary_json"] or "{}"),
+        "results": results,
+    }
+
+
+def legacy_sentiment_task_ids() -> List[str]:
+    """旧 sentiment 表里还没迁进 sentiment_runs 的 task_id"""
+    conn = _get_conn()
+    try:
+        rows = conn.execute("""
+            SELECT s.task_id FROM sentiment s
+            LEFT JOIN sentiment_runs r ON r.task_id = s.task_id
+            WHERE r.task_id IS NULL
+        """).fetchall()
+        return [r["task_id"] for r in rows]
+    except Exception:
+        return []          # 老库没有 sentiment 表就没什么可迁的
+    finally:
+        conn.close()
+
+
+def migrate_sentiment_blob(task_id: str, posts: List[dict]) -> bool:
+    """把一份按下标排列的旧结果换成按身份存。posts 必须是当时那个扁平数组。
+
+    对齐用一条可检验的不变量兜底：**凡是 results[i] 有结论，第 i 条帖子必须已带
+    sentiment_at**。对不上就整份跳过 —— 宁可留一份没迁进来的，也不能把结论安到
+    别人身上（上一个 bug 正是这么产生的）。
+    """
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT data_json FROM sentiment WHERE task_id = ?", (task_id,)
+        ).fetchone()
+    except Exception:
+        return False       # 新库压根没有这张表
+    finally:
+        conn.close()
+    if not row:
+        return False
+
+    data = json.loads(row["data_json"])
+    results = data.get("results") or []
+
+    # 结果比帖子多，通常是某个来源的落盘文件后来被删了（尾部那些结论的归属帖子
+    # 已经不存在）。**不能因此整份放弃** —— 前缀仍然对得上就该救回来，
+    # 校验交给下面的不变量，而不是靠长度一票否决
+    usable = min(len(results), len(posts))
+    if len(results) > len(posts):
+        logger.warning("舆情 %s 有 %d 条结果但只剩 %d 条帖子，尾部 %d 条的归属帖子已不存在，"
+                       "只迁前 %d 条", task_id, len(results), len(posts),
+                       len(results) - usable, usable)
+
+    for i in range(usable):
+        r = results[i]
+        if r and r.get("sentiment") and not (posts[i].get("_processed") or {}).get("sentiment_at"):
+            logger.error("舆情 %s 第 %d 条有结论但帖子没有 sentiment_at 标记，"
+                         "下标对不上，跳过迁移", task_id, i)
+            return False
+
+    save_sentiment(task_id, data, posts)
+    logger.info("舆情 %s 已按帖子身份重存 %d 条结论", task_id, usable)
+    return True
+
+
+def discard_legacy_sentiment(task_id: str) -> None:
+    """丢弃一份任务已不存在的旧结果。它从任何接口都够不着，只会挡住旧表的 DROP"""
+    conn = _get_conn()
+    try:
+        conn.execute("DELETE FROM sentiment WHERE task_id = ?", (task_id,))
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+
+def drop_legacy_sentiment_table() -> None:
+    """全部迁完后删掉旧表。留着就是给「读哪一份」留了个选择题"""
+    conn = _get_conn()
+    try:
+        remaining = conn.execute("""
+            SELECT COUNT(*) FROM sentiment s
+            LEFT JOIN sentiment_runs r ON r.task_id = s.task_id
+            WHERE r.task_id IS NULL
+        """).fetchone()[0]
+        if remaining:
+            return
+        conn.execute("DROP TABLE IF EXISTS sentiment")
+        conn.commit()
+        logger.info("旧 sentiment 表已删除")
+    except Exception as e:
+        logger.warning("删除旧 sentiment 表失败: %s", e)
     finally:
         conn.close()
 

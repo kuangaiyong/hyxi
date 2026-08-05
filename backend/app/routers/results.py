@@ -2,13 +2,20 @@
 
 import os
 import re
+import csv
 import json
+from io import StringIO
 from collections import Counter
+from datetime import datetime
+from urllib.parse import quote
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from app.models import PostsResponse, PostData, TaskStats
 from app.config import settings
 from app.services import source_service
+from app.services.excel_service import (
+    ExcelService, EXPORT_COLUMNS, SENTIMENT_CN, UNANALYZED,
+)
 from app.services.post_tree import build_tree, order_by_thread, post_key
 from app.services.orchestrator import orchestrator, _load_posts_from_sources
 
@@ -80,6 +87,45 @@ def _source_names(task: dict = None) -> dict:
         if entry.get("id"):
             names.setdefault(entry["id"], entry.get("name") or entry["id"])
     return names
+
+
+_FILENAME_BAD = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
+
+
+def _safe_segment(text: str, limit: int = 20) -> str:
+    """来源名要进文件名：剔掉 Windows 不接受的字符，空白收成连字符，再截断"""
+    cleaned = _FILENAME_BAD.sub("", text)
+    # strip 放在截断之后：先 strip 再截，正好切在连字符上就会留一个尾巴
+    return re.sub(r"\s+", "-", cleaned)[:limit].strip("-. ")
+
+
+def _export_filename(task: dict, task_id: str, kind: str, ext: str) -> str:
+    """下载文件名：`HYXi舆情_{内容类型}_{来源}_{任务ID前8位}_{导出时间}{ext}`
+
+    每次下载现算，所以时间是用户点下载的那一刻。**不能拿落盘名当下载名** ——
+    任务 Excel 是任务跑完那一刻生成的，同一份文件下载十次都会带着同一个时间戳，
+    而且那个名字里根本没有来源。
+    """
+    names = _source_names(task)
+    labels = [
+        _safe_segment(names.get(s.get("id")) or s.get("name") or "")
+        for s in (task.get("result") or {}).get("sources", [])
+    ]
+    labels = [x for x in labels if x]
+    parts = ["HYXi舆情", kind]
+    if len(labels) == 1:
+        parts.append(labels[0])
+    elif labels:
+        parts.append(f"{len(labels)}个来源")
+    parts += [task_id[:8], f"{datetime.now():%Y%m%d_%H%M}"]
+    return "_".join(parts) + ext
+
+
+def _attachment(name: str) -> dict:
+    """非 ASCII 文件名必须走 RFC 5987 编码，直接塞进 header 会被 latin-1 卡住。
+    形式与 FileResponse 内部保持一致，前端 download.ts 优先读 filename*。
+    """
+    return {"Content-Disposition": f"attachment; filename*=utf-8''{quote(name)}"}
 
 
 def _to_post_data(post: dict, index: int, names: dict, matched: bool = False) -> PostData:
@@ -218,63 +264,82 @@ async def get_stats(task_id: str):
     )
 
 
-@router.get("/download")
-async def download_excel(task_id: str):
-    """下载生成的 Excel 文件"""
-    task = _get_task_or_404(task_id)
-    result = task.get("result") or {}
-    excel_path = result.get("excel_path", "")
+# ===== 导出 =====
 
-    if not excel_path or not os.path.exists(excel_path):
-        raise HTTPException(status_code=404, detail="Excel 文件不存在或未生成")
+def _own_sentiment(task_id: str) -> dict:
+    """只读本任务自己的舆情文件。
 
-    file_name = os.path.basename(excel_path)
-    return FileResponse(
-        path=excel_path,
-        filename=file_name,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    **不走 get_sentiment() 那套跨任务 fallback** —— 页面上拿别的任务的结论顶一下还算
+    有点用，把它写进一份署着本任务名的报告里则是彻底的错。
+    """
+    path = os.path.join(settings.data_dir, f"sentiment_{task_id}.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-@router.get("/export/csv")
-async def export_csv(task_id: str):
-    """导出帖子数据为 CSV"""
-    task = _get_task_or_404(task_id)
-    posts = (task.get("result") or {}).get("posts") or []
-    if not posts:
-        posts = _load_posts_from_json(task)
-    if not posts:
-        raise HTTPException(status_code=404, detail="无帖子数据")
+def _export_rows(task: dict, posts: list, results: list) -> list:
+    """把舆情结论贴到帖子上，再按「主贴 → 它的评论 → 下一主贴」排序。
 
-    import csv
-    from io import StringIO
-    output = StringIO()
-    writer = csv.writer(output)
+    `results[i]` 对齐的是**扁平数组**的第 i 条（下标来自 `enumerate(all_posts)`），
+    而 order_by_thread 会重排。所以必须先按 post_key 建映射再排序 —— 排完再按下标取，
+    每条帖子都会配上别人的情感结论，而表面看毫无异常。
+    """
+    by_key = {
+        post_key(p): results[i]
+        for i, p in enumerate(posts)
+        if i < len(results) and results[i]
+    }
     names = _source_names(task)
-    writer.writerow(["序号", "来源", "层级", "用户名", "时间", "原文", "中文翻译", "页码"])
+    rows = []
     for i, p in enumerate(order_by_thread(posts), 1):
+        r = by_key.get(post_key(p)) or {}
         sid = p.get("source", "")
-        writer.writerow([
-            i,
-            names.get(sid, sid),
-            int(p.get("reply_level", 0) or 0),
-            p.get("username", ""),
-            _normalize_timestamp(p.get("timestamp", "")),
-            p.get("content", ""),
-            p.get("translation", ""),
-            p.get("page_number", ""),
-        ])
-    from fastapi.responses import Response
-    return Response(
-        content=output.getvalue().encode("utf-8-sig"),
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f"attachment; filename=posts_{task_id[:8]}.csv"},
-    )
+        rows.append({
+            "index": i,
+            "source": names.get(sid, sid),
+            "level": int(p.get("reply_level", 0) or 0),
+            "username": p.get("username", ""),
+            "timestamp": _normalize_timestamp(p.get("timestamp", "")),
+            "content": p.get("content", ""),
+            "translation": p.get("translation", ""),
+            "sentiment": SENTIMENT_CN.get(r.get("sentiment"), UNANALYZED),
+            "intensity": r.get("intensity") if r.get("sentiment") else "",
+            "reason": r.get("reason_cn", ""),
+            "dimensions": "、".join(r.get("dimensions") or []),
+        })
+    return rows
 
 
-@router.get("/export/json")
-async def export_json(task_id: str):
-    """导出帖子数据为 JSON"""
+def _export_meta(task: dict, rows: list, sentiment: dict) -> dict:
+    """概览表要用的任务级信息。时间区间同样排序取极值，不能取首尾（见 _build_stats）"""
+    stamps = sorted(r["timestamp"] for r in rows if r["timestamp"])
+    users = Counter(r["username"] for r in rows if r["username"])
+    return {
+        "description": task.get("description", ""),
+        "sources": "、".join(dict.fromkeys(r["source"] for r in rows if r["source"])),
+        "exported_at": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
+        "total": len(rows),
+        "replies": sum(1 for r in rows if r["level"] > 0),
+        "analyzed": sum(1 for r in rows if r["sentiment"] != UNANALYZED),
+        "time_start": stamps[0] if stamps else "",
+        "time_end": stamps[-1] if stamps else "",
+        "summary": sentiment.get("summary") or {},
+        "top_users": users.most_common(15),
+    }
+
+
+@router.get("/export")
+async def export_report(task_id: str, format: str = Query("xlsx")):
+    """导出原文 + 译文 + 舆情分析的单一报告。全站唯一的导出口。
+
+    舆情没跑过照样能导，情感列填「未分析」—— 只翻译不分析的任务否则永远导不出东西。
+    """
+    fmt = (format or "").lower()
+    if fmt not in ("xlsx", "csv"):
+        raise HTTPException(status_code=400, detail="format 只支持 xlsx 或 csv")
+
     task = _get_task_or_404(task_id)
     posts = (task.get("result") or {}).get("posts") or []
     if not posts:
@@ -282,12 +347,28 @@ async def export_json(task_id: str):
     if not posts:
         raise HTTPException(status_code=404, detail="无帖子数据")
 
-    import json as _json
-    from fastapi.responses import Response
+    sentiment = _own_sentiment(task_id)
+    rows = _export_rows(task, posts, sentiment.get("results") or [])
+
+    if fmt == "csv":
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow([label for _, label in EXPORT_COLUMNS])
+        for row in rows:
+            writer.writerow([row[key] for key, _ in EXPORT_COLUMNS])
+        # utf-8-sig：没有 BOM 时 Excel 会按本地代码页打开，中文全是乱码
+        content = output.getvalue().encode("utf-8-sig")
+        media_type = "text/csv; charset=utf-8"
+    else:
+        content = ExcelService.build_export(
+            rows, _export_meta(task, rows, sentiment), EXPORT_COLUMNS
+        )
+        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
     return Response(
-        content=_json.dumps(posts, ensure_ascii=False, indent=2),
-        media_type="application/json; charset=utf-8",
-        headers={"Content-Disposition": f"attachment; filename=posts_{task_id[:8]}.json"},
+        content=content,
+        media_type=media_type,
+        headers=_attachment(_export_filename(task, task_id, "分析报告", f".{fmt}")),
     )
 
 
@@ -369,29 +450,6 @@ async def get_sentiment_result(task_id: str):
 
     # 返回 200 + not_found 状态
     return {"status": "not_found", "message": "舆情分析结果不存在，请先触发分析"}
-
-
-@router.get("/sentiment/download")
-async def download_sentiment_excel(task_id: str):
-    """下载舆情分析 Excel 报告"""
-    # 同 get_sentiment_result：task_id 参与拼路径，必须先校验其为真实任务
-    _get_task_or_404(task_id)
-
-    sentiment_path = os.path.join(settings.data_dir, f"sentiment_{task_id}.json")
-    if not os.path.exists(sentiment_path):
-        raise HTTPException(status_code=404, detail="舆情分析结果不存在，请先触发分析")
-
-    with open(sentiment_path, "r", encoding="utf-8") as f:
-        sentiment_data = json.load(f)
-
-    from app.services.excel_service import ExcelService
-    result = ExcelService.generate_sentiment_report(task_id, sentiment_data)
-
-    return FileResponse(
-        path=result["file_path"],
-        filename=result["file_name"],
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
 
 
 @router.get("/sentiment/events")

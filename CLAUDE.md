@@ -238,14 +238,11 @@ GET    /api/v1/tasks/{id}/events      SSE 实时进度流
 GET    /api/v1/tasks/{id}/posts        帖子查询（**按主贴分页**，评论在 replies 里）
 GET    /api/v1/tasks/{id}/posts/{idx}  单条帖子详情（0-based）
 GET    /api/v1/tasks/{id}/stats        任务统计
-GET    /api/v1/tasks/{id}/download     Excel 下载
-GET    /api/v1/tasks/{id}/export/csv   CSV 下载（utf-8-sig）
-GET    /api/v1/tasks/{id}/export/json  JSON 下载
+GET    /api/v1/tasks/{id}/export       **唯一的导出口**（?format=xlsx|csv）
 
 POST   /api/v1/tasks/{id}/sentiment           触发舆情分析（增量）
 GET    /api/v1/tasks/{id}/sentiment           获取舆情结果（含跨任务 fallback）
 GET    /api/v1/tasks/{id}/sentiment/events    舆情分析 SSE 流
-GET    /api/v1/tasks/{id}/sentiment/download  舆情报告 Excel 下载
 
 GET    /api/v1/config                LLM 配置（不含 api_key）
 POST   /api/v1/config                保存配置
@@ -301,7 +298,7 @@ translate 和 generate_excel 在 context 里没有 posts 时会**从各数据源
 
 ## 测试
 
-**177 个测试，必须全部 PASSED**（本机实测 `177 passed in 342s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**187 个测试，必须全部 PASSED**（本机实测 `187 passed in 264s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
@@ -332,7 +329,9 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 - **增量机制**：每个帖子有 fingerprint，各步骤执行前检查 `_processed` 标记跳过已处理帖子
 - **SSE 进度推送**：`progress_manager` 按 task_id 做 pub/sub，30s 无事件发 `: keepalive` 注释帧防代理断连
 - **舆情按 task_id 命名但跨任务复用**：`get_sentiment()` 先查本任务，查不到则 fallback 到最新一条舆情数据；`_find_sentiment_file()` 还会用「帖子总数匹配」猜哪个文件对应当前数据
-- **舆情双写**：结果同时写 SQLite 和 JSON 文件；但 `/sentiment/download` 只读 JSON 文件，不读 DB
+- **舆情双写**：结果同时写 SQLite 和 JSON 文件；但 `/export` 只读 `sentiment_{task_id}.json`，不读 DB
+- **导出只有一个口**：`GET /export?format=xlsx|csv` 出一份含原文 + 译文 + 舆情结论的文件，界面入口只在舆情页。**报告每次下载现算、不落盘**（`ExcelService.build_export` 返回字节流）——落盘既会在 `exports/` 堆垃圾，两个人同时下载还会撞成一个在写另一个在读。流水线的 `generate_excel` 步骤照旧生成它自己那份，但那份不再被任何人下载
+- **导出取舆情不走 `get_sentiment()` 的跨任务 fallback**：页面上拿别的任务的结论顶一下还算有点用，把它写进一份署着本任务名的报告里则是彻底的错，所以 `_own_sentiment()` 只读本任务的文件
 - **LLM 重试分两层，别混为一谈**：`_retry_with_backoff` 是**传输层**指数退避（3 次，1s/2s/4s），只管 429/5xx；**解析失败是另一回事**——批量输出靠分隔符切分，LLM 偶尔在某一段吐出非 JSON，那一条会被记成 `{"sentiment": null, "reason_cn": "解析失败"}`。翻译和舆情都在批量之后补一轮**单条重试**（单条不必切分隔符，解析可靠得多），实测真实任务里 88 条中的 2 条因此救回。单条重试必须复用批量那份 prompt 片段（`_post_block`），来源标签和父贴上文少给一样就成了另一道题
 - **翻译用 LLM 而非 Google Translate**：5 条/批 + `---POST_SEPARATOR---` 切分，解析失败的条目再单条重译。源文本可能是荷兰语或英语且批内混杂，**「译文与原文一字不差且原文非中文」判为漏译**，走同一条单条重译队列
 - **舆情维度是封闭集合**：`DEFAULT_DIMENSIONS` 那 14 个。`_normalize_dimensions()` 把 LLM 返回的标签对齐回去（实测它会把 `认证/合规(如Synergrid)` 简写成 `认证/合规`，于是同一维度在 `top_dimensions` 和 `cross_source` 里各占一行），对不上的直接丢弃。维度表的全部价值就在于它封闭，一碎成近义标签跨来源对比就废了
@@ -374,6 +373,7 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 - **正文图只存相对路径，`<img>` 靠 `?api_key=` 过鉴权**：`/api/v1/media/{path}` 不能用 `StaticFiles` 挂载 —— `<img>` 没法自定义请求头，只能复用 `require_api_key` 为 SSE 开的 query 参数口子。**路径穿越必须挡**：`data/config.json` 里是明文 LLM API Key。裸的 `../` 通常在客户端就被规范化掉，但 `%2e%2e%2f` 会被框架解码后原样送进 `rel_path` —— 实测确认过，拿裸 `../` 当测试用例等于什么都没测（把校验整段禁用，那版照样绿）
 - **存储顺序不是时间顺序，求时间区间必须排序取极值**：信息流按时间倒序渲染，增量又往后追加，落盘数组的首尾和最早/最晚毫无关系。`/stats` 曾直接取 `timestamps[0]` / `[-1]`，实测显示成「开始 2026-07-28、结束 2026-07-10」——开始比结束晚 18 天，还把跨 5～8 月的数据缩成 7 月里的 18 天。排序也**必须先 `_normalize_timestamp()` 转 ISO**：落盘的 `dd-mm-yyyy` 按字符串排是按「日」排先，`01-07` 会排到 `28-06` 前面
 - **`/posts` 的响应里评论挂在主贴的 `replies` 下，按 index 建索引时必须递归展开**：`SentimentView.loadPosts()` 曾只遍历顶层 `posts`，把全部评论漏在外面 —— 实测 88 条里 42 条是评论，情感趋势图只画了 35 条（该 73 条），详情弹窗点评论行也取不到帖子。舆情结果的下标来自扁平数组，评论一样占位
+- **舆情结果贴回帖子必须「先按 key 建映射、再排序」**：`sentiment_*.json` 的 `results[i]` 对齐的是**扁平数组**第 i 条（下标来自 `enumerate(all_posts)`），而导出明细按 `order_by_thread()` 排成「主贴 → 它的评论 → 下一主贴」。排完再按行号取，每条帖子都会配上别人的情感结论 —— 实测 88 条里 72 条位置会变，而导出的表**表面上完全看不出异常**。回归测试见 `TestExportEndpointEndToEnd::test_sentiment_follows_the_post_not_the_row_number`（把实现改成按行号取，它会立刻报出「评论A1 拿到了主贴B 的结论」）
 - **`/posts` 的 `index` 是扁平存储数组里的绝对位置，不是页内序号**：`SentimentView` 用 `index - 1` 反查帖子，而舆情结果数组的下标来自 `enumerate(all_posts)`。一页只保证 `page_size` 个**主贴**，带上评论后条目数会超出，按页内计数编号会让相邻两页的 index 区间重叠、详情弹窗显示错帖子
 - **删数据源不能让历史任务结果变空白**：`task["result"]["sources"]` 里存了当时的 `output_path`，来源从注册表消失后 `results.py` 照原路读文件兜底
 - **爬虫必须通过 `node` 子进程调用**，不能 import

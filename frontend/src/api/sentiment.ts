@@ -13,8 +13,9 @@ export async function getSentiment(taskId: string): Promise<SentimentData> {
   return data
 }
 
-export function getSentimentDownloadUrl(taskId: string): string {
-  return `/api/v1/tasks/${taskId}/sentiment/download`
+/** 全站唯一的导出口：一份文件里含原文、译文和舆情分析结果 */
+export function getExportUrl(taskId: string, format: 'xlsx' | 'csv'): string {
+  return `/api/v1/tasks/${taskId}/export?format=${format}`
 }
 
 export function getSentimentEventsUrl(taskId: string): string {

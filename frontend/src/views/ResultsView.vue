@@ -2,17 +2,13 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useTaskStore } from '@/stores/task'
-import { useToast } from '@/composables/useToast'
-import { downloadFile } from '@/utils/download'
 import PostContent from '@/components/PostContent.vue'
 import type { PostData } from '@/types/result'
 
 const route = useRoute()
 const router = useRouter()
 const taskStore = useTaskStore()
-const toast = useToast()
 const taskId = computed(() => route.params.id as string)
-const downloading = ref('')
 
 const currentPage = ref(1)
 const pageSize = 50
@@ -91,22 +87,6 @@ function goToPage(p: number) {
   taskStore.fetchResults(searchText.value, p)
 }
 
-async function handleDownload(kind: 'excel' | 'csv' | 'json') {
-  const targets = {
-    excel: { url: taskStore.getDownloadUrl(), name: `任务结果_${taskId.value}.xlsx` },
-    csv: { url: `/api/v1/tasks/${taskId.value}/export/csv`, name: `任务结果_${taskId.value}.csv` },
-    json: { url: `/api/v1/tasks/${taskId.value}/export/json`, name: `任务结果_${taskId.value}.json` },
-  }
-  downloading.value = kind
-  try {
-    await downloadFile(targets[kind].url, targets[kind].name)
-  } catch (e: any) {
-    toast.error('下载失败: ' + (e?.message || '网络错误'))
-  } finally {
-    downloading.value = ''
-  }
-}
-
 function getStatusText(): string {
   const status = taskStore.currentTask?.status
   const map: Record<string, string> = {
@@ -139,36 +119,13 @@ function getStatusText(): string {
           </span>
         </div>
         <div class="flex gap-2">
+          <!-- 导出口只有舆情页一处，这里是过去的路 -->
           <button
             v-if="taskStore.isCompleted"
             class="btn btn-outline"
             @click="router.push(`/tasks/${taskId}/sentiment`)"
           >
-            📊 舆情分析
-          </button>
-          <button
-            v-if="taskStore.isCompleted"
-            class="btn btn-success"
-            :disabled="!!downloading"
-            @click="handleDownload('excel')"
-          >
-            {{ downloading === 'excel' ? '下载中...' : '📥 Excel' }}
-          </button>
-          <button
-            v-if="taskStore.isCompleted"
-            class="btn btn-outline btn-sm"
-            :disabled="!!downloading"
-            @click="handleDownload('csv')"
-          >
-            {{ downloading === 'csv' ? '...' : 'CSV' }}
-          </button>
-          <button
-            v-if="taskStore.isCompleted"
-            class="btn btn-outline btn-sm"
-            :disabled="!!downloading"
-            @click="handleDownload('json')"
-          >
-            {{ downloading === 'json' ? '...' : 'JSON' }}
+            📊 舆情分析与导出
           </button>
         </div>
       </div>

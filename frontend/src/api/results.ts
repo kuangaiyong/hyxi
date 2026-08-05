@@ -22,7 +22,3 @@ export async function fetchStats(taskId: string): Promise<TaskStats> {
   const { data } = await apiClient.get(`/tasks/${taskId}/stats`)
   return data
 }
-
-export function getDownloadUrl(taskId: string): string {
-  return `/api/v1/tasks/${taskId}/download`
-}

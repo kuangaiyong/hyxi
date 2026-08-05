@@ -23,6 +23,7 @@ const analyzing = ref(false)
 const error = ref('')
 const crossTaskWarning = ref('')
 const downloading = ref(false)
+const showFormats = ref(false)
 const eventSource = ref<EventSource | null>(null)
 const showDetail = ref(false)
 const detailPost = ref<PostWithSentiment | null>(null)
@@ -105,10 +106,16 @@ const DIM_COLORS: Record<string, string> = {
 // 按需注册，整包 echarts 会往首屏包里塞进一兆多用不上的图表类型
 echarts.use([LineChart, GridComponent, TooltipComponent, LegendComponent, CanvasRenderer])
 
+/** 点面板外面关掉格式菜单。不用 blur —— 点菜单里的按钮本身就会先触发 blur */
+function closeFormats(e: MouseEvent) {
+  if (!(e.target as HTMLElement).closest('.export-menu')) showFormats.value = false
+}
+
 onMounted(() => {
   checkStatus()
   themeOb = new MutationObserver(() => { if (trendChart) renderTrend() })
   themeOb.observe(document.documentElement, { attributeFilter: ['data-theme'] })
+  document.addEventListener('click', closeFormats)
 })
 
 onUnmounted(() => {
@@ -117,6 +124,7 @@ onUnmounted(() => {
   clearConnectTimer()
   themeOb?.disconnect()
   disposeTrend()
+  document.removeEventListener('click', closeFormats)
 })
 
 // 定时器句柄：组件卸载后再触发就会泄漏一条无人持有的 EventSource
@@ -565,15 +573,16 @@ function intensityStars(n: number): string {
   return '★'.repeat(stars) + '☆'.repeat(5 - stars)
 }
 
-async function handleDownload() {
+async function handleExport(format: 'xlsx' | 'csv') {
+  showFormats.value = false
   downloading.value = true
   try {
     await downloadFile(
-      sentimentApi.getSentimentDownloadUrl(taskId.value),
-      `舆情分析报告_${taskId.value}.xlsx`
+      sentimentApi.getExportUrl(taskId.value, format),
+      `HYXi舆情_分析报告_${taskId.value}.${format}`
     )
   } catch (e: any) {
-    toast.error('下载舆情报告失败: ' + (e?.message || '网络错误'))
+    toast.error('导出失败: ' + (e?.message || '网络错误'))
   } finally {
     downloading.value = false
   }
@@ -598,14 +607,23 @@ function viewPost(idx: number) {
     <div class="flex items-center justify-between mb-4">
       <h2 style="font-size: 18px; font-weight: 600;">📊 舆情分析</h2>
       <div class="flex gap-2">
-        <button
-          v-if="data"
-          class="btn btn-success btn-sm"
-          :disabled="downloading"
-          @click="handleDownload"
-        >
-          {{ downloading ? '下载中...' : '📥 下载舆情报告' }}
-        </button>
+        <!-- 全站唯一的导出口。不挂 v-if="data" —— 只翻译没跑舆情的任务也得导得出来，
+             那种情况下情感列是「未分析」 -->
+        <div class="export-menu">
+          <button class="btn btn-success btn-sm" :disabled="downloading" @click="handleExport('xlsx')">
+            {{ downloading ? '导出中...' : '📥 导出' }}
+          </button>
+          <button
+            class="btn btn-success btn-sm export-caret"
+            :disabled="downloading"
+            title="选择格式"
+            @click="showFormats = !showFormats"
+          >▾</button>
+          <div v-if="showFormats" class="export-formats">
+            <button @click="handleExport('xlsx')">Excel (.xlsx)</button>
+            <button @click="handleExport('csv')">CSV (.csv)</button>
+          </div>
+        </div>
         <button class="btn btn-outline btn-sm" @click="router.push(`/tasks/${taskId}/results`)">
           ← 返回结果
         </button>
@@ -997,5 +1015,54 @@ function viewPost(idx: number) {
 .trend-chart {
   width: 100%;
   height: 280px;
+}
+
+.export-menu {
+  position: relative;
+  display: flex;
+}
+
+/* 主按钮和箭头拼成一体，中缝留一道浅色分隔 */
+.export-menu > .btn:first-child {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.export-caret {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-left: 1px solid rgba(255, 255, 255, 0.35);
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
+.export-formats {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 10;
+  min-width: 140px;
+  padding: 4px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+
+.export-formats button {
+  display: block;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  background: none;
+  border-radius: 4px;
+  text-align: left;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.export-formats button:hover {
+  background: var(--border-light);
 }
 </style>

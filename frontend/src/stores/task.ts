@@ -158,10 +158,6 @@ export const useTaskStore = defineStore('task', () => {
     return '加载失败: ' + (e?.response?.data?.detail || e?.message || '网络错误')
   }
 
-  function getDownloadUrl(): string {
-    return currentTaskId.value ? resultApi.getDownloadUrl(currentTaskId.value) : ''
-  }
-
   return {
     tasks,
     currentTaskId,
@@ -192,6 +188,5 @@ export const useTaskStore = defineStore('task', () => {
     addTimelineEvent,
     setConnected,
     fetchResults,
-    getDownloadUrl,
   }
 })

@@ -6,6 +6,7 @@ import json
 import tempfile
 import shutil
 import hashlib
+from io import BytesIO
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -692,86 +693,129 @@ class TestLLMUtilsEndToEnd:
         asyncio.get_event_loop().run_until_complete(llm.close())
 
 
-class TestSentimentExcelGenerationEndToEnd:
-    """舆情 Excel 生成测试"""
+def _export_row(**over):
+    """导出明细的一行。字段与 results.py 的 _export_rows 产出一致"""
+    row = {
+        "index": 1, "source": "论坛来源", "level": 0, "username": "u",
+        "timestamp": "2026-05-22 17:06", "content": "origineel", "translation": "原文",
+        "sentiment": "中立", "intensity": 2, "reason": "询问", "dimensions": "",
+    }
+    row.update(over)
+    return row
 
-    def setup_method(self):
-        self.tmpdir = tempfile.mkdtemp()
 
-    def teardown_method(self):
-        shutil.rmtree(self.tmpdir, ignore_errors=True)
+def _export_meta(**over):
+    meta = {
+        "description": "测试任务", "sources": "论坛来源",
+        "exported_at": "2026-08-05 11:00:00", "total": 1, "replies": 0, "analyzed": 1,
+        "time_start": "2026-05-22 17:06", "time_end": "2026-05-22 17:06",
+        "summary": {"top_dimensions": []}, "top_users": [],
+    }
+    meta.update(over)
+    return meta
 
-    def test_generate_sentiment_excel_creates_valid_file(self):
-        from app.services.excel_service import ExcelService
 
-        sentiment_data = {
-            "task_id": "test-sentiment",
-            "analyzed_at": "2026-07-29T22:00:00",
-            "total": 10,
-            "success": 9,
-            "failed": 1,
-            "summary": {
-                "sentiment_distribution": {"positive": 3, "negative": 2, "neutral": 5},
-                "sentiment_percentages": {"positive": 30.0, "negative": 20.0, "neutral": 50.0},
-                "avg_intensity": 2.5,
-                "top_dimensions": [
-                    ["价格/性价比", 7],
-                    ["安装/配置体验", 5],
-                    ["App/软件体验", 3],
-                ],
-            },
-            "results": [
-                {"sentiment": "positive", "intensity": 4, "reason_cn": "满意", "dimensions": ["价格/性价比"]},
-                {"sentiment": "negative", "intensity": 3, "reason_cn": "有问题", "dimensions": ["安装/配置体验"]},
-                {"sentiment": "neutral", "intensity": 2, "reason_cn": "询问", "dimensions": []},
-                None,
-            ],
-        }
+class TestExportWorkbookEndToEnd:
+    """用户下载到的那份报告 —— 结构、排版与脏数据容错"""
 
-        result = ExcelService.generate_sentiment_report("test-task", sentiment_data, self.tmpdir)
-
-        assert os.path.exists(result["file_path"])
-        assert result["file_name"].endswith(".xlsx")
-        assert "sentiment" in result["file_name"]
-
+    def test_builds_two_sheets_with_readable_layout(self):
         from openpyxl import load_workbook
-        wb = load_workbook(result["file_path"])
-        assert "舆情分析汇总" in wb.sheetnames
-        assert "帖子情感详情" in wb.sheetnames
+        from app.services.excel_service import ExcelService, EXPORT_COLUMNS, FONT_NAME
 
-        ws = wb["舆情分析汇总"]
-        assert ws.cell(1, 1).value and "HYXi" in str(ws.cell(1, 1).value)
+        rows = [
+            _export_row(index=1, sentiment="正面", intensity=4, reason="满意",
+                        dimensions="价格/性价比"),
+            _export_row(index=2, level=1, username="回复者", sentiment="负面",
+                        intensity=3, reason="有问题", dimensions="安装/配置体验"),
+            _export_row(index=3, sentiment="未分析", intensity="", reason=""),
+        ]
+        meta = _export_meta(total=3, replies=1, analyzed=2,
+                            summary={"top_dimensions": [["价格/性价比", 7], ["App/软件体验", 3]]},
+                            top_users=[("u", 2), ("回复者", 1)])
 
-        ws2 = wb["帖子情感详情"]
-        assert ws2.cell(1, 1).value == "序号"
-        assert ws2.cell(2, 1).value == 1
-        assert ws2.cell(2, 2).value == "正面"
-        assert ws2.cell(5, 2).value == "(解析失败)"
+        wb = load_workbook(BytesIO(ExcelService.build_export(rows, meta, EXPORT_COLUMNS)))
+        assert wb.sheetnames == ["概览", "帖子明细"]
 
-    def test_generate_sentiment_excel_with_empty_data(self):
-        from app.services.excel_service import ExcelService
+        ov = wb["概览"]
+        assert "HYXi" in str(ov.cell(1, 1).value)
+        flat = [str(ov.cell(r, c).value) for r in range(1, ov.max_row + 1) for c in (1, 2)]
+        assert "测试任务" in flat
+        # 占比按总条数算，「未分析」也占一行，四行加起来才是 100%
+        assert "未分析" in flat
 
-        sentiment_data = {
-            "task_id": "test-empty",
-            "analyzed_at": "2026-07-29T22:00:00",
-            "total": 0,
-            "success": 0,
-            "failed": 0,
-            "summary": {
-                "sentiment_distribution": {"positive": 0, "negative": 0, "neutral": 0},
-                "sentiment_percentages": {"positive": 0, "negative": 0, "neutral": 0},
-                "avg_intensity": 0,
-                "top_dimensions": [],
-            },
-            "results": [],
-        }
+        ws = wb["帖子明细"]
+        assert [c.value for c in ws[1]] == [label for _, label in EXPORT_COLUMNS]
+        assert ws.max_row == 4
+        # 冻结首行 + 自动筛选，88 行里找负面才不用人肉翻
+        assert ws.freeze_panes == "A2"
+        assert ws.auto_filter.ref == "A1:K4"
+        # Arial 没有中文字形，中英文混排会错位
+        assert ws.cell(1, 1).font.name == FONT_NAME
+        assert ws.cell(2, 1).font.name == FONT_NAME
 
-        result = ExcelService.generate_sentiment_report("test-empty", sentiment_data, self.tmpdir)
-        assert os.path.exists(result["file_path"])
-
+    def test_reply_rows_are_the_only_shaded_ones(self):
+        """评论行单独上底色。再叠隔行斑马纹两者互相掩盖，等于谁也看不出来"""
         from openpyxl import load_workbook
-        wb = load_workbook(result["file_path"])
-        assert "舆情分析汇总" in wb.sheetnames
+        from app.services.excel_service import (
+            ExcelService, EXPORT_COLUMNS, REPLY_FILL, SENTIMENT_STYLE,
+        )
+
+        rows = [
+            _export_row(index=1, level=0, sentiment="正面"),
+            _export_row(index=2, level=0, sentiment="负面"),   # 偶数行，旧实现会给它上色
+            _export_row(index=3, level=1, sentiment="中立"),
+        ]
+        wb = load_workbook(BytesIO(ExcelService.build_export(rows, _export_meta(), EXPORT_COLUMNS)))
+        ws = wb["帖子明细"]
+
+        def fill_of(row):
+            return ws.cell(row, 1).fill.start_color.rgb
+
+        assert fill_of(2) == fill_of(3), "两个主贴的底色必须一致，不能隔行"
+        assert fill_of(4) == "00" + REPLY_FILL.start_color.rgb[-6:]
+        assert fill_of(4) != fill_of(2), "评论行要能与主贴区分开"
+
+        # 情感列按情感上色，三种各不相同
+        sentiment_col = [k for k, _ in EXPORT_COLUMNS].index("sentiment") + 1
+        painted = {ws.cell(r, sentiment_col).fill.start_color.rgb[-6:] for r in (2, 3, 4)}
+        assert painted == {bg for bg, _ in SENTIMENT_STYLE.values()}
+
+    def test_survives_dirty_intensity(self):
+        """LLM 会把 intensity 返回成字符串 / None / 越界值，星级渲染不能因此炸"""
+        from openpyxl import load_workbook
+        from app.services.excel_service import ExcelService, EXPORT_COLUMNS
+
+        rows = [
+            _export_row(index=1, sentiment="正面", intensity="高"),
+            _export_row(index=2, sentiment="正面", intensity=None),
+            _export_row(index=3, sentiment="正面", intensity=12),
+            _export_row(index=4, sentiment="未分析", intensity=""),
+        ]
+        wb = load_workbook(BytesIO(ExcelService.build_export(rows, _export_meta(), EXPORT_COLUMNS)))
+        ws = wb["帖子明细"]
+        col = [k for k, _ in EXPORT_COLUMNS].index("intensity") + 1
+        # 空串写进 openpyxl 读回来是 None（就是个空格子）；关键是别凭空编出星级
+        assert not ws.cell(2, col).value        # "高"
+        assert not ws.cell(3, col).value        # None
+        assert ws.cell(4, col).value == "★★★★★"  # 12 收敛到 5
+        assert not ws.cell(5, col).value        # 未分析
+
+        # 脏强度不能把平均分拖成 0
+        ov = wb["概览"]
+        avg = next(ov.cell(r, 2).value for r in range(1, ov.max_row + 1)
+                   if ov.cell(r, 1).value == "平均强度")
+        assert avg == "5 / 5"
+
+    def test_empty_rows_do_not_crash(self):
+        """帖子一条都没有时端点会先 404，但生成器自己不该除零"""
+        from openpyxl import load_workbook
+        from app.services.excel_service import ExcelService, EXPORT_COLUMNS
+
+        wb = load_workbook(BytesIO(
+            ExcelService.build_export([], _export_meta(total=0, analyzed=0), EXPORT_COLUMNS)
+        ))
+        assert wb.sheetnames == ["概览", "帖子明细"]
+        assert wb["帖子明细"].max_row == 1
 
 
 class TestSearchFilteringEndToEnd:
@@ -1144,28 +1188,6 @@ class TestExcelRobustnessEndToEnd:
         assert _star_level(-3) == 0
         assert _star_level(99) == 5
         assert _star_level(3.4) == 3
-
-    def test_sentiment_excel_survives_dirty_intensity(self):
-        from app.services.excel_service import ExcelService
-        sentiment_data = {
-            "task_id": "dirty", "analyzed_at": "2026-07-30T10:00:00",
-            "total": 3, "success": 3, "failed": 0,
-            "summary": {
-                "sentiment_distribution": {"positive": 3, "negative": 0, "neutral": 0},
-                "sentiment_percentages": {"positive": 100.0, "negative": 0, "neutral": 0},
-                "avg_intensity": 0, "top_dimensions": [],
-            },
-            "results": [
-                {"sentiment": "positive", "intensity": "高", "reason_cn": "", "dimensions": []},
-                {"sentiment": "positive", "intensity": None, "reason_cn": "", "dimensions": []},
-                {"sentiment": "positive", "intensity": 12, "reason_cn": "", "dimensions": []},
-            ],
-        }
-        result = ExcelService.generate_sentiment_report("dirty", sentiment_data, self.tmpdir)
-        from openpyxl import load_workbook
-        ws = load_workbook(result["file_path"])["帖子情感详情"]
-        assert ws.cell(2, 3).value.startswith("☆☆☆☆☆")
-        assert ws.cell(4, 3).value.startswith("★★★★★")
 
     def test_time_range_uses_extremes_not_first_last(self):
         from app.services.excel_service import ExcelService

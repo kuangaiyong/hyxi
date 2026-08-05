@@ -1,6 +1,7 @@
 """FastAPI 端点集成测试 — 使用 TestClient 真实请求"""
 
 import os
+import re
 import sys
 import json
 import tempfile
@@ -204,15 +205,15 @@ class TestAPIEndpointsEndToEnd:
         for path, allowed in (
             ("posts", (200,)),
             ("stats", (200,)),
-            ("export/csv", (404,)),
-            ("export/json", (404,)),
+            ("export?format=xlsx", (404,)),
+            ("export?format=csv", (404,)),
         ):
             r = self.client.get(f"/api/v1/tasks/{task_id}/{path}")
             assert r.status_code in allowed, f"{path} 返回 {r.status_code}，期望 {allowed}"
 
     def test_sentiment_endpoints_reject_unknown_task(self):
         """task_id 会被拼进文件路径，不存在的任务必须 404 而不是去读文件"""
-        for path in ("sentiment", "sentiment/download"):
+        for path in ("sentiment", "export?format=xlsx"):
             r = self.client.get(f"/api/v1/tasks/no-such-task/{path}")
             assert r.status_code == 404, f"{path} 返回 {r.status_code}，期望 404"
 
@@ -660,6 +661,204 @@ class TestNestedPostsApiEndToEnd:
 
         stats = self.client.get(f"/api/v1/tasks/{self.task_id}/stats").json()
         assert stats["total_posts"] == 9
+
+
+class TestExportEndpointEndToEnd:
+    """全站唯一的导出口 —— 真实 HTTP 打到真实落盘数据上"""
+
+    @classmethod
+    def setup_class(cls):
+        import app.config as cfg
+
+        cls.cfg = cfg
+        cls.tmpdir = tempfile.mkdtemp()
+        cls._old_key = cfg.settings.api_key
+        cls._old_dir = cfg.settings.data_dir
+        cfg.settings.api_key = ""
+        cfg.settings.data_dir = cls.tmpdir
+
+        from main import app
+        from app.services import storage
+        cls.storage = storage
+        cls._old_db = storage.DB_PATH
+        storage.DB_PATH = os.path.join(cls.tmpdir, "hyxi.db")
+        storage.init_db()
+        cls.client = TestClient(app)
+
+        # 一个主贴带两条评论，再一个主贴 —— 存储顺序刻意与线程顺序不同，
+        # order_by_thread 必然重排，对齐一旦写错就会被这批数据抓住
+        cls.posts = [
+            {"username": "楼主A", "timestamp": "02-06-2026 09:00", "content": "主贴A",
+             "translation": "译A", "page_number": 1, "fingerprint": "a",
+             "source": "src_x", "parent_fingerprint": None, "reply_level": 0},
+            {"username": "楼主B", "timestamp": "03-06-2026 09:00", "content": "主贴B",
+             "translation": "译B", "page_number": 1, "fingerprint": "b",
+             "source": "src_x", "parent_fingerprint": None, "reply_level": 0},
+            {"username": "回复1", "timestamp": "02-06-2026 10:00", "content": "评论A1",
+             "translation": "译A1", "page_number": 1, "fingerprint": "a1",
+             "source": "src_x", "parent_fingerprint": "a", "reply_level": 1},
+            {"username": "回复2", "timestamp": "02-06-2026 11:00", "content": "评论A2",
+             "translation": "译A2", "page_number": 1, "fingerprint": "a2",
+             "source": "src_x", "parent_fingerprint": "a", "reply_level": 1},
+        ]
+        cls.data_path = os.path.join(cls.tmpdir, "src_x.json")
+        with open(cls.data_path, "w", encoding="utf-8") as f:
+            json.dump({"total_pages": 1, "posts": cls.posts}, f, ensure_ascii=False)
+
+        cls.task_id = "export-e2e"
+        from app.services.orchestrator import orchestrator
+        cls.orchestrator = orchestrator
+        orchestrator.tasks[cls.task_id] = {
+            "id": cls.task_id, "status": "completed", "description": "导出用任务",
+            "plan": [], "logs": [], "progress": 1.0, "current_step": None,
+            "result": {"total_posts": 4, "sources": [
+                {"id": "src_x", "name": "小组来源:测试", "collector_id": "group_feed",
+                 "output_path": cls.data_path, "post_count": 4},
+            ]},
+        }
+
+    @classmethod
+    def teardown_class(cls):
+        cls.cfg.settings.api_key = cls._old_key
+        cls.cfg.settings.data_dir = cls._old_dir
+        cls.storage.DB_PATH = cls._old_db
+        cls.orchestrator.tasks.pop(cls.task_id, None)
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _write_sentiment(self, results):
+        """舆情结果按**扁平数组**下标对齐（下标来自 enumerate(all_posts)）"""
+        path = os.path.join(self.tmpdir, f"sentiment_{self.task_id}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"total": len(results), "success": len(results), "failed": 0,
+                       "summary": {"top_dimensions": []}, "results": results}, f,
+                      ensure_ascii=False)
+        return path
+
+    def _drop_sentiment(self):
+        path = os.path.join(self.tmpdir, f"sentiment_{self.task_id}.json")
+        if os.path.exists(path):
+            os.remove(path)
+
+    def _csv_rows(self):
+        import csv as _csv
+        from io import StringIO
+        resp = self.client.get(f"/api/v1/tasks/{self.task_id}/export", params={"format": "csv"})
+        assert resp.status_code == 200
+        text = resp.content.decode("utf-8-sig")
+        return resp, list(_csv.DictReader(StringIO(text)))
+
+    def _filename(self, resp):
+        from urllib.parse import unquote
+        disposition = resp.headers["content-disposition"]
+        return unquote(re.search(r"filename\*=utf-8''([^;]+)", disposition, re.I).group(1))
+
+    def test_sentiment_follows_the_post_not_the_row_number(self):
+        """**最容易写错的一处**：舆情下标对齐的是扁平数组，而明细按线程重排。
+
+        先按下标建映射再排序才对。反过来（排完按行号取）每条帖子都会配上别人的结论，
+        而表面上完全看不出异常 —— 所以这里用「每条帖子的结论里写着自己的名字」来钉死。
+        """
+        self._write_sentiment([
+            {"sentiment": "positive", "intensity": 5, "reason_cn": "属于:主贴A", "dimensions": ["价格/性价比"]},
+            {"sentiment": "negative", "intensity": 4, "reason_cn": "属于:主贴B", "dimensions": []},
+            {"sentiment": "neutral", "intensity": 3, "reason_cn": "属于:评论A1", "dimensions": []},
+            {"sentiment": "neutral", "intensity": 2, "reason_cn": "属于:评论A2", "dimensions": []},
+        ])
+        _resp, rows = self._csv_rows()
+
+        # 排序确实发生了：存储顺序是 A,B,A1,A2，线程顺序是 A,A1,A2,B
+        assert [r["原文"] for r in rows] == ["主贴A", "评论A1", "评论A2", "主贴B"]
+        for row in rows:
+            assert row["分析理由"] == f"属于:{row['原文']}", f"第 {row['序号']} 行串了：{row}"
+        assert [r["情感"] for r in rows] == ["正面", "中立", "中立", "负面"]
+        assert [r["层级"] for r in rows] == ["0", "1", "1", "0"]
+
+    def test_unanalyzed_posts_still_export(self):
+        """只翻译没跑舆情的任务也得导得出来，否则唯一的导出口对它永远是死的"""
+        self._drop_sentiment()
+        resp, rows = self._csv_rows()
+        assert resp.status_code == 200
+        assert len(rows) == 4
+        assert {r["情感"] for r in rows} == {"未分析"}
+        assert {r["强度"] for r in rows} == {""}
+        # 原文译文照常给全
+        assert [r["中文翻译"] for r in rows] == ["译A", "译A1", "译A2", "译B"]
+
+    def test_partial_sentiment_does_not_overrun(self):
+        """增量分析进行到一半时 results 比 posts 短，越界的按未分析处理"""
+        self._write_sentiment([
+            {"sentiment": "positive", "intensity": 5, "reason_cn": "属于:主贴A", "dimensions": []},
+            {"sentiment": "negative", "intensity": 4, "reason_cn": "属于:主贴B", "dimensions": []},
+        ])
+        _resp, rows = self._csv_rows()
+        by_content = {r["原文"]: r for r in rows}
+        assert by_content["主贴A"]["情感"] == "正面"
+        assert by_content["主贴B"]["情感"] == "负面"
+        assert by_content["评论A1"]["情感"] == "未分析"
+        assert by_content["评论A2"]["情感"] == "未分析"
+
+    def test_filename_carries_source_and_export_time(self):
+        """文件名要能自证是哪个来源、哪次任务、什么时候导的"""
+        from datetime import datetime
+
+        for fmt in ("xlsx", "csv"):
+            resp = self.client.get(f"/api/v1/tasks/{self.task_id}/export", params={"format": fmt})
+            assert resp.status_code == 200
+            name = self._filename(resp)
+            assert name.startswith("HYXi舆情_分析报告_"), name
+            assert name.endswith(f".{fmt}"), name
+            # 来源名里的冒号是 Windows 非法字符，必须被剔掉
+            assert "小组来源测试" in name, name
+            assert ":" not in name, name
+            assert self.task_id[:8] in name, name
+            assert f"{datetime.now():%Y%m%d}" in name, name
+
+    def test_multiple_sources_collapse_to_a_count(self):
+        """来源一多就不逐个列，否则文件名能长到没法看"""
+        task = self.orchestrator.tasks[self.task_id]
+        original = task["result"]["sources"]
+        task["result"]["sources"] = original + [
+            {"id": "src_y", "name": "论坛来源", "collector_id": "tweakers",
+             "output_path": self.data_path, "post_count": 4},
+        ]
+        try:
+            resp = self.client.get(f"/api/v1/tasks/{self.task_id}/export", params={"format": "csv"})
+            assert "2个来源" in self._filename(resp)
+        finally:
+            task["result"]["sources"] = original
+
+    def test_xlsx_is_a_real_workbook_with_both_sheets(self):
+        from io import BytesIO
+        from openpyxl import load_workbook
+
+        self._write_sentiment([
+            {"sentiment": "positive", "intensity": 5, "reason_cn": "好", "dimensions": ["价格/性价比"]},
+        ])
+        resp = self.client.get(f"/api/v1/tasks/{self.task_id}/export", params={"format": "xlsx"})
+        assert resp.status_code == 200
+        wb = load_workbook(BytesIO(resp.content))
+        assert wb.sheetnames == ["概览", "帖子明细"]
+        ws = wb["帖子明细"]
+        assert ws.max_row == 5                       # 表头 + 4 条
+        assert ws.cell(1, 6).value == "原文"
+        assert ws.cell(1, 7).value == "中文翻译"
+        assert ws.cell(2, 8).value == "正面"
+
+    def test_format_must_be_one_of_the_two(self):
+        for bad in ("json", "pdf", "XLS", ""):
+            resp = self.client.get(f"/api/v1/tasks/{self.task_id}/export", params={"format": bad})
+            assert resp.status_code == 400, f"format={bad!r} 返回 {resp.status_code}"
+
+    def test_default_format_is_xlsx(self):
+        resp = self.client.get(f"/api/v1/tasks/{self.task_id}/export")
+        assert resp.status_code == 200
+        assert self._filename(resp).endswith(".xlsx")
+
+    def test_old_download_endpoints_are_gone(self):
+        """四个旧下载口已合并，留着等于让用户拿到不含舆情的半份数据"""
+        for path in ("download", "export/csv", "export/json", "sentiment/download"):
+            resp = self.client.get(f"/api/v1/tasks/{self.task_id}/{path}")
+            assert resp.status_code == 404, f"{path} 仍然可用（{resp.status_code}）"
 
 
 class TestStatsTimeRangeEndToEnd:

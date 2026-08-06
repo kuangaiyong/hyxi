@@ -573,10 +573,39 @@ class TestPostTreeEndToEnd:
         assert [p["fingerprint"] for p in ordered] == ["root1", "c1", "c2", "root2"]
         assert [p["reply_level"] for p in ordered] == [0, 1, 2, 0]
 
-    def test_pure_forum_data_is_returned_untouched(self):
+    def test_roots_are_ordered_newest_first(self):
+        """主贴按发表时间从新到旧，评论跟着自己的主贴走、不参与排序"""
         from app.services.post_tree import order_by_thread
-        posts = [{"fingerprint": "a"}, {"fingerprint": "b"}]
-        assert order_by_thread(posts) is posts
+        posts = [
+            {"source": "s", "fingerprint": "r1", "timestamp": "20-05-2026 10:00", "content": "旧主贴"},
+            {"source": "s", "fingerprint": "c1", "parent_fingerprint": "r1",
+             "timestamp": "28-06-2026 09:00", "content": "旧主贴的新评论"},
+            {"source": "s", "fingerprint": "r2", "timestamp": "01-07-2026 08:00", "content": "新主贴"},
+        ]
+        ordered = order_by_thread(posts)
+        assert [p["content"] for p in ordered] == ["新主贴", "旧主贴", "旧主贴的新评论"]
+
+    def test_sorting_uses_iso_not_raw_dutch_string(self):
+        """落盘是 dd-mm-yyyy，按字符串排会变成「按日排先」：01-07 排到 28-06 前面"""
+        from app.services.post_tree import order_by_thread
+        posts = [
+            {"source": "s", "fingerprint": "a", "timestamp": "28-06-2026 09:00", "content": "六月底"},
+            {"source": "s", "fingerprint": "b", "timestamp": "01-07-2026 08:00", "content": "七月初"},
+            {"source": "s", "fingerprint": "c", "parent_fingerprint": "b", "content": "评论"},
+        ]
+        assert [p["content"] for p in order_by_thread(posts)][0] == "七月初"
+
+    def test_posts_without_a_timestamp_sink_to_the_bottom(self):
+        """早期采集读不到 tooltip 绝对时间，落盘留空。这些帖子实际很新，不该霸占最前面"""
+        from app.services.post_tree import order_by_thread
+        posts = [
+            {"source": "s", "fingerprint": "a", "timestamp": "", "content": "没时间1"},
+            {"source": "s", "fingerprint": "b", "timestamp": "", "content": "没时间2"},
+            {"source": "s", "fingerprint": "c", "timestamp": "20-05-2026 10:00", "content": "有时间"},
+            {"source": "s", "fingerprint": "d", "parent_fingerprint": "c", "content": "评论"},
+        ]
+        ordered = [p["content"] for p in order_by_thread(posts)]
+        assert ordered == ["有时间", "评论", "没时间1", "没时间2"], ordered
 
 
 class TestFingerprintGenerationEndToEnd:

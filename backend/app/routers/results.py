@@ -13,32 +13,18 @@ from app.services import source_service, storage
 from app.services.excel_service import (
     ExcelService, EXPORT_COLUMNS, SENTIMENT_CN, UNANALYZED,
 )
-from app.services.post_tree import build_tree, order_by_thread, post_key
+from app.services.post_tree import (
+    build_tree, normalize_timestamp, order_by_thread, post_key, sort_time,
+)
 from app.services.orchestrator import orchestrator, load_task_posts
 
 router = APIRouter(prefix="/api/v1/tasks/{task_id}", tags=["结果"])
 
 
-def _normalize_timestamp(ts: str) -> str:
-    """将荷兰/欧洲日期格式 (dd-mm-yyyy) 转为 ISO 格式 (yyyy-mm-dd)"""
-    if not ts:
-        return ts
-    match = re.match(r"(\d{2})-(\d{2})-(\d{4})\s+(.+)", ts)
-    if match:
-        return f"{match.group(3)}-{match.group(2)}-{match.group(1)} {match.group(4)}"
-    return ts
-
-
-def _sort_time(ts: str) -> tuple:
-    """按时间排序用的键。没有时间的排在所有有时间的后面（配 reverse=True）"""
-    iso = _normalize_timestamp(ts or "").strip()
-    return (bool(iso), iso)
-
-
 def _normalize_post(post: dict) -> dict:
     """规范化帖子数据（日期格式等）"""
     post = dict(post)
-    post["timestamp"] = _normalize_timestamp(post.get("timestamp", ""))
+    post["timestamp"] = normalize_timestamp(post.get("timestamp", ""))
     return post
 
 
@@ -101,7 +87,7 @@ def _to_post_data(post: dict, index: int, names: dict, matched: bool = False) ->
     return PostData(
         index=index,
         username=post.get("username", ""),
-        timestamp=_normalize_timestamp(post.get("timestamp", "")),
+        timestamp=normalize_timestamp(post.get("timestamp", "")),
         content=post.get("content", ""),
         translation=post.get("translation", ""),
         page_number=post.get("page_number", 1),
@@ -159,13 +145,10 @@ async def get_posts(
             kept_roots.add(cur)
         roots = [r for r in roots if post_key(r) in kept_roots]
 
-    # 主贴按发表时间从新到旧。**必须排在切片之前** —— 只排页内的话，跨页看到的
-    # 仍是采集顺序。存储层的 seq 不动（它是全链路的顺序锚点），这里只改呈现次序。
-    # 排序键先转 ISO：落盘是 dd-mm-yyyy，直接按字符串排会变成按「日」排先，
-    # 01-07 会排到 28-06 前面。
-    # 没解析出时间的沉到最后（早期采集读不到 tooltip 绝对时间，留空是刻意的，
-    # 见 CLAUDE.md）——它们之间保持采集顺序。
-    roots.sort(key=lambda p: _sort_time(p.get("timestamp")), reverse=True)
+    # 主贴按发表时间从新到旧，规则同 order_by_thread（导出走那条路）。
+    # **必须排在切片之前** —— 只排页内的话，一页 50 个主贴，后面更新的帖子永远
+    # 出不了第二页。
+    roots.sort(key=lambda p: sort_time(p.get("timestamp")), reverse=True)
 
     total = len(roots)
     start = (page - 1) * page_size
@@ -223,7 +206,7 @@ async def get_stats(task_id: str):
     # time_range_start 比 time_range_end 晚 18 天。也不能直接对落盘的
     # dd-mm-yyyy 排序：那是按「日」排先，01-07 会被排到 28-06 前面。
     timestamps = sorted(
-        _normalize_timestamp(p["timestamp"]) for p in posts if p.get("timestamp")
+        normalize_timestamp(p["timestamp"]) for p in posts if p.get("timestamp")
     )
 
     top_users = [
@@ -263,7 +246,7 @@ def _task_sentiment(task_id: str, posts: list) -> dict:
 
 
 def _export_rows(task: dict, posts: list, results: list) -> list:
-    """把舆情结论贴到帖子上，再按「主贴 → 它的评论 → 下一主贴」排序。
+    """把舆情结论贴到帖子上，再按「主贴 → 它的评论 → 下一主贴」、主贴时间从新到旧排序。
 
     `results[i]` 对齐的是**扁平数组**的第 i 条（下标来自 `enumerate(all_posts)`），
     而 order_by_thread 会重排。所以必须先按 post_key 建映射再排序 —— 排完再按下标取，
@@ -284,7 +267,7 @@ def _export_rows(task: dict, posts: list, results: list) -> list:
             "source": names.get(sid, sid),
             "level": int(p.get("reply_level", 0) or 0),
             "username": p.get("username", ""),
-            "timestamp": _normalize_timestamp(p.get("timestamp", "")),
+            "timestamp": normalize_timestamp(p.get("timestamp", "")),
             "content": p.get("content", ""),
             "translation": p.get("translation", ""),
             "sentiment": SENTIMENT_CN.get(r.get("sentiment"), UNANALYZED),

@@ -817,12 +817,24 @@ class TestExportEndpointEndToEnd:
         ])
         _resp, rows = self._csv_rows()
 
-        # 排序确实发生了：存储顺序是 A,B,A1,A2，线程顺序是 A,A1,A2,B
-        assert [r["原文"] for r in rows] == ["主贴A", "评论A1", "评论A2", "主贴B"]
+        # 排序确实发生了：存储顺序是 A,B,A1,A2，导出顺序是「主贴按时间倒序 + 评论跟着走」
+        assert [r["原文"] for r in rows] == ["主贴B", "主贴A", "评论A1", "评论A2"]
         for row in rows:
             assert row["分析理由"] == f"属于:{row['原文']}", f"第 {row['序号']} 行串了：{row}"
-        assert [r["情感"] for r in rows] == ["正面", "中立", "中立", "负面"]
-        assert [r["层级"] for r in rows] == ["0", "1", "1", "0"]
+        assert [r["情感"] for r in rows] == ["负面", "正面", "中立", "中立"]
+        assert [r["层级"] for r in rows] == ["0", "0", "1", "1"]
+
+    def test_rows_are_ordered_newest_first(self):
+        """导出与页面用同一条排序规则：主贴按发表时间从新到旧，评论跟着自己的主贴走。
+
+        主贴B(03-06) 比主贴A(02-06) 新，所以排在前面 —— 哪怕 A 的评论(10:00/11:00)
+        比 B 的发表时间还晚。评论不参与主贴之间的排序。
+        """
+        self._drop_sentiment()
+        _resp, rows = self._csv_rows()
+        assert [r["原文"] for r in rows] == ["主贴B", "主贴A", "评论A1", "评论A2"]
+        roots = [r["发布时间"] for r in rows if r["层级"] == "0"]
+        assert roots == sorted(roots, reverse=True), roots
 
     def test_unanalyzed_posts_still_export(self):
         """只翻译没跑舆情的任务也得导得出来，否则唯一的导出口对它永远是死的"""
@@ -833,7 +845,7 @@ class TestExportEndpointEndToEnd:
         assert {r["情感"] for r in rows} == {"未分析"}
         assert {r["强度"] for r in rows} == {""}
         # 原文译文照常给全
-        assert [r["中文翻译"] for r in rows] == ["译A", "译A1", "译A2", "译B"]
+        assert [r["中文翻译"] for r in rows] == ["译B", "译A", "译A1", "译A2"]
 
     def test_partial_sentiment_does_not_overrun(self):
         """增量分析进行到一半时 results 比 posts 短，越界的按未分析处理"""
@@ -893,7 +905,9 @@ class TestExportEndpointEndToEnd:
         assert ws.max_row == 5                       # 表头 + 4 条
         assert ws.cell(1, 6).value == "原文"
         assert ws.cell(1, 7).value == "中文翻译"
-        assert ws.cell(2, 8).value == "正面"
+        # 结论写给扁平数组第 0 条（主贴A），导出按时间倒序后它落在第 3 行
+        assert ws.cell(3, 6).value == "主贴A"
+        assert ws.cell(3, 8).value == "正面"
 
     def test_format_must_be_one_of_the_two(self):
         for bad in ("json", "pdf", "XLS", ""):

@@ -1,10 +1,11 @@
-"""帖子的跨来源索引键与父子关系组装。
+"""帖子的跨来源索引键、父子关系组装与出口排序。
 
 存储层始终是扁平数组 —— 整条处理链有 8 处假设如此（增量过滤、指纹合并、翻译下标对齐、
-舆情绝对索引、Excel、切片、Node 端合并）。嵌套只在出口（API / Excel）现场组装，
-所以这里只提供「怎么算键」和「怎么组树」，不改变任何存储形态。
+舆情绝对索引、Excel、切片、Node 端合并）。嵌套和排序只在出口（API / Excel）现场组装，
+所以这里只提供「怎么算键」「怎么组树」「按什么顺序出」，不改变任何存储形态。
 """
 
+import re
 from typing import Dict, List, Tuple
 
 
@@ -27,6 +28,29 @@ def parent_key(post: dict) -> str:
     return f"{post.get('source') or 'tweakers'}:{parent_fp}"
 
 
+_DUTCH_DATE = re.compile(r"(\d{2})-(\d{2})-(\d{4})\s+(.+)")
+
+
+def normalize_timestamp(ts: str) -> str:
+    """将荷兰/欧洲日期格式 (dd-mm-yyyy) 转为 ISO 格式 (yyyy-mm-dd)"""
+    if not ts:
+        return ts
+    match = _DUTCH_DATE.match(ts)
+    if match:
+        return f"{match.group(3)}-{match.group(2)}-{match.group(1)} {match.group(4)}"
+    return ts
+
+
+def sort_time(ts: str) -> tuple:
+    """按时间排序用的键。没有时间的排在所有有时间的后面（配 reverse=True）。
+
+    必须先转 ISO：落盘是 dd-mm-yyyy，直接按字符串排是按「日」排先，01-07 会排到
+    28-06 前面。
+    """
+    iso = normalize_timestamp(ts or "").strip()
+    return (bool(iso), iso)
+
+
 def build_tree(posts: List[dict]) -> Tuple[List[dict], Dict[str, List[dict]]]:
     """组成 (roots, children)，children 的键是父贴的 post_key。
 
@@ -45,14 +69,16 @@ def build_tree(posts: List[dict]) -> Tuple[List[dict], Dict[str, List[dict]]]:
 
 
 def order_by_thread(posts: List[dict]) -> List[dict]:
-    """按「主贴 → 它的评论 → 下一个主贴」重排，并回填 reply_level。
+    """按「主贴 → 它的评论 → 下一个主贴」重排，主贴按发表时间从新到旧，并回填 reply_level。
 
-    没有任何回复时原样返回，避免给纯论坛数据平白做一次重排。
+    评论跟着自己的主贴走、不参与排序 —— 它们本来就该按发表先后读。没解析出时间的主贴
+    沉到最后（早期采集读不到 tooltip 的绝对时间时是故意留空的，这批帖子实际很新），
+    它们之间靠稳定排序保持采集顺序。
+
+    这里只改呈现次序，存储层的 seq 不动 —— 它是全链路的顺序锚点，舆情结论按它对齐。
     """
-    if not any(p.get("parent_fingerprint") for p in posts):
-        return posts
-
     roots, children = build_tree(posts)
+    roots = sorted(roots, key=lambda p: sort_time(p.get("timestamp")), reverse=True)
     ordered: List[dict] = []
 
     def walk(post: dict, level: int):

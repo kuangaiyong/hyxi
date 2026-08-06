@@ -319,7 +319,11 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 
 translate、generate_excel 和 sentiment 在 context 里没有 posts 时会**从各数据源已落盘的 JSON 兜底加载**（`_load_posts_from_sources()`），所以可以只提交「翻译已有数据」这类任务。不再有 `_extract_thread_id()` 那套「从描述里抠 5 位数字」的猜测，也不再 glob `tweakers_thread_*.json`。
 
-**sentiment 步骤由 `_resolve_sentiment()` 补，不是 LLM 给的**：`parse_intent` 的 prompt 里只有 collect / translate / generate_excel 三个动作，模型**永远产不出** sentiment。描述里出现「舆情 / 情感分析 / 情感倾向」就在计划末尾追加一步（放最后：它要读翻译后的帖子，且是整条链上最贵的一步）。同 `_resolve_sources` 的路子——LLM 负责理解，后端负责保证。**没写就不加**，舆情是要花钱的。
+**sentiment 步骤由 `_resolve_sentiment()` 补，不是 LLM 给的**：`parse_intent` 的 prompt 里只有 collect / translate / generate_excel 三个动作，模型**永远产不出** sentiment。描述里出现「舆情分析 / 分析舆情 / 情感分析 / 分析情感 / 情感倾向 / 舆情报告」就在计划末尾追加一步（放最后：它要读翻译后的帖子，且是整条链上最贵的一步）。同 `_resolve_sources` 的路子——LLM 负责理解，后端负责保证。**没写就不加**，舆情是要花钱的。
+
+**只认「明确要求分析」的说法，光出现「舆情」两个字不算**。本项目自己就叫「舆情分析平台」，凭单个词触发的话，「每天抓取 Facebook 舆情数据」这种把舆情当话题词的**定时任务会每轮都静默调一次 LLM**——定时任务没人盯着，扣的钱要很久以后才发现。**两种语序都必须收**（「分析舆情」和「舆情分析」）：界面预设按钮 `TaskManagementView.vue` 的 quickActions 和用户实际写的都是「分析舆情」，只认「舆情分析」等于把这个功能对现有用法整个关掉。匹配是子串，中间插了词认不出（「分析一下舆情」），与 `_resolve_sources` 判「所有来源」同一权衡。
+
+新建任务、`POST /tasks/{id}/retry`、定时任务三条入口都走 `run_task_async` → `execute_task`，所以这条规则对三者一致生效。回归测试见 `TestResolveSentimentEndToEnd`。
 
 漏掉这一步的后果特别隐蔽：结论按帖子身份跨任务共享，所以新任务一打开，页面上是**上一个任务留下的**结论，看着像已经分析过了；只有那几条新采到的帖子是空的，得逐条翻才发现。用户实测报过（95 条里只有第 95 条没分析，因为它是当天新增的唯一一条）。
 
@@ -331,7 +335,7 @@ translate、generate_excel 和 sentiment 在 context 里没有 posts 时会**从
 
 ## 测试
 
-**231 个测试，必须全部 PASSED**（本机实测 `231 passed in 286s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**233 个测试，必须全部 PASSED**（本机实测 `233 passed in 287s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v

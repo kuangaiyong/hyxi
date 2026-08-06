@@ -454,7 +454,26 @@ class TestResolveSentimentEndToEnd:
             ["collect", "sentiment"]
 
     def test_other_wordings_are_recognized(self):
-        for desc in ("做一下情感分析", "看看情感倾向", "输出舆情报告"):
+        # 子串匹配，中间插了词就认不出（「分析一下舆情」）—— 同 _resolve_sources
+        # 判「所有来源」的策略，项目已接受这个权衡，不为此引入正则
+        for desc in ("做一下舆情分析", "做一下情感分析", "分析情感",
+                     "看看情感倾向", "输出舆情报告"):
+            assert self._resolve(desc)[-1] == "sentiment", desc
+
+    def test_topic_word_alone_does_not_trigger(self):
+        """光提「舆情」不算要求分析 —— 本项目自己就叫「舆情分析平台」。
+
+        定时任务尤其危险：「每天抓取Facebook舆情数据」这种描述每轮都会静默调一次
+        LLM，而定时任务没人盯着，扣的钱要很久以后才发现。
+        """
+        for desc in ("每天抓取Facebook上的舆情数据", "定时采集舆情，导出Excel",
+                     "抓取舆情相关帖子并翻译"):
+            assert self._resolve(desc) == ["collect", "translate"], desc
+
+    def test_both_word_orders_are_accepted(self):
+        """界面预设按钮和用户实际写的都是「分析舆情」，只认「舆情分析」等于整个关掉"""
+        for desc in ("采集所有来源的帖子，翻译成中文，导出Excel，分析舆情",
+                     "采集所有来源的帖子，翻译成中文，导出Excel，舆情分析"):
             assert self._resolve(desc)[-1] == "sentiment", desc
 
 

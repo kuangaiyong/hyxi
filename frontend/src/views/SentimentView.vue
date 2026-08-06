@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import * as echarts from 'echarts/core'
 import { LineChart } from 'echarts/charts'
@@ -36,6 +36,10 @@ const progressPct = ref(0)
 const progressLogs = ref<string[]>([])
 // 过滤条件
 const filterSentiment = ref('')
+/** 从结果页跳过来时高亮的那一行（扁平下标）；关掉详情弹窗后仍然留着，便于回看上下文 */
+const highlightIdx = ref<number | null>(null)
+/** 只定位一次：loadResults 在轮询里会被反复调用，不设防会每轮都把详情弹窗弹回来 */
+const focused = ref(false)
 const filterDimension = ref('')
 const filterKeyword = ref('')
 
@@ -278,6 +282,9 @@ async function loadResults() {
       applyData(result)
       analyzing.value = false
       await loadPosts()
+      // 带着 ?post= 进来时分析正好在跑的话，checkStatus 那次是提前返回的 ——
+      // 结果是这条路送达的，定位也只能在这里做
+      await focusFromQuery()
     } else if (result.status === 'running') {
       analyzing.value = true
       connectSSE()
@@ -312,6 +319,7 @@ async function checkStatus() {
     if (result.task_id) {
       applyData(result)
       await loadPosts()
+      await focusFromQuery()
     } else {
       error.value = '尚未进行舆情分析'
     }
@@ -586,6 +594,28 @@ async function handleExport(format: 'xlsx' | 'csv') {
   } finally {
     downloading.value = false
   }
+}
+
+/**
+ * 从结果页「查看舆情」跳过来时，定位到那条帖子：滚过去、标出来、并直接打开详情。
+ *
+ * 必须先清掉筛选条件 —— 目标行很可能被当前筛选挡在外面，那样跳过来会是一片空白。
+ * 用 index（1-based，扁平数组的绝对位置）而不是行号：行号会随筛选变。
+ */
+async function focusFromQuery() {
+  const raw = route.query.post
+  if (!raw || focused.value) return
+  const idx = Number(raw) - 1
+  if (!Number.isInteger(idx) || idx < 0) return
+  if (!data.value?.results?.[idx]) return
+
+  focused.value = true
+  clearFilters()
+  highlightIdx.value = idx
+  await nextTick()
+  document.querySelector(`[data-row="${idx}"]`)
+    ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  viewPost(idx)
 }
 
 function viewPost(idx: number) {
@@ -907,6 +937,8 @@ function viewPost(idx: number) {
             <tr
               v-for="row in filteredResults"
               :key="row._idx"
+              :data-row="row._idx"
+              :class="{ 'row-target': row._idx === highlightIdx }"
             >
               <td style="text-align: center; font-size: 12px; color: var(--text-light);">{{ row._idx + 1 }}</td>
               <td style="text-align: center;">
@@ -1026,6 +1058,16 @@ function viewPost(idx: number) {
 .export-menu > .btn:first-child {
   border-top-right-radius: 0;
   border-bottom-right-radius: 0;
+}
+
+/* 从结果页跳过来时标出目标行。关掉详情弹窗后仍然留着 —— 用户这时候多半想看看
+   这条帖子前后是什么情况，标记没了就得重新数行号。
+   !important 是必须的：main.css 的 .data-table tr:hover td 优先级更高，会盖掉它。
+   **不给 color-mix 配纯色兜底** —— 兜成不透明的 --primary 会让行内文字对比度掉到
+   1.9:1 直接读不了，还不如让不支持的浏览器只留左边那条竖线。 */
+.row-target > td {
+  background: color-mix(in srgb, var(--primary) 14%, transparent) !important;
+  box-shadow: inset 3px 0 0 var(--primary);
 }
 
 .export-caret {

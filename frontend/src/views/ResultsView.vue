@@ -3,7 +3,9 @@ import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useTaskStore } from '@/stores/task'
 import PostContent from '@/components/PostContent.vue'
+import * as sentimentApi from '@/api/sentiment'
 import type { PostData } from '@/types/result'
+import type { SentimentResult } from '@/types/sentiment'
 
 const route = useRoute()
 const router = useRouter()
@@ -33,6 +35,32 @@ const threadKey = (p: PostData) => `${p.source}:${p.index}`
 // 早期采集读不到 tooltip 的绝对时间，落盘就是空的（写相对时间会污染指纹）。
 // 留一段空白看着像功能坏了，明说没有反而清楚。
 const postTime = (p: PostData) => p.timestamp?.trim() || '时间未知'
+
+/** 舆情结论，按扁平下标存：results[i] 对应 index 为 i+1 的那条帖子 */
+const sentimentResults = ref<(SentimentResult | null)[]>([])
+
+const SENTIMENT_LABEL: Record<string, string> = {
+  positive: '正面', negative: '负面', neutral: '中立',
+}
+
+/**
+ * 这条帖子的舆情结论；没分析过、或分析失败（sentiment 为 null）都返回 null。
+ *
+ * index 是**扁平存储数组里的绝对位置**（1-based），主贴和评论共用同一套编号，
+ * 所以这个函数对两者一视同仁 —— 结论本来就是逐条给的，评论也占位。
+ */
+function sentimentOf(p: PostData): SentimentResult | null {
+  const r = sentimentResults.value[p.index - 1]
+  return r && r.sentiment ? r : null
+}
+
+/** 跳到舆情页并定位到这条帖子。带 index 过去，那边负责滚动 + 高亮 + 开详情 */
+function viewSentiment(p: PostData) {
+  router.push({
+    path: `/tasks/${taskId.value}/sentiment`,
+    query: { post: String(p.index) },
+  })
+}
 
 /**
  * 后端按主贴分页、评论挂在 replies 里。这里把每个主贴的后代**展平成带层级的列表**，
@@ -70,6 +98,14 @@ onMounted(async () => {
   taskStore.currentTaskId = taskId.value
   await taskStore.fetchResults()
   await taskStore.fetchTask(taskId.value)
+  // 舆情是附加信息，没分析过、正在分析、请求失败都只是不显示按钮，
+  // 不能让它拖累帖子列表本身
+  try {
+    const data = await sentimentApi.getSentiment(taskId.value)
+    if (data?.results) sentimentResults.value = data.results
+  } catch {
+    /* 静默 */
+  }
 })
 
 async function handleSearch() {
@@ -235,6 +271,15 @@ function getStatusText(): string {
             <strong class="root-user">{{ t.root.username }}</strong>
             <span class="text-sm text-secondary">{{ postTime(t.root) }}</span>
             <span class="grow" />
+            <button
+              v-if="sentimentOf(t.root)"
+              class="sentiment-chip"
+              :class="'is-' + sentimentOf(t.root)!.sentiment"
+              :title="`查看舆情分析详情：${sentimentOf(t.root)!.reason_cn}`"
+              @click="viewSentiment(t.root)"
+            >
+              📊 {{ SENTIMENT_LABEL[sentimentOf(t.root)!.sentiment!] }} ›
+            </button>
             <span class="text-sm text-secondary">#{{ t.root.index }}</span>
             <span v-if="t.replies.length" class="reply-count">💬 {{ t.replies.length }}</span>
           </header>
@@ -255,6 +300,15 @@ function getStatusText(): string {
                 <span class="reply-user">{{ r.username }}</span>
                 <span class="text-sm text-secondary">{{ postTime(r) }}</span>
                 <span class="grow" />
+                <button
+                  v-if="sentimentOf(r)"
+                  class="sentiment-chip"
+                  :class="'is-' + sentimentOf(r)!.sentiment"
+                  :title="`查看舆情分析详情：${sentimentOf(r)!.reason_cn}`"
+                  @click="viewSentiment(r)"
+                >
+                  📊 {{ SENTIMENT_LABEL[sentimentOf(r)!.sentiment!] }} ›
+                </button>
                 <span class="text-sm text-secondary">#{{ r.index }}</span>
               </div>
               <PostContent :post="r" :mode="viewMode" @zoom="zoomUrl = $event" />
@@ -372,6 +426,26 @@ function getStatusText(): string {
   font-size: 12px;
   color: var(--text-secondary);
 }
+/* 情感标签本身就是入口：既让人一眼看到结论，又不用再多摆一个「查看」按钮。
+   主贴和评论共用同一个样式 —— 结论是逐条给的，评论也有自己那份 */
+.sentiment-chip {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+  border: 1px solid currentColor;
+  background: transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  opacity: 0.9;
+}
+.sentiment-chip:hover {
+  opacity: 1;
+  filter: brightness(1.15);
+}
+.sentiment-chip.is-positive { color: #10B981; }
+.sentiment-chip.is-negative { color: #EF4444; }
+.sentiment-chip.is-neutral { color: #94A3B8; }
 /* 回复整块缩进 + 换底色：一眼就能看出它从属于上面那张卡，而不是并列的另一条帖子 */
 .replies {
   margin: 12px 0 0 12px;

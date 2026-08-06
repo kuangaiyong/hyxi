@@ -29,6 +29,12 @@ def _normalize_timestamp(ts: str) -> str:
     return ts
 
 
+def _sort_time(ts: str) -> tuple:
+    """按时间排序用的键。没有时间的排在所有有时间的后面（配 reverse=True）"""
+    iso = _normalize_timestamp(ts or "").strip()
+    return (bool(iso), iso)
+
+
 def _normalize_post(post: dict) -> dict:
     """规范化帖子数据（日期格式等）"""
     post = dict(post)
@@ -152,6 +158,14 @@ async def get_posts(
                 cur = parent_of[cur]
             kept_roots.add(cur)
         roots = [r for r in roots if post_key(r) in kept_roots]
+
+    # 主贴按发表时间从新到旧。**必须排在切片之前** —— 只排页内的话，跨页看到的
+    # 仍是采集顺序。存储层的 seq 不动（它是全链路的顺序锚点），这里只改呈现次序。
+    # 排序键先转 ISO：落盘是 dd-mm-yyyy，直接按字符串排会变成按「日」排先，
+    # 01-07 会排到 28-06 前面。
+    # 没解析出时间的沉到最后（早期采集读不到 tooltip 绝对时间，留空是刻意的，
+    # 见 CLAUDE.md）——它们之间保持采集顺序。
+    roots.sort(key=lambda p: _sort_time(p.get("timestamp")), reverse=True)
 
     total = len(roots)
     start = (page - 1) * page_size

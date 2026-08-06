@@ -30,6 +30,10 @@ const totalPages = computed(() =>
 
 const threadKey = (p: PostData) => `${p.source}:${p.index}`
 
+// 早期采集读不到 tooltip 的绝对时间，落盘就是空的（写相对时间会污染指纹）。
+// 留一段空白看着像功能坏了，明说没有反而清楚。
+const postTime = (p: PostData) => p.timestamp?.trim() || '时间未知'
+
 /**
  * 后端按主贴分页、评论挂在 replies 里。这里把每个主贴的后代**展平成带层级的列表**，
  * 卡片内用缩进渲染 —— 比递归组件简单，而嵌套最多也就两三层。
@@ -228,7 +232,7 @@ function getStatusText(): string {
           <header class="thread-head">
             <span class="badge-source">{{ t.root.source_name }}</span>
             <strong>{{ t.root.username }}</strong>
-            <span class="text-sm text-secondary">{{ t.root.timestamp }}</span>
+            <span class="text-sm text-secondary">{{ postTime(t.root) }}</span>
             <span class="grow" />
             <span class="text-sm text-secondary">#{{ t.root.index }}</span>
             <span v-if="t.replies.length" class="reply-count">💬 {{ t.replies.length }}</span>
@@ -246,7 +250,7 @@ function getStatusText(): string {
             >
               <div class="reply-head">
                 <strong>{{ r.username }}</strong>
-                <span class="text-sm text-secondary">{{ r.timestamp }}</span>
+                <span class="text-sm text-secondary">{{ postTime(r) }}</span>
                 <span class="grow" />
                 <span class="text-sm text-secondary">#{{ r.index }}</span>
               </div>

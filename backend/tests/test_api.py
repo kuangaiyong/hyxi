@@ -627,7 +627,9 @@ class TestNestedPostsApiEndToEnd:
             return out
 
         i1, i2 = all_indices(page1), all_indices(page2)
-        assert len(i1) == 6, i1          # 论坛 3 + 小组主贴1 及其 2 条评论
+        # 主贴按时间倒序，第一页 4 个主贴是「小组主贴1、小组主贴0、论坛帖子2、论坛帖子1」，
+        # 前两个各带 2 条评论
+        assert len(i1) == 8, i1
         assert not (set(i1) & set(i2)), f"两页的 index 重叠了: {i1} vs {i2}"
         assert sorted(i1 + i2) == list(range(1, 10))
 
@@ -637,6 +639,55 @@ class TestNestedPostsApiEndToEnd:
         ).json()
         flat = [p for p in page1["posts"] for p in [p] + p["replies"]]
         assert detail["content"] == flat[-1]["content"]
+
+    def test_roots_are_ordered_newest_first(self):
+        """主贴按发表时间从新到旧。存储顺序是采集顺序，跟时间毫无关系"""
+        data = self._posts(page_size=200)
+        got = [p["content"] for p in data["posts"]]
+        assert got == ["小组主贴1", "小组主贴0", "论坛帖子2", "论坛帖子1", "论坛帖子0"], got
+
+        times = [p["timestamp"] for p in data["posts"]]
+        assert times == sorted(times, reverse=True), times
+
+        # 存储顺序（index）必须原封不动 —— 它是舆情结论的对齐锚点
+        assert [p["index"] for p in data["posts"]] == [7, 4, 3, 2, 1]
+
+    def test_sorting_uses_iso_not_raw_dutch_string(self):
+        """落盘是 dd-mm-yyyy，直接按字符串排会变成「按日排先」
+
+        07-01（1月7日）会排到 28-06（6月28日）前面，整个顺序错乱且看着还挺像回事。
+        """
+        self.storage.upsert_posts("src_forum", [{
+            "username": "跨年用户", "timestamp": "07-01-2027 08:00",
+            "content": "元月的帖子", "translation": "", "page_number": 1,
+            "fingerprint": "jan", "source": "src_forum",
+            "parent_fingerprint": None, "reply_level": 0,
+        }])
+        try:
+            got = [p["content"] for p in self._posts(page_size=200)["posts"]]
+            assert got[0] == "元月的帖子", got
+        finally:
+            conn = self.storage._get_conn()
+            conn.execute("DELETE FROM posts WHERE fingerprint = 'jan'")
+            conn.commit()
+            conn.close()
+
+    def test_posts_without_a_timestamp_sink_to_the_bottom(self):
+        """早期采集读不到 tooltip 绝对时间，落盘留空。这些帖子不该霸占最前面"""
+        self.storage.upsert_posts("src_forum", [{
+            "username": "无时间用户", "timestamp": "",
+            "content": "没有时间的帖子", "translation": "", "page_number": 1,
+            "fingerprint": "notime", "source": "src_forum",
+            "parent_fingerprint": None, "reply_level": 0,
+        }])
+        try:
+            got = [p["content"] for p in self._posts(page_size=200)["posts"]]
+            assert got[-1] == "没有时间的帖子", got
+        finally:
+            conn = self.storage._get_conn()
+            conn.execute("DELETE FROM posts WHERE fingerprint = 'notime'")
+            conn.commit()
+            conn.close()
 
     def test_search_hit_on_comment_brings_back_its_root(self):
         data = self._posts(search="独特词10")

@@ -259,7 +259,7 @@ DELETE /api/v1/tasks/{id}             取消运行中 / force=true 删除已结�
 POST   /api/v1/tasks/{id}/retry       重试终态任务（复用原描述创建新任务，返回新 id）
 GET    /api/v1/tasks/{id}/events      SSE 实时进度流
 
-GET    /api/v1/tasks/{id}/posts        帖子查询（**按主贴分页**，评论在 replies 里）
+GET    /api/v1/tasks/{id}/posts        帖子查询（**按主贴分页**，评论在 replies 里，**主贴按时间倒序**）
 GET    /api/v1/tasks/{id}/posts/{idx}  单条帖子详情（0-based）
 GET    /api/v1/tasks/{id}/stats        任务统计
 GET    /api/v1/tasks/{id}/export       **唯一的导出口**（?format=xlsx|csv）
@@ -322,7 +322,7 @@ translate 和 generate_excel 在 context 里没有 posts 时会**从各数据源
 
 ## 测试
 
-**218 个测试，必须全部 PASSED**（本机实测 `218 passed in 277s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**221 个测试，必须全部 PASSED**（本机实测 `221 passed in 278s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
@@ -398,6 +398,7 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 - **存储顺序不是时间顺序，求时间区间必须排序取极值**：信息流按时间倒序渲染，增量又往后追加，落盘数组的首尾和最早/最晚毫无关系。`/stats` 曾直接取 `timestamps[0]` / `[-1]`，实测显示成「开始 2026-07-28、结束 2026-07-10」——开始比结束晚 18 天，还把跨 5～8 月的数据缩成 7 月里的 18 天。排序也**必须先 `_normalize_timestamp()` 转 ISO**：落盘的 `dd-mm-yyyy` 按字符串排是按「日」排先，`01-07` 会排到 `28-06` 前面
 - **`/posts` 的响应里评论挂在主贴的 `replies` 下，按 index 建索引时必须递归展开**：`SentimentView.loadPosts()` 曾只遍历顶层 `posts`，把全部评论漏在外面 —— 实测 88 条里 42 条是评论，情感趋势图只画了 35 条（该 73 条），详情弹窗点评论行也取不到帖子。舆情结果的下标来自扁平数组，评论一样占位
 - **舆情结果贴回帖子必须「先按 key 建映射、再排序」**：`sentiment_*.json` 的 `results[i]` 对齐的是**扁平数组**第 i 条（下标来自 `enumerate(all_posts)`），而导出明细按 `order_by_thread()` 排成「主贴 → 它的评论 → 下一主贴」。排完再按行号取，每条帖子都会配上别人的情感结论 —— 实测 88 条里 72 条位置会变，而导出的表**表面上完全看不出异常**。回归测试见 `TestExportEndpointEndToEnd::test_sentiment_follows_the_post_not_the_row_number`（把实现改成按行号取，它会立刻报出「评论A1 拿到了主贴B 的结论」）
+- **`/posts` 的主贴时间倒序排在切片之前，且只排主贴**：只排页内的话跨页看到的仍是采集顺序（一页只有 50 个主贴，后面的更新的帖子永远排在第二页）。**排序键必须先转 ISO**，理由同上一条。评论跟着自己的主贴走，不参与排序 —— 它们在 `replies` 里本来就该按发表先后读。**存储层的 `seq` 一个字都不能动**，`index` 也照旧是绝对位置：舆情结论按它对齐（见下两条）。没解析出时间的帖子沉到最后而不是当成最早 —— 早期采集读不到 tooltip 绝对时间时是**故意留空**的（写相对时间会污染指纹），这批帖子实际很新，排到最前面会把整页占满。回归测试见 `TestNestedPostsApiEndToEnd` 里 `test_roots_are_ordered_newest_first` / `test_sorting_uses_iso_not_raw_dutch_string` / `test_posts_without_a_timestamp_sink_to_the_bottom`
 - **`/posts` 的 `index` 是扁平存储数组里的绝对位置，不是页内序号**：`SentimentView` 用 `index - 1` 反查帖子，而舆情结果数组的下标来自 `enumerate(all_posts)`。一页只保证 `page_size` 个**主贴**，带上评论后条目数会超出，按页内计数编号会让相邻两页的 index 区间重叠、详情弹窗显示错帖子
 - **删数据源不能让历史任务结果变空白**：`task["result"]["sources"]` 里存了当时的 `output_path`，来源从注册表消失后 `results.py` 照原路读文件兜底
 - **爬虫必须通过 `node` 子进程调用**，不能 import

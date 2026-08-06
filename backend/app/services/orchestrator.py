@@ -214,7 +214,6 @@ class TaskOrchestrator:
 
             plan = [PlanStep(**s) for s in plan_data.get("plan", [])]
             plan, source_warnings = _resolve_sources(task, plan, enabled_sources)
-            plan = _resolve_sentiment(task, plan)
             for w in source_warnings:
                 await self._task_log(task_id, "warning", w)
             task["plan"] = [s.model_dump() for s in plan]
@@ -690,36 +689,6 @@ def _resolve_sources(task: dict, plan: List[PlanStep], sources: List[dict]):
                for sid in picked]
     rebuilt += [s for s in plan if s.action != "collect"]
     return rebuilt, warnings
-
-
-# 必须是「明确要求分析」的说法，光出现「舆情」两个字不算
-_SENTIMENT_PATTERNS = (
-    "舆情分析", "分析舆情", "情感分析", "分析情感", "情感倾向", "舆情报告",
-)
-
-
-def _resolve_sentiment(task: dict, plan: List[PlanStep]) -> List[PlanStep]:
-    """用户在描述里要了舆情分析，就在计划末尾补一个 sentiment 步骤。
-
-    同 _resolve_sources 的路子：LLM 负责理解，后端负责保证。parse_intent 的 prompt
-    里压根没有 sentiment 这个动作，所以模型永远不会产出它 —— 而「分析舆情」是完全
-    自然的写法，任务跑完却一条都没分析，用户还得自己回舆情页再点一次按钮，而且不点
-    就永远不知道没分析（页面上是别的任务留下的结论，看着像已经分析过了）。
-
-    **只认明确要求分析的说法**。本项目自己就叫「舆情分析平台」，光凭「舆情」两个字
-    触发的话，「每天抓取 Facebook 舆情数据」这种把舆情当话题词的定时任务会每轮都
-    静默调一次 LLM —— 定时任务没人盯着，扣的钱要很久以后才发现。
-    两种语序都要收：界面预设按钮和用户实际写的都是「分析舆情」，只认「舆情分析」
-    等于把这个功能对现有用法整个关掉。
-
-    放最后：舆情要读翻译后的帖子，而且它是整条链上最贵的一步。
-    """
-    if any(s.action == "sentiment" for s in plan):
-        return plan
-    desc = task.get("description", "")
-    if not any(p in desc for p in _SENTIMENT_PATTERNS):
-        return plan
-    return plan + [PlanStep(action="sentiment", params={})]
 
 
 def _resolve_start_page(task: dict, params: dict) -> Optional[int]:

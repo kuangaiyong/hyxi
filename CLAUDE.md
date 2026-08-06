@@ -200,7 +200,9 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 - **展开后按钮文字变成「收起」，同样会被 `textContent` 吃进正文**，和没点开时残留的「… 展开」一样都要剥掉（`bodyTrail`）。它们进的是 `content` 前 100 字 = 指纹，留着等于把界面文案写进去重锚点，且同一条帖子展开前后会算出两个指纹。已展开的按钮文字已经不是「展开」，所以每批重新提取时不会重复点击
 - **评论正文是一串并列的 `div[dir="auto"]`，一段一个**（`commentText()`）。`querySelector` 只拿第一段 —— 实测一条 9 段的评论只存下第一段的 71 个字符，原文 811 个，丢了 92%；一轮 42 条评论里 13 条多段，共丢 2792 个字符。**层级限定不能省**：嵌套回复也是 `article`，不加 `closest(sel.post) === root` 就会把子回复的正文并进父评论，父子两条都错。主贴不走这条路（取的是 `[data-ad-comet-preview="message"]` 容器的 textContent，本来就含全部段落），所以主贴段落之间没有换行、评论之间有 —— 这是两条不同的取法，不是 bug
 - **「查看N条回复」/「查看更多评论」目前不点，那部分评论根本没进 DOM**（实测一页上有 26 条这样的回复）。要补齐得循环点击并等加载，会显著增加请求量，与反爬虫姿态需要一并权衡
-- **信息流里混着不是帖子的 `role="article"`**（广告、推荐小组卡片），既没有固定链接也没有正文容器，`flatten()` 用 `isNotAPost()` 把它们丢掉。存下来就是一条四个字段全空的记录 —— 白占一次翻译调用（清理前的落盘数据里有 55 条这种，全被标成「已翻译」），还会在结果页显示成一条什么都没有的帖子。**判据是 id 和正文全都没有**：纯图片帖有 id 没正文、正文没渲染出来的帖子有正文没 id，两种都是真帖子，不能误伤
+- **信息流里混着不是帖子的 `role="article"`**（广告、推荐小组卡片），既没有固定链接也没有正文容器，`flatten()` 用 `isNotAPost()` 把它们丢掉。存下来就是一条四个字段全空的记录 —— 白占一次翻译调用（清理前的落盘数据里有 55 条这种，全被标成「已翻译」），还会在结果页显示成一条什么都没有的帖子。`isNotAPost()` 的判据是 id 和正文全都没有。**正文为空但有 id 的那一类不在这里拦**（见下条）
+- **正文为空的帖子一条都不入库**，拦在 `storage.drop_empty_posts()`（`upsert_posts()` 开头调用）。它翻译不了（实测那条被标成「已翻译」、译文是空串）、舆情永远分析不了（`analyze()` 按 `non_empty` 过滤），在报告和舆情页上就一直挂着一行什么都没有的「未分析」。**拦在入库口而不是采集脚本里**，理由有两条：一是 `upsert_posts()` 是 posts 表唯一的门，三个采集器和以后新加的都不用各自记得过滤；二是**在 `flatten()` 里过滤会把评论一起带走** —— 它是「主贴 → 它的评论」嵌套遍历的，实测那条空主贴下面挂着 2 条有内容的真实发言。`drop_empty_posts()` 因此把孤儿评论就地提成主贴（`parent_fingerprint=None`、`reply_level=0`），而不是留一个指向已删帖子的悬空 parent；父贴本来就没正文，评论失去的上下文是空的。回归测试见 `TestEmptyPostsNeverStoredEndToEnd`
+- **历史迁移不能套用这条规则**：`migrate_posts_file()` 传 `drop_empty=False`。迁移是**照原样重建**，旧舆情 blob 的 `results[i]` 对齐的正是那个数组的第 i 条 —— 少搬一条，条数就对不上，`migrate_sentiment_blob()` 的「条数不等整份跳过」会把那个来源的历史结论**永久**挡在门外，且没有任何报错。回归测试见 `TestPostsStorageEndToEnd::test_migration_keeps_empty_posts_so_sentiment_blob_still_aligns`
 - **正文图是 `<img>`，host 在 `scontent-*.xx.fbcdn.net` 上，渲染尺寸几百像素**（实测 367×795 这个量级，`alt` 是 Facebook 自动生成的「可能是包含下列内容的图片：…」）。界面图标是 `data:image/svg+xml`（16~18px）、emoji 在 `static.xx.fbcdn.net`，按 host 一刀就切干净；**头像是 `<svg><image>` 不是 `img`**，压根不会被 `querySelectorAll('img')` 选中。尺寸下限是第二道保险
 - **图片不必额外滚动去凑**：实测滚到底后逐个主贴 `scrollIntoView`，原有 15 个主贴的图片数**一张没变**（1→1、0→0），多出来的全是新滚出来的帖子 —— 也就是说「这条没图」是真没图，不是懒加载没触发
 - **真实 `message_id` 实测全是 16 位纯数字**。`p1` / `c1` 这种前缀式 id 只有 fixture 站点会生成 —— 落盘数据里出现它就说明某次测试写进了真实文件（发生过 3 条）
@@ -319,11 +321,13 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 
 translate、generate_excel 和 sentiment 在 context 里没有 posts 时会**从各数据源已落盘的 JSON 兜底加载**（`_load_posts_from_sources()`），所以可以只提交「翻译已有数据」这类任务。不再有 `_extract_thread_id()` 那套「从描述里抠 5 位数字」的猜测，也不再 glob `tweakers_thread_*.json`。
 
-**sentiment 步骤由 `_resolve_sentiment()` 补，不是 LLM 给的**：`parse_intent` 的 prompt 里只有 collect / translate / generate_excel 三个动作，模型**永远产不出** sentiment。描述里出现「舆情分析 / 分析舆情 / 情感分析 / 分析情感 / 情感倾向 / 舆情报告」就在计划末尾追加一步（放最后：它要读翻译后的帖子，且是整条链上最贵的一步）。同 `_resolve_sources` 的路子——LLM 负责理解，后端负责保证。**没写就不加**，舆情是要花钱的。
+**要不要 sentiment 步骤由 LLM 判断，没有关键词表**：`sentiment` 是 `parse_intent` prompt 里的第 4 个动作，模型按用户描述自己决定加不加。**别再退回关键词匹配**——曾经用过 `("舆情分析","分析舆情","情感分析",…)` 这种子串表，「分析一下舆情」「帮我分析下舆情」中间插了词就全认不出，而这正是用户的自然写法。
 
-**只认「明确要求分析」的说法，光出现「舆情」两个字不算**。本项目自己就叫「舆情分析平台」，凭单个词触发的话，「每天抓取 Facebook 舆情数据」这种把舆情当话题词的**定时任务会每轮都静默调一次 LLM**——定时任务没人盯着，扣的钱要很久以后才发现。**两种语序都必须收**（「分析舆情」和「舆情分析」）：界面预设按钮 `TaskManagementView.vue` 的 quickActions 和用户实际写的都是「分析舆情」，只认「舆情分析」等于把这个功能对现有用法整个关掉。匹配是子串，中间插了词认不出（「分析一下舆情」），与 `_resolve_sources` 判「所有来源」同一权衡。
+prompt 里有两条必须留着：一是**正例要列全**（各种语序和口语说法），二是**必须给反例**——「抓取舆情数据」「采集舆情相关帖子」只是把舆情当话题词，不该触发。本项目自己就叫「舆情分析平台」，没有反例的话模型会把话题词也当成要求，而**定时任务没人盯着**，每轮静默逐条调一次 LLM，扣的钱要很久以后才发现。还有一条是 sentiment 必须排在 translate 之后（它读的是译文）。
 
-新建任务、`POST /tasks/{id}/retry`、定时任务三条入口都走 `run_task_async` → `execute_task`，所以这条规则对三者一致生效。回归测试见 `TestResolveSentimentEndToEnd`。
+真实模型实测 9/9（`分析一下舆情`/`帮我分析下舆情`/`看看大家的情感倾向如何`/`出一份舆情报告` 都给出 sentiment，`每天抓取Facebook上的舆情数据`/`采集舆情相关帖子并翻译成中文` 都不给）。自动化测试只能钉住「prompt 里确实声明了这个动作和那条反例」（`TestSentimentActionIsOfferedToTheLLM`）和「计划里有就执行、没有就不执行」（`TestPipelineSentimentStepEndToEnd`）——模型理解得准不准，只能对真模型跑。
+
+新建任务、`POST /tasks/{id}/retry`、定时任务三条入口都走 `run_task_async` → `execute_task`，所以这条规则对三者一致生效。
 
 漏掉这一步的后果特别隐蔽：结论按帖子身份跨任务共享，所以新任务一打开，页面上是**上一个任务留下的**结论，看着像已经分析过了；只有那几条新采到的帖子是空的，得逐条翻才发现。用户实测报过（95 条里只有第 95 条没分析，因为它是当天新增的唯一一条）。
 
@@ -335,7 +339,7 @@ translate、generate_excel 和 sentiment 在 context 里没有 posts 时会**从
 
 ## 测试
 
-**233 个测试，必须全部 PASSED**（本机实测 `233 passed in 287s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**233 个测试，必须全部 PASSED**（本机实测 `233 passed in 280s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v

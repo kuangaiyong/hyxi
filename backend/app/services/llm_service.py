@@ -120,6 +120,7 @@ class LLMService:
 1. collect - 从一个数据源采集帖子（参数：source_id 数据源ID）
 2. translate - 翻译帖子内容（参数：target_lang 目标语言默认zh-CN）
 3. generate_excel - 生成Excel报告（参数：include_stats 是否包含统计表默认true）
+4. sentiment - 舆情/情感分析（无参数）
 
 当前可用的数据源：
 {catalog}
@@ -130,7 +131,8 @@ class LLMService:
   "plan": [
     {{"action": "collect", "params": {{"source_id": "src_a1b2c3d4"}}}},
     {{"action": "translate", "params": {{"target_lang": "zh-CN"}}}},
-    {{"action": "generate_excel", "params": {{"include_stats": true}}}}
+    {{"action": "generate_excel", "params": {{"include_stats": true}}}},
+    {{"action": "sentiment", "params": {{}}}}
   ]
 }}
 
@@ -145,6 +147,11 @@ class LLMService:
 - 如果用户只要求翻译已有数据，不要包含 collect 步骤
 - 如果用户只要求采集不翻译，不要包含 translate 步骤
 - 翻译使用 LLM 大模型进行专业翻译
+- 用户要求做舆情/情感分析时，在计划**最后**加一个 sentiment 步骤。各种说法都算：
+  「分析舆情」「舆情分析」「帮我分析下舆情」「分析一下大家的情感倾向」「出份舆情报告」等
+- 但用户只是把「舆情」当话题词提了一下（如「抓取舆情数据」「采集舆情相关帖子」），
+  **不要**加 sentiment 步骤 —— 舆情分析要额外逐条调用大模型，用户没要求就别花这个钱
+- sentiment 必须排在 translate 之后：它读的是翻译后的帖子
 - 输出纯JSON，不要包含markdown代码块标记"""
 
         async def _call():

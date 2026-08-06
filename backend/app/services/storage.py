@@ -285,6 +285,11 @@ def migrate_posts_file(source_id: str, path: str) -> int:
     """把一个来源的落盘 JSON 搬进 posts 表，seq 取数组下标。
 
     幂等：该来源已有帖子就跳过 —— 重跑不能把 seq 洗牌，那会让所有历史结论错位。
+
+    **空正文帖照搬不误**（`drop_empty=False`）：迁移是照原样重建历史，旧舆情 blob
+    的 results[i] 对齐的正是这个数组的第 i 条。少搬一条，条数就对不上，
+    migrate_sentiment_blob() 会整份跳过，那个来源的历史结论就再也进不来了。
+    新采集到的空正文帖仍然被挡在 upsert_posts() 门口。
     """
     if not os.path.exists(path) or count_posts(source_id) > 0:
         return 0
@@ -293,7 +298,7 @@ def migrate_posts_file(source_id: str, path: str) -> int:
     posts = loaded.get("posts") or []
     for p in posts:
         p.setdefault("source", source_id)
-    added = upsert_posts(source_id, posts)
+    added = upsert_posts(source_id, posts, drop_empty=False)
     logger.info("来源 %s 的 %d 条帖子已迁入 posts 表", source_id, added)
     return added
 
@@ -741,13 +746,53 @@ def max_page_number(source_id: str) -> int:
         conn.close()
 
 
-def upsert_posts(source_id: str, posts: List[dict]) -> int:
+def drop_empty_posts(posts: List[dict]) -> List[dict]:
+    """丢掉正文为空的帖子，并把它们的评论提成主贴。
+
+    空正文帖在报告里是一行什么都没有的记录，还白占一次翻译调用（实测那条已被标成
+    「已翻译」，译文是空串），舆情又永远分析不了它 —— 页面上就一直挂着一条「未分析」。
+
+    **丢主贴不能连累它的评论**：实测那条空主贴下面挂着 2 条有内容的评论，采集脚本
+    的 flatten() 是按「主贴 → 它的评论」嵌套遍历的，在那里过滤会把评论一起带走。
+    所以过滤放在这个唯一的入库口，并把孤儿评论就地提成主贴 —— 父贴本来就没有正文，
+    评论失去的上下文是空的，没有损失。
+    """
+    dropped = {
+        p.get("fingerprint") for p in posts
+        if p.get("fingerprint") and not (p.get("content") or "").strip()
+    }
+    if not dropped:
+        return posts
+
+    kept = []
+    for post in posts:
+        if post.get("fingerprint") in dropped:
+            continue
+        if post.get("parent_fingerprint") in dropped:
+            post = dict(post)
+            post["parent_fingerprint"] = None
+            post["reply_level"] = 0
+        kept.append(post)
+    logger.info("丢弃 %d 条空正文帖子，保留 %d 条", len(dropped), len(kept))
+    return kept
+
+
+def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True) -> int:
     """写入采集结果，返回新增条数。
 
     **已存在的帖子只更新采集字段，绝不覆盖 translation / translated / sentiment_at**。
     整体覆盖等于把已翻译的帖子重新变成新帖，下一轮再付一次翻译钱、舆情也重算一遍
     （group_feed.js 曾经就是这么错的）。
+
+    空正文帖在这里就被挡掉（见 drop_empty_posts）—— 这是 posts 表唯一的入口，
+    放在这里三个采集器和以后新加的采集器都不用各自记得过滤一遍。
+
+    `drop_empty=False` 只给历史迁移用：迁移是**照原样重建**，不是采集。少搬一条
+    就会让入库条数对不上旧舆情 blob 的 results 长度，`migrate_sentiment_blob()`
+    的「条数不等整份跳过」会因此把那个来源的历史结论永久挡在门外。
     """
+    if drop_empty:
+        posts = drop_empty_posts(posts)
     if not posts:
         return 0
     conn = _get_conn()

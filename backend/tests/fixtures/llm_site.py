@@ -2,12 +2,12 @@
 
 真 HTTP、真 httpx 客户端、真解析逻辑 —— 换掉的只是模型本身，因为真模型没法
 稳定复现「这一批里第三条吐了非 JSON」。它按请求体自己判断走哪条分支：
-  意图解析请求（system prompt 里是那个调度器）→ 回一份**不含 sentiment 的**计划
+  意图解析请求（system prompt 里是那个调度器）→ 按描述里要没要舆情回不同的计划
   批量舆情请求（user_message 里有多条「帖子N」）→ 故意少给一段分隔符
   单条重试请求（只有一条）                      → 返回合法 JSON
 
-意图解析那条永远不给 sentiment 步骤 —— 真模型也给不出来（parse_intent 的
-prompt 里压根没这个动作），补步骤是 _resolve_sentiment 的活。
+意图识别本身由真模型负责（prompt 里已有 sentiment 动作），这里只是个可控的替身：
+测的是「计划里有 sentiment 就执行、没有就不执行」，不是模型理解得准不准。
 """
 
 import json
@@ -19,6 +19,8 @@ GOOD = ('{"sentiment": "negative", "intensity": 4, '
         '"reason_cn": "单条重试成功", "dimensions": ["固件更新"]}')
 SEPARATOR = "---SENTIMENT_SEPARATOR---"
 PLAN = '{"plan": [{"action": "generate_excel", "params": {"include_stats": true}}]}'
+PLAN_WITH_SENTIMENT = ('{"plan": [{"action": "generate_excel", "params": {"include_stats": true}}, '
+                       '{"action": "sentiment", "params": {}}]}')
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -33,9 +35,12 @@ class _Handler(BaseHTTPRequestHandler):
                 system_msg = m.get("content") or ""
         n_posts = len(re.findall(r"^帖子\d+ \[来源:", user_msg, re.M))
         self.server.seen.append("plan" if "智能调度器" in system_msg else n_posts)
+        self.server.prompts.append(system_msg)
 
         if "智能调度器" in system_msg:
-            content = PLAN
+            # 替身模型：描述里要了舆情就给带 sentiment 的计划。真模型靠 prompt
+            # 里那几条规则自己判断，这里只需要可控
+            content = PLAN_WITH_SENTIMENT if "舆情" in user_msg else PLAN
         elif n_posts > 1:
             # 批量：前 n-1 条正常，最后一条给一段解析不了的文本。
             # 分隔符数量仍然对得上，所以走的是 _parse_sentiment 失败那条路，
@@ -68,6 +73,7 @@ class LLMSite:
     """with LLMSite() as base_url: ...
 
     seen 记下每次请求里有几条帖子，用来断言重试确实是「一条一条」发出去的。
+    prompts 记下每次请求的 system prompt，用来断言模型确实被告知了某个动作。
     """
 
     def __init__(self, port: int = 0):
@@ -75,10 +81,12 @@ class LLMSite:
         self._server = None
         self._thread = None
         self.seen = []
+        self.prompts = []
 
     def __enter__(self) -> str:
         self._server = ThreadingHTTPServer(("127.0.0.1", self._port), _Handler)
         self._server.seen = self.seen
+        self._server.prompts = self.prompts
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         return "http://127.0.0.1:{}".format(self._server.server_address[1])

@@ -430,51 +430,101 @@ class TestResolveSourcesEndToEnd:
         assert warns == []
 
 
-class TestResolveSentimentEndToEnd:
-    """描述里要了舆情分析，流水线就得真去分析 —— 模型永远给不出这个步骤"""
+class TestSentimentActionIsOfferedToTheLLM:
+    """舆情步骤由模型自己判断要不要，不再有关键词表。至少得让它知道有这个动作"""
 
-    def _resolve(self, desc, plan_actions=(("collect", {}), ("translate", {}))):
-        from app.models import PlanStep
-        from app.services.orchestrator import _resolve_sentiment
-        plan = [PlanStep(action=a, params=p) for a, p in plan_actions]
-        return [s.action for s in _resolve_sentiment({"description": desc}, plan)]
+    def test_prompt_declares_the_sentiment_action_and_when_to_use_it(self):
+        import asyncio
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures"))
+        import llm_site
+        from app.services.llm_service import LLMService
+        from app.models import LLMConfig
 
-    def test_sentiment_step_is_appended_at_the_end(self):
-        """舆情要读翻译后的帖子，而且是整条链上最贵的一步，只能排最后"""
-        assert self._resolve("只采集Facebook的帖子，翻译成中文，导出Excel，分析舆情",
-                             [("collect", {}), ("translate", {}), ("generate_excel", {})]) == \
-            ["collect", "translate", "generate_excel", "sentiment"]
+        server = llm_site.LLMSite()
+        with server as base_url:
+            svc = LLMService(LLMConfig(api_key="sk-test", base_url=base_url,
+                                       model_name="test-model"))
+            plan = asyncio.new_event_loop().run_until_complete(
+                svc.parse_intent("帮我分析下舆情", [])
+            )
 
-    def test_description_without_sentiment_is_untouched(self):
-        """没要就别跑 —— 舆情是要花钱调 LLM 的"""
-        assert self._resolve("采集帖子，翻译成中文") == ["collect", "translate"]
+        prompt = server.prompts[0]
+        assert "sentiment" in prompt, "模型看不到这个动作就永远产不出它"
+        # 只把「舆情」当话题词提一下不该触发 —— 舆情分析要逐条调 LLM，很贵
+        assert "抓取舆情数据" in prompt, "缺了反例，模型会把话题词也当成要求"
+        assert "translate 之后" in prompt, "舆情读的是译文，顺序必须交代"
+        # 模型给了 sentiment，解析这一层就得原样带出来
+        assert [s["action"] for s in plan["plan"]] == ["generate_excel", "sentiment"]
 
-    def test_no_duplicate_when_plan_already_has_one(self):
-        assert self._resolve("分析舆情", [("collect", {}), ("sentiment", {})]) == \
-            ["collect", "sentiment"]
 
-    def test_other_wordings_are_recognized(self):
-        # 子串匹配，中间插了词就认不出（「分析一下舆情」）—— 同 _resolve_sources
-        # 判「所有来源」的策略，项目已接受这个权衡，不为此引入正则
-        for desc in ("做一下舆情分析", "做一下情感分析", "分析情感",
-                     "看看情感倾向", "输出舆情报告"):
-            assert self._resolve(desc)[-1] == "sentiment", desc
+class TestEmptyPostsNeverStoredEndToEnd:
+    """正文为空的帖子一条都不入库 —— 它翻译不了、分析不了，只在报告里占一行空白"""
 
-    def test_topic_word_alone_does_not_trigger(self):
-        """光提「舆情」不算要求分析 —— 本项目自己就叫「舆情分析平台」。
+    def setup_method(self):
+        import app.services.storage as storage_module
+        self.tmpdir = tempfile.mkdtemp()
+        self.storage = storage_module
+        self._old_db = storage_module.DB_PATH
+        storage_module.DB_PATH = os.path.join(self.tmpdir, "hyxi.db")
+        storage_module.init_db()
 
-        定时任务尤其危险：「每天抓取Facebook舆情数据」这种描述每轮都会静默调一次
-        LLM，而定时任务没人盯着，扣的钱要很久以后才发现。
+    def teardown_method(self):
+        self.storage.DB_PATH = self._old_db
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _post(self, fp, content, parent=None, level=0):
+        return {"username": "某人", "timestamp": "01-07-2026 10:00", "content": content,
+                "translation": "", "page_number": 1, "fingerprint": fp, "source": "src_e",
+                "parent_fingerprint": parent, "reply_level": level}
+
+    def test_empty_post_is_not_stored(self):
+        added = self.storage.upsert_posts("src_e", [
+            self._post("a", "有正文的帖子"),
+            self._post("b", ""),
+            self._post("c", "   \n  "),   # 只有空白也算空
+        ])
+        assert added == 1
+        assert [p["fingerprint"] for p in self.storage.load_posts(["src_e"])] == ["a"]
+
+    def test_comments_of_a_dropped_root_survive_as_roots(self):
+        """实测踩过：那条空主贴下面挂着 2 条有内容的评论。
+
+        采集脚本的 flatten() 是「主贴 → 它的评论」嵌套遍历的，在那里过滤会把评论
+        一起带走 —— 两条真实发言就这么没了。
         """
-        for desc in ("每天抓取Facebook上的舆情数据", "定时采集舆情，导出Excel",
-                     "抓取舆情相关帖子并翻译"):
-            assert self._resolve(desc) == ["collect", "translate"], desc
+        self.storage.upsert_posts("src_e", [
+            self._post("root", ""),
+            self._post("c1", "评论一", parent="root", level=1),
+            self._post("c2", "评论二", parent="root", level=1),
+        ])
+        posts = self.storage.load_posts(["src_e"])
+        assert [p["fingerprint"] for p in posts] == ["c1", "c2"]
+        # 提成主贴，而不是留一个指向已删帖子的悬空 parent
+        assert [p["parent_fingerprint"] for p in posts] == [None, None]
+        assert [p["reply_level"] for p in posts] == [0, 0]
 
-    def test_both_word_orders_are_accepted(self):
-        """界面预设按钮和用户实际写的都是「分析舆情」，只认「舆情分析」等于整个关掉"""
-        for desc in ("采集所有来源的帖子，翻译成中文，导出Excel，分析舆情",
-                     "采集所有来源的帖子，翻译成中文，导出Excel，舆情分析"):
-            assert self._resolve(desc)[-1] == "sentiment", desc
+    def test_seq_still_has_no_holes_so_ordering_survives(self):
+        """seq 是全链路的顺序锚点，被丢掉的帖子不能在里面留个洞"""
+        self.storage.upsert_posts("src_e", [
+            self._post("a", "第一条"), self._post("skip", ""), self._post("b", "第二条"),
+        ])
+        conn = self.storage._get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT fingerprint, seq FROM posts WHERE source_id='src_e' ORDER BY seq"
+            ).fetchall()
+        finally:
+            conn.close()
+        assert [(r["fingerprint"], r["seq"]) for r in rows] == [("a", 0), ("b", 1)]
+
+    def test_second_round_does_not_resurrect_them(self):
+        """增量重抓会把同一条空帖再送一遍，不能这轮挡住下轮放行"""
+        self.storage.upsert_posts("src_e", [self._post("a", "有正文")])
+        added = self.storage.upsert_posts("src_e", [
+            self._post("a", "有正文"), self._post("b", ""),
+        ])
+        assert added == 0
+        assert len(self.storage.load_posts(["src_e"])) == 1
 
 
 class TestPipelineSentimentStepEndToEnd:
@@ -545,12 +595,11 @@ class TestPipelineSentimentStepEndToEnd:
         posts = self.storage.load_posts(["src_p"])
         return posts, [(p.get("_processed") or {}).get("sentiment_at") for p in posts]
 
-    def test_description_asking_for_sentiment_actually_analyzes(self):
+    def test_plan_with_sentiment_actually_analyzes(self):
         """用户报的就是这个：描述里写了「分析舆情」，任务跑完一条都没分析。
 
-        LLM 的计划里永远没有 sentiment（parse_intent 的 prompt 里没这个动作），
-        全靠 _resolve_sentiment 补。补不上的话，页面上显示的是别的任务留下的结论，
-        看着像分析过了，用户根本发现不了。
+        模型识别出意图、计划里带了 sentiment，流水线就必须真的去分析。不然页面上
+        显示的是别的任务留下的结论，看着像分析过了，用户根本发现不了。
         """
         task, seen = self._run("翻译已有数据，导出Excel，分析舆情")
 
@@ -571,6 +620,7 @@ class TestPipelineSentimentStepEndToEnd:
         assert [s for s in seen if s != "plan"] == [], f"重复分析了: {seen}"
 
     def test_no_sentiment_step_means_no_llm_analysis_calls(self):
+        """模型没给 sentiment 步骤时，一次分析调用都不该发生 —— 那是要花钱的"""
         task, seen = self._run("翻译已有数据，导出Excel")
         assert [s["action"] for s in task["plan"]] == ["generate_excel"]
         assert [s for s in seen if s != "plan"] == [], f"没要舆情却调了分析: {seen}"
@@ -1290,6 +1340,25 @@ class TestPostsStorageEndToEnd:
         # 幂等：重跑不能把 seq 洗牌，也不能重复插入
         assert self.storage.migrate_posts_file("src_x", path) == 0
         assert self.storage.count_posts("src_x") == 6
+
+    def test_migration_keeps_empty_posts_so_sentiment_blob_still_aligns(self):
+        """迁移是照原样重建历史，不能套用「空正文不入库」那条采集规则。
+
+        旧舆情 blob 的 results[i] 对齐的正是这个数组的第 i 条。迁移时少搬一条，
+        条数就对不上，migrate_sentiment_blob() 的「条数不等整份跳过」会把那个来源的
+        历史结论永久挡在门外 —— 静默丢掉一整份分析结果，而且没人看得出来。
+        """
+        posts = [self._p("fp0"), self._p("fp1", content=""), self._p("fp2")]
+        path = os.path.join(self.tmpdir, "legacy_with_empty.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"total_pages": 1, "posts": posts}, f, ensure_ascii=False)
+
+        assert self.storage.migrate_posts_file("src_e", path) == 3
+        assert [p["fingerprint"] for p in self.storage.load_posts(["src_e"])] \
+            == ["fp0", "fp1", "fp2"]
+
+        # 但新采集到的空正文帖照样挡在门外
+        assert self.storage.upsert_posts("src_e", [self._p("fp3", content="")]) == 0
     """舆情结果数组的下标必须是全量帖子数组里的绝对位置。
 
     页面和导出都按下标反查帖子。存成「待分析批次内的下标」不会报任何错，

@@ -230,8 +230,9 @@ function getStatusText(): string {
           :class="{ hit: t.root.matched }"
         >
           <header class="thread-head">
+            <span class="badge-role">主贴</span>
             <span class="badge-source">{{ t.root.source_name }}</span>
-            <strong>{{ t.root.username }}</strong>
+            <strong class="root-user">{{ t.root.username }}</strong>
             <span class="text-sm text-secondary">{{ postTime(t.root) }}</span>
             <span class="grow" />
             <span class="text-sm text-secondary">#{{ t.root.index }}</span>
@@ -241,6 +242,7 @@ function getStatusText(): string {
           <PostContent :post="t.root" :mode="viewMode" @zoom="zoomUrl = $event" />
 
           <div v-if="t.replies.length" class="replies">
+            <div class="replies-label">💬 {{ t.replies.length }} 条回复</div>
             <div
               v-for="r in visibleReplies(t)"
               :key="threadKey(r)"
@@ -249,7 +251,8 @@ function getStatusText(): string {
               :style="{ marginLeft: Math.min(r.reply_level - 1, 3) * 18 + 'px' }"
             >
               <div class="reply-head">
-                <strong>{{ r.username }}</strong>
+                <span class="reply-arrow" aria-hidden="true">↳</span>
+                <span class="reply-user">{{ r.username }}</span>
                 <span class="text-sm text-secondary">{{ postTime(r) }}</span>
                 <span class="grow" />
                 <span class="text-sm text-secondary">#{{ r.index }}</span>
@@ -314,15 +317,25 @@ function getStatusText(): string {
   gap: 12px;
   padding: 12px 16px 0;
 }
+/* 主贴 vs 回复的区分靠四路信号叠加，缺一路都会有人看不出来：
+   ①「主贴」文字徽标 ② 主贴左侧的主色粗竖条 ③ 回复整块下沉成一个内嵌面板
+   ④ 每条回复前的 ↳（与导出 Excel 的 └─ 前缀同一个语义）。
+   **不能只靠边框颜色**：深色主题下 --border-light 恰好等于 --bg-card，
+   改造前回复那条 2px 竖线在深色下完全看不见。 */
+.thread-list {
+  --reply-panel: #F1F5F9;
+  --reply-rail: #94A3B8;
+}
+[data-theme="dark"] .thread-list {
+  --reply-panel: #172033;
+  --reply-rail: #475569;
+}
 .thread {
-  border: 1px solid var(--border-light);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--primary);
   border-radius: 8px;
   padding: 12px 14px;
   background: var(--bg-card, transparent);
-}
-.thread.hit,
-.reply.hit {
-  background: var(--warning-bg, #fef3c7);
 }
 .thread-head,
 .reply-head {
@@ -335,27 +348,66 @@ function getStatusText(): string {
 .grow {
   flex: 1;
 }
+.badge-role {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--primary);
+  color: #fff;
+  letter-spacing: 0.5px;
+}
+.root-user {
+  font-size: 15px;
+}
 .badge-source {
   font-size: 11px;
   padding: 2px 8px;
   border-radius: 10px;
   background: var(--border-light);
   color: var(--text-secondary);
+  border: 1px solid var(--border);
 }
 .reply-count {
   font-size: 12px;
   color: var(--text-secondary);
 }
+/* 回复整块缩进 + 换底色：一眼就能看出它从属于上面那张卡，而不是并列的另一条帖子 */
 .replies {
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px dashed var(--border-light);
+  margin: 12px 0 0 12px;
+  padding: 8px 12px 10px;
+  background: var(--reply-panel);
+  border-left: 3px solid var(--reply-rail);
+  border-radius: 0 6px 6px 0;
 }
-/* 左侧竖线是层级的主要信号：光靠缩进，行一多就分不出谁回复谁 */
+.replies-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
 .reply {
-  border-left: 2px solid var(--border-light);
+  border-left: 2px solid var(--reply-rail);
   padding: 6px 0 6px 10px;
   margin-bottom: 6px;
+}
+.reply-arrow {
+  color: var(--reply-rail);
+  font-weight: 700;
+}
+.reply-user {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+/* 搜索命中的高亮压在层级配色之上，否则回复面板的底色会把它盖掉 */
+.thread.hit,
+.reply.hit {
+  background: var(--warning-bg, #fef3c7);
+}
+[data-theme="dark"] .thread.hit,
+[data-theme="dark"] .reply.hit {
+  background: #4A3A12;
 }
 .more-replies {
   border: none;

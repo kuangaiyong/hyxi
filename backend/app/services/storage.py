@@ -597,16 +597,18 @@ def migrate_sentiment_blob(task_id: str, posts: List[dict]) -> bool:
     data = json.loads(row["data_json"])
     results = data.get("results") or []
 
-    # 结果比帖子多，通常是某个来源的落盘文件后来被删了（尾部那些结论的归属帖子
-    # 已经不存在）。**不能因此整份放弃** —— 前缀仍然对得上就该救回来，
-    # 校验交给下面的不变量，而不是靠长度一票否决
-    usable = min(len(results), len(posts))
-    if len(results) > len(posts):
-        logger.warning("舆情 %s 有 %d 条结果但只剩 %d 条帖子，尾部 %d 条的归属帖子已不存在，"
-                       "只迁前 %d 条", task_id, len(results), len(posts),
-                       len(results) - usable, usable)
+    # 条数对不上就整份跳过。曾经想「只迁对得上的前缀」把多出来的尾部丢掉，
+    # 那假设了缺文件的来源排在最后 —— 实测踩过：某任务采了 tweakers(9) +
+    # group_feed(8)，先跑的 tweakers 落盘文件后来被删，幸存的 8 条 group_feed
+    # 帖子于是套上了 results[0:8]，也就是 tweakers 的结论。下面那条不变量拦不住
+    # （8 条帖子确实都带着 sentiment_at），错位悄无声息。
+    # 少迁一份还能从旧表重来，迁错了没人看得出来。
+    if len(results) != len(posts):
+        logger.error("舆情 %s 有 %d 条结果但当前是 %d 条帖子，对不上，跳过迁移",
+                     task_id, len(results), len(posts))
+        return False
 
-    for i in range(usable):
+    for i in range(len(results)):
         r = results[i]
         if r and r.get("sentiment") and not (posts[i].get("_processed") or {}).get("sentiment_at"):
             logger.error("舆情 %s 第 %d 条有结论但帖子没有 sentiment_at 标记，"
@@ -614,7 +616,7 @@ def migrate_sentiment_blob(task_id: str, posts: List[dict]) -> bool:
             return False
 
     save_sentiment(task_id, data, posts)
-    logger.info("舆情 %s 已按帖子身份重存 %d 条结论", task_id, usable)
+    logger.info("舆情 %s 已按帖子身份重存 %d 条结论", task_id, len(results))
     return True
 
 

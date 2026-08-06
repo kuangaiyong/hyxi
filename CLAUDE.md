@@ -130,7 +130,7 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
 
 **采集脚本不再读旧数据**。它只输出本轮新抓到的，合并由 `storage.upsert_posts()` 做：已存在的帖子**只更新采集字段**，绝不覆盖 `translation` / `translated` / `sentiment_at`。增量所需的 `known_fingerprints` 与续抓页码由 Python 从库里算好，通过 job 文件下发。
 
-**迁移**：启动时 `migrate_from_json()` 幂等执行，源文件移进 `data/_migrated_backup/` 而不是删掉。舆情从旧的整块 JSON 列搬到键控表时，靠一条**可检验的不变量**兜底 —— 凡是 `results[i]` 有结论，第 i 条帖子必须已带 `sentiment_at`；对不上就整份跳过并保留原数据。某个来源的落盘文件被删导致结果比帖子多时，只迁对得上的前缀，尾部丢弃并打 warning。
+**迁移**：启动时 `migrate_from_json()` 幂等执行，源文件移进 `data/_migrated_backup/` 而不是删掉。舆情从旧的整块 JSON 列搬到键控表时，靠一条**可检验的不变量**兜底 —— 凡是 `results[i]` 有结论，第 i 条帖子必须已带 `sentiment_at`；对不上就整份跳过并保留原数据。**结果条数与帖子条数不等也整份跳过**，不许「只迁对得上的前缀」—— 那假设了缺文件的来源排在末尾，而实测踩过反例（tweakers 排在前、文件被删，幸存的 8 条 group_feed 帖子套上了 tweakers 的结论，5 条错位，且上面那条不变量拦不住）。
 
 ## 数据源与凭据
 

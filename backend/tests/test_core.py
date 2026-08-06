@@ -852,19 +852,24 @@ class TestJsonToSqliteMigrationEndToEnd:
         assert got["results"][0]["intensity"] == 4
         assert isinstance(got["results"][0]["intensity"], int)
 
-    def test_deleted_source_keeps_the_surviving_prefix(self):
-        """某个来源的落盘文件被删后结果比帖子多。尾部救不回来，前缀不该跟着陪葬"""
-        posts = [self._post("p1"), self._post("p2")]
-        self._seed_legacy("t", [
-            {"sentiment": "positive", "intensity": 4, "reason_cn": "属于p1", "dimensions": []},
-            {"sentiment": "negative", "intensity": 3, "reason_cn": "属于p2", "dimensions": []},
-            {"sentiment": "neutral", "intensity": 1, "reason_cn": "归属帖子已不存在", "dimensions": []},
-        ])
-        assert self.storage.migrate_sentiment_blob("t", posts) is True
+    def test_deleted_leading_source_does_not_shift_conclusions(self):
+        """结果比帖子多时不许「迁前缀」—— 缺文件的来源可能排在最前面。
 
-        got = self.storage.get_sentiment("t", posts)
-        assert [r["reason_cn"] for r in got["results"]] == ["属于p1", "属于p2"]
-        assert got["total"] == 2
+        实测踩过：某任务采了 tweakers(9) + group_feed(8)，tweakers 的落盘文件后来
+        被删，幸存的 8 条 group_feed 帖子于是套上了 results[0:8]（tweakers 的结论）。
+        sentiment_at 那条不变量拦不住，因为这 8 条帖子确实都分析过。
+        """
+        posts = [self._post("g1"), self._post("g2")]      # 幸存的是排在后面那个来源
+        self._seed_legacy("t", [
+            {"sentiment": "positive", "intensity": 4, "reason_cn": "属于已删来源的t1", "dimensions": []},
+            {"sentiment": "negative", "intensity": 3, "reason_cn": "属于已删来源的t2", "dimensions": []},
+            {"sentiment": "neutral", "intensity": 1, "reason_cn": "属于g1", "dimensions": []},
+            {"sentiment": "positive", "intensity": 5, "reason_cn": "属于g2", "dimensions": []},
+        ])
+        assert self.storage.migrate_sentiment_blob("t", posts) is False
+
+        assert self.storage.get_sentiment("t", posts) is None, "宁可没迁，也不能把 t1/t2 的结论安到 g1/g2 头上"
+        assert self.storage.legacy_sentiment_task_ids() == ["t"], "原始数据必须留着"
 
     def test_misaligned_blob_is_refused(self):
         """有结论的位置上帖子却没有 sentiment_at —— 下标对不上，整份放弃。

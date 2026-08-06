@@ -12,7 +12,35 @@ logger = logging.getLogger("hyxi.storage")
 
 DB_PATH = os.path.join(settings.data_dir, "hyxi.db")
 
-SCHEMA = """
+# 单独拎出来：重建这张表时要在一个显式事务里执行它。
+# **不能走 executescript** —— 实测它会打断外层事务，回滚后会留下「空的新表 +
+# 孤立的旧表」，而那正是要防的静默丢数据
+SENTIMENT_RESULTS_DDL = """
+-- 结论**按帖子身份存**，不按下标，也**不按任务**。
+--
+-- 下标一旦离开写入现场就没人能保证它还对得上（已因此出过一次事故：批次内下标被当成
+-- 全量位置存盘，结论整体挂到别人身上）。
+--
+-- 主键里不含 task_id：结论是对**帖子**下的，任务只是「什么时候、由谁触发的」。
+-- `_processed.sentiment_at` 本来就按帖子存、跨任务共享（所以同一条帖子不会被重复
+-- 花钱分析），结论必须同一个粒度 —— 否则第二个任务跑同一批数据，页面上 94 条里
+-- 会有 90 条显示「未分析」，而它们其实早就分析过了。
+CREATE TABLE IF NOT EXISTS sentiment_results (
+    source_id       TEXT NOT NULL,
+    fingerprint     TEXT NOT NULL,
+    sentiment       TEXT,
+    -- NUMERIC 而非 REAL：REAL 亲和性会把整数 3 存成 3.0，导出的强度列于是从
+    -- 「3」变成「3.0」。NUMERIC 保留原样，整数还是整数
+    intensity       NUMERIC,
+    reason_cn       TEXT NOT NULL DEFAULT '',
+    dimensions_json TEXT NOT NULL DEFAULT '[]',
+    task_id         TEXT NOT NULL DEFAULT '',   -- 出处，最后写它的那个任务
+    analyzed_at     TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (source_id, fingerprint)
+)
+"""
+
+SCHEMA = SENTIMENT_RESULTS_DDL + ";\n" + """
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     status TEXT NOT NULL DEFAULT 'pending',
@@ -33,27 +61,12 @@ CREATE TABLE IF NOT EXISTS tasks (
 -- 刻意不在这里建：它只应该由老库遗留下来，迁完就 DROP。写进 SCHEMA 会让它
 -- 每次启动又长回来，于是「读哪一份」永远是个选择题
 
--- 一次舆情分析的元信息。summary 是纯派生的聚合结果，整体读写、不参与查询，
--- 按前面定的边界可以留在 JSON 列里
+-- 「这个任务在什么时候跑过一次舆情分析」，仅此而已。
+-- summary（情感分布 / TOP 维度 / 平均强度）**不存**：它是纯派生的，一存就会和
+-- 实际展示的结论对不上 —— 结论按帖子共享之后，任务能看到的结论会比它自己分析的多
 CREATE TABLE IF NOT EXISTS sentiment_runs (
     task_id TEXT PRIMARY KEY,
-    analyzed_at TEXT NOT NULL,
-    summary_json TEXT NOT NULL DEFAULT '{}'
-);
-
--- 结论**按帖子身份存**，不按下标。下标一旦离开写入现场就没人能保证它还对得上：
--- 已经因此出过一次事故（批次内下标被当成全量位置存盘，结论整体挂到别人身上）
-CREATE TABLE IF NOT EXISTS sentiment_results (
-    task_id         TEXT NOT NULL,
-    source_id       TEXT NOT NULL,
-    fingerprint     TEXT NOT NULL,
-    sentiment       TEXT,
-    -- NUMERIC 而非 REAL：REAL 亲和性会把整数 3 存成 3.0，导出的强度列于是从
-    -- 「3」变成「3.0」。NUMERIC 保留原样，整数还是整数
-    intensity       NUMERIC,
-    reason_cn       TEXT NOT NULL DEFAULT '',
-    dimensions_json TEXT NOT NULL DEFAULT '[]',
-    PRIMARY KEY (task_id, source_id, fingerprint)
+    analyzed_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sources (
@@ -135,10 +148,85 @@ def init_db():
         conn = _get_conn()
         conn.executescript(SCHEMA)
         conn.commit()
+        _rekey_sentiment_results(conn)
+        _drop_stored_summary(conn)
         conn.close()
         logger.info("SQLite 数据库初始化完成: %s", DB_PATH)
     except Exception as e:
         logger.error("数据库初始化失败: %s", str(e))
+
+
+def _drop_stored_summary(conn) -> None:
+    """扔掉 sentiment_runs 里那列存好的 summary。
+
+    它现在是纯派生的（读的时候按 results 现算），留着就是一份会过期的副本 ——
+    结论按帖子共享之后，任务能看到的结论比它自己分析的多，存下来的那份必然对不上。
+    """
+    cols = [d[1] for d in conn.execute("PRAGMA table_info(sentiment_runs)")]
+    if "summary_json" not in cols:
+        return
+    try:
+        conn.execute("ALTER TABLE sentiment_runs DROP COLUMN summary_json")
+        conn.commit()
+        logger.info("sentiment_runs.summary_json 已移除（改为读时现算）")
+    except Exception as e:
+        logger.warning("移除 summary_json 列失败（不影响功能，它已不再被读取）: %s", e)
+
+
+def _rekey_sentiment_results(conn) -> None:
+    """把主键含 task_id 的旧 sentiment_results 换成按帖子身份。
+
+    同一条帖子在两个任务下各有一份结论时，**取最近分析的那份**。这在真实数据里
+    有意义：fixture 那个来源被两个任务分别真跑过一次，结论确实不同。
+    """
+    # 上一次重建到一半失败留下的孤儿表：它里面是唯一一份完整数据，必须先接回来。
+    # 不处理的话，此时 sentiment_results 已经是「新主键、空表」，下面的检测会判定
+    # 「不用迁移」直接跳过 —— 全部历史结论静默永久不可见
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sentiment_results_old'"
+    ).fetchone():
+        logger.warning("发现上次重建残留的 sentiment_results_old，从它恢复")
+        conn.execute("DROP TABLE IF EXISTS sentiment_results")
+        conn.execute("ALTER TABLE sentiment_results_old RENAME TO sentiment_results")
+        conn.commit()
+
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='sentiment_results'"
+    ).fetchone()
+    if not sql or "PRIMARY KEY (task_id" not in (sql["sql"] or ""):
+        return
+    try:
+        # 旧表没有 analyzed_at，出处时间从 sentiment_runs 取。
+        # 按 analyzed_at 升序，后写的自然覆盖先写的 = 同一条帖子取最近一次的结论；
+        # 时间为空的排在最前，也就是最先被覆盖 —— 有确切时间的那份优先
+        rows = conn.execute("""
+            SELECT r.source_id, r.fingerprint, r.sentiment, r.intensity, r.reason_cn,
+                   r.dimensions_json, r.task_id,
+                   COALESCE(n.analyzed_at, '') AS analyzed_at
+            FROM sentiment_results r
+            LEFT JOIN sentiment_runs n ON n.task_id = r.task_id
+            ORDER BY COALESCE(n.analyzed_at, '')
+        """).fetchall()
+        # **必须显式开事务**：DDL 在这里不会自动回滚，中途抛异常就会留下
+        # 「空的新表 + 孤立的旧表」，而外层只打一条 error 日志放过去。
+        # 实测过：不加事务时失败后 sentiment_results 是 0 行
+        conn.execute("BEGIN")
+        conn.execute("ALTER TABLE sentiment_results RENAME TO sentiment_results_old")
+        conn.execute(SENTIMENT_RESULTS_DDL)
+        conn.executemany(
+            """INSERT OR REPLACE INTO sentiment_results
+               (source_id, fingerprint, sentiment, intensity, reason_cn,
+                dimensions_json, task_id, analyzed_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            [tuple(r) for r in rows],
+        )
+        conn.execute("DROP TABLE sentiment_results_old")
+        conn.commit()
+        kept = conn.execute("SELECT COUNT(*) FROM sentiment_results").fetchone()[0]
+        logger.info("舆情结论改按帖子身份存：%d 行合并为 %d 行", len(rows), kept)
+    except Exception as e:
+        conn.rollback()
+        logger.error("重建 sentiment_results 失败，已回滚，数据未动: %s", e)
 
 
 MIGRATED_DIR_NAME = "_migrated_backup"
@@ -369,6 +457,7 @@ def save_sentiment(task_id: str, data: dict, posts: List[dict]) -> None:
     **下标只在写入现场有意义** —— 离开这里就再没人能保证它对得上哪条帖子。
     """
     results = data.get("results") or []
+    analyzed_at = data.get("analyzed_at") or datetime.now().isoformat()
     rows = []
     for i, post in enumerate(posts):
         if i >= len(results):
@@ -380,28 +469,28 @@ def save_sentiment(task_id: str, data: dict, posts: List[dict]) -> None:
         if not fingerprint:
             continue
         rows.append((
-            task_id, source_id, fingerprint, r.get("sentiment"), r.get("intensity"),
+            source_id, fingerprint, r.get("sentiment"), r.get("intensity"),
             r.get("reason_cn") or "",
             json.dumps(r.get("dimensions") or [], ensure_ascii=False),
+            task_id, analyzed_at,
         ))
 
     conn = _get_conn()
     try:
         conn.execute(
-            "INSERT OR REPLACE INTO sentiment_runs (task_id, analyzed_at, summary_json) VALUES (?,?,?)",
-            (task_id, data.get("analyzed_at") or datetime.now().isoformat(),
-             json.dumps(data.get("summary") or {}, ensure_ascii=False)),
+            "INSERT OR REPLACE INTO sentiment_runs (task_id, analyzed_at) VALUES (?,?)",
+            (task_id, analyzed_at),
         )
-        # 整轮覆盖：analyze() 传进来的 results 已经是「已有结果 + 本轮新增」的全量
-        conn.execute("DELETE FROM sentiment_results WHERE task_id = ?", (task_id,))
+        # **不按 task_id 删**：结论属于帖子，别的任务分析过的那些不该被这一轮抹掉。
         # OR REPLACE 而非裸 INSERT：同一批 posts 里出现两条 (source_id, fingerprint)
         # 相同的记录并非不可能（指纹只吃 username|timestamp|content[:100]，翻页错位
         # 就能撞上）。裸 INSERT 会抛 IntegrityError 让整个事务回滚 —— 这一轮
         # 花钱算出来的结论一条都存不下，而调用方还在报「分析完成」
         conn.executemany(
             """INSERT OR REPLACE INTO sentiment_results
-               (task_id, source_id, fingerprint, sentiment, intensity, reason_cn, dimensions_json)
-               VALUES (?,?,?,?,?,?,?)""",
+               (source_id, fingerprint, sentiment, intensity, reason_cn, dimensions_json,
+                task_id, analyzed_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
             rows,
         )
         conn.commit()
@@ -415,44 +504,57 @@ def save_sentiment(task_id: str, data: dict, posts: List[dict]) -> None:
 
 
 def get_sentiment(task_id: str, posts: List[dict]) -> Optional[dict]:
-    """按 posts 的顺序重建 results 数组，返回与旧版逐字段一致的结构。
+    """取这批帖子已知的舆情结论，按 posts 的顺序摆成下标数组。
 
-    只按 task_id 精确匹配。曾经在查不到时回退返回最新一条，但那份结果是按别的
-    任务的帖子列表编号的，取来与当前帖子完全对不上；更糟的是增量分析会把它当作
-    existing_results 合并后持久化，直接污染目标任务。
+    **按帖子身份查，不按 task_id 过滤**：结论是对帖子下的，哪个任务触发的分析不改变
+    它对哪条帖子成立。`_processed.sentiment_at` 本来就跨任务共享（同一条帖子不会被
+    重复花钱分析），结论必须同一个粒度 —— 按任务过滤的话，第二个任务跑同一批数据，
+    页面上 94 条里会有 90 条显示「未分析」，而它们早就分析过了。
+
+    这与「绝不跨任务顶替」并不矛盾：当初出事的是**按下标**取别的任务的整份结果，
+    那个数组是按别人的帖子列表编号的。现在按 (source_id, fingerprint) 取，
+    取到的就是这条帖子自己的结论，取不到就是真没有。
     """
+    if not posts:
+        return None
     conn = _get_conn()
     try:
         run = conn.execute(
             "SELECT * FROM sentiment_runs WHERE task_id = ?", (task_id,)
         ).fetchone()
-        if not run:
-            return None
-        by_identity = {
-            (r["source_id"], r["fingerprint"]): {
+        keys = {_post_identity(p) for p in posts}
+        by_identity = {}
+        latest = ""
+        for r in conn.execute("SELECT * FROM sentiment_results").fetchall():
+            key = (r["source_id"], r["fingerprint"])
+            if key not in keys:
+                continue
+            by_identity[key] = {
                 "sentiment": r["sentiment"],
                 "intensity": r["intensity"],
                 "reason_cn": r["reason_cn"],
                 "dimensions": json.loads(r["dimensions_json"] or "[]"),
             }
-            for r in conn.execute(
-                "SELECT * FROM sentiment_results WHERE task_id = ?", (task_id,)
-            ).fetchall()
-        }
+            latest = max(latest, r["analyzed_at"] or "")
     except Exception as e:
         logger.error("获取舆情结果失败: %s", str(e))
         return None
     finally:
         conn.close()
 
+    # 本任务没跑过、这批帖子也一条结论都没有 —— 那就是真的还没分析
+    if not run and not by_identity:
+        return None
+
     results = [by_identity.get(_post_identity(p)) for p in posts]
     return {
         "task_id": task_id,
-        "analyzed_at": run["analyzed_at"],
+        # 本任务跑过就用它自己的时间，否则用这批结论里最新的那个
+        "analyzed_at": run["analyzed_at"] if run else latest,
         "total": len(posts),
         "success": sum(1 for r in results if r and r.get("sentiment")),
         "failed": sum(1 for r in results if not r or not r.get("sentiment")),
-        "summary": json.loads(run["summary_json"] or "{}"),
+        # summary 由调用方按 results 现算 —— 存一份就会和展示的结论对不上
         "results": results,
     }
 

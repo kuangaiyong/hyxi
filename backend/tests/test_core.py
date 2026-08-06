@@ -881,6 +881,139 @@ class TestJsonToSqliteMigrationEndToEnd:
         assert self.storage.legacy_sentiment_task_ids() == ["t"], "原始数据必须留着"
 
 
+class TestSentimentRekeyMigrationEndToEnd:
+    """把主键含 task_id 的旧 sentiment_results 换成按帖子身份。
+
+    这是一次性、不可逆的数据迁移，跑坏了就是全部历史结论永久不可见。
+    """
+
+    OLD_DDL = """
+    CREATE TABLE sentiment_results (
+        task_id TEXT NOT NULL, source_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+        sentiment TEXT, intensity NUMERIC, reason_cn TEXT NOT NULL DEFAULT '',
+        dimensions_json TEXT NOT NULL DEFAULT '[]',
+        PRIMARY KEY (task_id, source_id, fingerprint))
+    """
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+        import app.config as cfg
+        import app.services.storage as storage_module
+        self.cfg, self.storage = cfg, storage_module
+        self._old_dir, self._old_db = cfg.settings.data_dir, storage_module.DB_PATH
+        cfg.settings.data_dir = self.tmpdir
+        storage_module.DB_PATH = os.path.join(self.tmpdir, "hyxi.db")
+
+    def teardown_method(self):
+        self.cfg.settings.data_dir = self._old_dir
+        self.storage.DB_PATH = self._old_db
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    POSTS = [{"fingerprint": "p1", "source": "src_x"}, {"fingerprint": "p2", "source": "src_x"}]
+
+    def _seed_old_schema(self):
+        """造一个旧库：同一条帖子被两个任务分别分析过，结论不同"""
+        conn = self.storage._get_conn()
+        conn.execute("""CREATE TABLE sentiment_runs (
+            task_id TEXT PRIMARY KEY, analyzed_at TEXT NOT NULL,
+            summary_json TEXT NOT NULL DEFAULT '{}')""")
+        conn.execute(self.OLD_DDL)
+        conn.executemany(
+            "INSERT INTO sentiment_runs (task_id, analyzed_at) VALUES (?,?)",
+            [("old-task", "2026-08-01T10:00:00"), ("new-task", "2026-08-05T10:00:00")],
+        )
+        conn.executemany(
+            """INSERT INTO sentiment_results
+               (task_id, source_id, fingerprint, sentiment, intensity, reason_cn, dimensions_json)
+               VALUES (?,?,?,?,?,?,?)""",
+            [
+                ("old-task", "src_x", "p1", "positive", 4, "旧结论", "[]"),
+                ("new-task", "src_x", "p1", "negative", 2, "新结论", "[]"),
+                ("old-task", "src_x", "p2", "neutral", 1, "只有旧任务分析过", "[]"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+    def test_duplicate_conclusions_collapse_to_the_latest(self):
+        self._seed_old_schema()
+        self.storage.init_db()
+
+        got = self.storage.get_sentiment("old-task", self.POSTS)
+        assert [r["reason_cn"] for r in got["results"]] == ["新结论", "只有旧任务分析过"]
+        assert got["results"][0]["sentiment"] == "negative", "该取 2026-08-05 那份"
+
+        conn = self.storage._get_conn()
+        try:
+            assert conn.execute("SELECT COUNT(*) FROM sentiment_results").fetchone()[0] == 2
+            sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='sentiment_results'"
+            ).fetchone()["sql"]
+            assert "PRIMARY KEY (source_id, fingerprint)" in sql
+            assert conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='sentiment_results_old'"
+            ).fetchone()[0] == 0, "残留了孤儿表"
+        finally:
+            conn.close()
+
+    def test_rekey_is_idempotent(self):
+        self._seed_old_schema()
+        self.storage.init_db()
+        self.storage.init_db()
+        conn = self.storage._get_conn()
+        try:
+            assert conn.execute("SELECT COUNT(*) FROM sentiment_results").fetchone()[0] == 2
+        finally:
+            conn.close()
+
+    def test_failure_midway_rolls_back_completely(self):
+        """中途失败必须整体回滚。
+
+        DDL 在这里**不会**自动回滚：不加显式事务的话，失败后留下的是「空的新表 +
+        孤立的旧表」，而下次启动的检测会看到新主键、判定「不用迁移」直接跳过 ——
+        全部历史结论静默永久不可见。executescript 也会打断事务，同样的下场。
+        """
+        self._seed_old_schema()
+
+        # 让重建新表这一步失败 —— 正好落在 RENAME 之后那个危险窗口里。
+        # （不能去 monkeypatch conn.executemany：它是只读属性，改不动，
+        #   之前那版测试因此从头到尾没触发过任何失败，是在空跑）
+        orig_ddl = self.storage.SENTIMENT_RESULTS_DDL
+        self.storage.SENTIMENT_RESULTS_DDL = "CREATE TABLE 语法坏掉的东西 ("
+        try:
+            self.storage.init_db()          # 内部会吞掉异常并打 error 日志
+        finally:
+            self.storage.SENTIMENT_RESULTS_DDL = orig_ddl
+
+        conn = self.storage._get_conn()
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM sentiment_results").fetchone()[0]
+            assert n == 3, f"回滚后旧数据应原样还在，实际 {n} 行"
+            assert conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='sentiment_results_old'"
+            ).fetchone()[0] == 0, "回滚后不该留下孤儿表"
+        finally:
+            conn.close()
+
+        # 失败不是终点：下次启动还认得出旧主键，能重新迁移成功
+        self.storage.init_db()
+        assert self.storage.get_sentiment("old-task", self.POSTS)["success"] == 2
+
+    def test_orphan_table_from_an_older_crash_is_recovered(self):
+        """老版本崩在半路留下的孤儿表：里面是唯一一份完整数据，必须接回来"""
+        self._seed_old_schema()
+        conn = self.storage._get_conn()
+        conn.execute("ALTER TABLE sentiment_results RENAME TO sentiment_results_old")
+        conn.commit()
+        conn.close()
+
+        self.storage.init_db()
+
+        got = self.storage.get_sentiment("old-task", self.POSTS)
+        assert got["success"] == 2, "孤儿表里的历史结论没被接回来"
+        assert [r["reason_cn"] for r in got["results"]] == ["新结论", "只有旧任务分析过"]
+
+
 class TestPostsStorageEndToEnd:
     """posts 表：seq 是全链路的顺序锚点，upsert 不能碰已处理标记"""
 
@@ -1606,15 +1739,58 @@ class TestSentimentIsolationEndToEnd:
     def _posts(*fps):
         return [{"fingerprint": f, "source": "src_x", "content": f"内容{f}"} for f in fps]
 
-    def test_missing_task_does_not_fall_back_to_another_task(self):
+    def test_untouched_posts_have_no_conclusions(self):
+        """没人分析过的帖子就是没有结论，不能从别处顶一个上来"""
         posts = self._posts("a1", "a2")
         self.storage.save_sentiment("task-a", {
-            "task_id": "task-a", "total": 2, "analyzed_at": "2026-07-30T10:00:00",
+            "task_id": "task-a", "analyzed_at": "2026-07-30T10:00:00",
             "results": [{"sentiment": "positive"}, {"sentiment": "negative"}],
         }, posts)
-        assert self.storage.get_sentiment("task-a", posts)["task_id"] == "task-a"
-        # 曾经在这里回退返回最新一条，索引与本任务帖子对不上还会被合并写回
-        assert self.storage.get_sentiment("task-b", posts) is None
+        assert self.storage.get_sentiment("task-a", posts)["success"] == 2
+        # 另一批完全不同的帖子：结论按身份取，取不到就是真没有
+        assert self.storage.get_sentiment("task-b", self._posts("z1", "z2")) is None
+
+    def test_conclusions_are_visible_to_every_task_over_the_same_posts(self):
+        """结论属于帖子，不属于任务。
+
+        `_processed.sentiment_at` 按帖子存、跨任务共享（所以同一条帖子不会被重复
+        花钱分析），结论必须同一个粒度。按任务过滤的话，第二个任务跑同一批数据时
+        页面上会有一大片「未分析」，而它们早就分析过了 —— 线上就是这么暴露的：
+        94 条里 90 条显示未分析。
+        """
+        posts = self._posts("p1", "p2", "p3")
+        # 任务 A 分析了前两条
+        self.storage.save_sentiment("task-a", {
+            "analyzed_at": "2026-08-01T10:00:00",
+            "results": [{"sentiment": "positive", "reason_cn": "属于p1"},
+                        {"sentiment": "negative", "reason_cn": "属于p2"}],
+        }, posts)
+        # 任务 B 后来只分析了新增的第三条（前两条被 sentiment_at 挡住不再重复分析）
+        self.storage.save_sentiment("task-b", {
+            "analyzed_at": "2026-08-05T10:00:00",
+            "results": [None, None, {"sentiment": "neutral", "reason_cn": "属于p3"}],
+        }, posts)
+
+        got = self.storage.get_sentiment("task-b", posts)
+        assert got["success"] == 3, "任务 B 应该看得到 A 分析过的那两条"
+        assert [r["reason_cn"] for r in got["results"]] == ["属于p1", "属于p2", "属于p3"]
+        # 反过来任务 A 也看得到 B 的
+        assert self.storage.get_sentiment("task-a", posts)["success"] == 3
+
+    def test_later_analysis_wins_for_the_same_post(self):
+        """同一条帖子被重新分析，留最后写的那份，不是两份并存"""
+        posts = self._posts("p1")
+        self.storage.save_sentiment("task-a", {
+            "analyzed_at": "2026-08-01T10:00:00",
+            "results": [{"sentiment": "positive", "reason_cn": "旧结论"}],
+        }, posts)
+        self.storage.save_sentiment("task-b", {
+            "analyzed_at": "2026-08-05T10:00:00",
+            "results": [{"sentiment": "negative", "reason_cn": "新结论"}],
+        }, posts)
+        got = self.storage.get_sentiment("task-a", posts)
+        assert len(got["results"]) == 1
+        assert got["results"][0]["reason_cn"] == "新结论"
 
     def test_results_follow_the_post_not_the_row(self):
         """结论按 (source_id, fingerprint) 存，帖子顺序变了也不会串位。

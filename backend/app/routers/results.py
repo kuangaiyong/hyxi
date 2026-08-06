@@ -229,13 +229,23 @@ async def get_stats(task_id: str):
 
 # ===== 导出 =====
 
-def _own_sentiment(task_id: str, posts: list) -> dict:
-    """只读本任务自己的舆情结论，按 posts 顺序还原成下标数组。
+def _task_sentiment(task_id: str, posts: list) -> dict:
+    """这批帖子已知的舆情结论，按 posts 顺序还原成下标数组。
 
-    **不取别的任务的结果来顶** —— 页面上顶一下还算有点用，写进一份署着本任务名的
-    报告里则是彻底的错。
+    结论按帖子身份取（不按 task_id 过滤）—— 同一条帖子不会被重复花钱分析，
+    结论也就不该只对触发那次分析的任务可见。
+
+    **summary 在这里现算**，不读存下来的：任务能看到的结论比它自己分析的多，
+    存一份就会出现「概览说 4 条、明细列 93 条」这种自相矛盾。
     """
-    return storage.get_sentiment(task_id, posts) or {}
+    data = storage.get_sentiment(task_id, posts) or {}
+    if data.get("results"):
+        from app.services.sentiment_service import SentimentService
+
+        data["summary"] = SentimentService._build_summary(
+            data["results"], posts, _source_names()
+        )
+    return data
 
 
 def _export_rows(task: dict, posts: list, results: list) -> list:
@@ -306,7 +316,7 @@ async def export_report(task_id: str, format: str = Query("xlsx")):
     if not posts:
         raise HTTPException(status_code=404, detail="无帖子数据")
 
-    sentiment = _own_sentiment(task_id, posts)
+    sentiment = _task_sentiment(task_id, posts)
     rows = _export_rows(task, posts, sentiment.get("results") or [])
 
     if fmt == "csv":
@@ -363,8 +373,9 @@ async def trigger_sentiment_analysis(task_id: str):
             msg = f"所有有内容的帖子已完成舆情分析（{pending_empty} 条空内容帖子已跳过）"
         return {"message": msg, "task_id": task_id, "status": "completed"}
 
-    # 只取本任务自己的结论：别的任务的结果被当作 existing_results 合并后会写回本任务
-    existing_results = _own_sentiment(task_id, posts).get("results") or []
+    # 这批帖子已知的结论（含别的任务分析过的）。它们会作为 existing_results 参与合并，
+    # 保证本轮写回去的是「已有 + 本轮新增」的全量，而不是把别人的结论覆盖掉
+    existing_results = _task_sentiment(task_id, posts).get("results") or []
 
     # 后台启动分析（仅分析增量帖子，合并已有结果）
     orchestrator.run_sentiment_async(task_id, posts, pending, existing_results)
@@ -392,13 +403,16 @@ async def get_sentiment_result(task_id: str):
     if not posts:
         posts = load_task_posts(task)
 
-    result = _own_sentiment(task_id, posts)
-    if result:
-        return result
-
-    # 检查是否正在分析
+    # **「分析中」必须先判**。结论跨任务共享之后，只要这批帖子里有一条被别的任务
+    # 分析过，_task_sentiment 就会返回真值 —— 放在后面判的话，本轮还在跑就先把
+    # 一份「看起来完整、实际少了本轮新分析那几条」的结果返回了，前端据此认为分析
+    # 已结束，既不连 SSE 也不再轮询，用户只能手动刷新才看得到最终数据
     if orchestrator.is_sentiment_running(task_id):
         return {"status": "running", "message": "分析进行中..."}
+
+    result = _task_sentiment(task_id, posts)
+    if result:
+        return result
 
     # 返回 200 + not_found 状态
     return {"status": "not_found", "message": "舆情分析结果不存在，请先触发分析"}

@@ -99,8 +99,8 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
 |------|------|
 | `posts` | 帖子。`seq` 承担改造前「数组下标即顺序」的全部语义 |
 | `tasks` | 任务记录（plan / result / logs 是形状可变的不透明块，留在 JSON 列里） |
-| `sentiment_runs` | 一次舆情分析的元信息 + summary（纯派生的聚合结果） |
-| `sentiment_results` | **舆情结论，按 `(task_id, source_id, fingerprint)` 存** |
+| `sentiment_runs` | 某个任务最近一次触发分析的时间，只此一列 |
+| `sentiment_results` | **舆情结论，按 `(source_id, fingerprint)` 存** |
 | `sources` / `credentials` | 数据源与加密凭据，`ON DELETE CASCADE` |
 | `app_config` | LLM 配置，按 `llm.api_key` / `llm.base_url` / `llm.model_name` 分列 |
 | `schedules` | 定时任务业务配置 |
@@ -117,6 +117,10 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
 **为什么不留双写**：同一份数据存两处、两个读者各读一份，必然长出「改了一边、另一边还是旧的」的 bug。实测踩过：修完 `sentiment_*.json` 后 `/sentiment` 仍返回旧数据，因为它读 SQLite 而 `/export` 读 JSON。
 
 **舆情结论按帖子身份存，不按下标**。下标只在写入现场有意义 —— 离开那里就没人能保证它对得上哪条帖子（已因此出过一次事故，见「常见陷阱」）。`storage.save_sentiment()` 收到的仍是下标数组，落库时立刻换成 `(source_id, fingerprint)`；`get_sentiment(task_id, posts)` 再按当前帖子顺序还原成前端要的下标数组，**API 响应形状不变**。副作用是 `total` / `failed` 现在按当前帖子实算，而不是分析那一刻冻结的数字 —— `/sentiment` 因此与 `/posts`、`/stats`、`/export` 报同一个数。
+
+**结论也不按 task_id 存**。它是对帖子下的，哪个任务触发的分析不改变它对哪条帖子成立。`posts.sentiment_at` 本来就跨任务共享（同一条帖子不重复花钱分析），结论必须同一个粒度 —— 按任务过滤的话，第二个任务跑同一批数据，页面上 94 条里 90 条显示「未分析」，而它们早分析过了（用户实测报过）。这与「绝不跨任务顶替」不矛盾：当初出事的是**按下标**取别的任务那份按别人帖子列表编号的整数组；现在按 `(source_id, fingerprint)` 取，取到的就是这条帖子自己的结论，取不到就是真没有。`sentiment_runs` 因此只剩「本任务最近一次触发的时间」这一个用途，summary 全在读取时现算。
+
+**「分析中」必须在取结论之前判**（`results.py` 的 `GET /sentiment`）。结论跨任务共享后，只要这批帖子里有一条被别的任务分析过，`_task_sentiment()` 就返回真值；放在后面判会让前端认为分析已结束，既不连 SSE 也不再轮询。
 
 `intensity` 列必须是 `NUMERIC` 不能是 `REAL`：REAL 亲和性会把整数 3 存成 3.0，导出的强度列跟着变成「3.0」。
 
@@ -318,7 +322,7 @@ translate 和 generate_excel 在 context 里没有 posts 时会**从各数据源
 
 ## 测试
 
-**212 个测试，必须全部 PASSED**（本机实测 `212 passed in 266s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**218 个测试，必须全部 PASSED**（本机实测 `218 passed in 277s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
@@ -348,9 +352,9 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 
 - **增量机制**：每个帖子有 fingerprint，各步骤执行前检查 `_processed` 标记跳过已处理帖子
 - **SSE 进度推送**：`progress_manager` 按 task_id 做 pub/sub，30s 无事件发 `: keepalive` 注释帧防代理断连
-- **舆情结果只属于本任务，绝不跨任务顶替**：曾经查不到就 fallback 到最新一条，而那份结果是按别的任务的帖子列表编号的，取来与当前帖子完全对不上；更糟的是增量分析会把它当作 `existing_results` 合并后持久化，直接污染目标任务
+- **绝不按下标跨任务顶替舆情结果**：曾经查不到就 fallback 到最新一条，而那份结果是按别的任务的帖子列表编号的，取来与当前帖子完全对不上；更糟的是增量分析会把它当作 `existing_results` 合并后持久化，直接污染目标任务。**按帖子身份取则相反 —— 必须跨任务共享**，见「持久化」一节
 - **导出只有一个口**：`GET /export?format=xlsx|csv` 出一份含原文 + 译文 + 舆情结论的文件，界面入口只在舆情页。**报告每次下载现算、不落盘**（`ExcelService.build_export` 返回字节流）——落盘既会在 `exports/` 堆垃圾，两个人同时下载还会撞成一个在写另一个在读。流水线的 `generate_excel` 步骤照旧生成它自己那份，但那份不再被任何人下载
-- **导出取舆情不走 `get_sentiment()` 的跨任务 fallback**：页面上拿别的任务的结论顶一下还算有点用，把它写进一份署着本任务名的报告里则是彻底的错，所以 `_own_sentiment()` 只读本任务的结论
+- **导出与页面读同一份结论**（`results.py::_task_sentiment()`）：按帖子身份取，取到什么就写什么，所以报告里的「未分析」条数与舆情页显示的完全一致。它不再有「本任务 / 别的任务」之分 —— 那个区分只在按下标取整数组的年代才有意义
 - **LLM 重试分两层，别混为一谈**：`_retry_with_backoff` 是**传输层**指数退避（3 次，1s/2s/4s），只管 429/5xx；**解析失败是另一回事**——批量输出靠分隔符切分，LLM 偶尔在某一段吐出非 JSON，那一条会被记成 `{"sentiment": null, "reason_cn": "解析失败"}`。翻译和舆情都在批量之后补一轮**单条重试**（单条不必切分隔符，解析可靠得多），实测真实任务里 88 条中的 2 条因此救回。单条重试必须复用批量那份 prompt 片段（`_post_block`），来源标签和父贴上文少给一样就成了另一道题
 - **翻译用 LLM 而非 Google Translate**：5 条/批 + `---POST_SEPARATOR---` 切分，解析失败的条目再单条重译。源文本可能是荷兰语或英语且批内混杂，**「译文与原文一字不差且原文非中文」判为漏译**，走同一条单条重译队列
 - **舆情维度是封闭集合**：`DEFAULT_DIMENSIONS` 那 14 个。`_normalize_dimensions()` 把 LLM 返回的标签对齐回去（实测它会把 `认证/合规(如Synergrid)` 简写成 `认证/合规`，于是同一维度在 `top_dimensions` 和 `cross_source` 里各占一行），对不上的直接丢弃。维度表的全部价值就在于它封闭，一碎成近义标签跨来源对比就废了

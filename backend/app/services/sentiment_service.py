@@ -129,8 +129,14 @@ class SentimentService:
         source_names: dict = None,
         parent_by_key: dict = None,
         all_posts: list = None,
+        step_index: int = 0,
     ) -> dict:
-        """对帖子进行舆情分析（增量：仅分析传入的帖子，合并已有结果）"""
+        """对帖子进行舆情分析（增量：仅分析传入的帖子，合并已有结果）。
+
+        step_index 是进度事件要挂到第几个流水线步骤上。舆情页那条路没有步骤概念，
+        缺省 0 即可；进了流水线就必须给真实下标，否则进度条会去刷新早已完成的
+        第一个步骤（照着 ExcelService 的 step_index 来）。
+        """
         total = len(posts)
         non_empty = [(i, p) for i, p in enumerate(posts) if p.get("content", "").strip()]
         total_non_empty = len(non_empty)
@@ -222,7 +228,7 @@ class SentimentService:
                 done = batch_start + len(batch)
                 pct = done / total_non_empty if total_non_empty > 0 else 1.0
                 await progress.emit(task_id, "step_progress", {
-                    "step": 0,
+                    "step": step_index,
                     "progress": min(pct, 0.99),
                     "message": f"舆情分析 {done}/{total_non_empty} 条 ({success_count} 成功, {fail_count} 失败)",
                 })

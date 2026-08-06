@@ -430,6 +430,135 @@ class TestResolveSourcesEndToEnd:
         assert warns == []
 
 
+class TestResolveSentimentEndToEnd:
+    """描述里要了舆情分析，流水线就得真去分析 —— 模型永远给不出这个步骤"""
+
+    def _resolve(self, desc, plan_actions=(("collect", {}), ("translate", {}))):
+        from app.models import PlanStep
+        from app.services.orchestrator import _resolve_sentiment
+        plan = [PlanStep(action=a, params=p) for a, p in plan_actions]
+        return [s.action for s in _resolve_sentiment({"description": desc}, plan)]
+
+    def test_sentiment_step_is_appended_at_the_end(self):
+        """舆情要读翻译后的帖子，而且是整条链上最贵的一步，只能排最后"""
+        assert self._resolve("只采集Facebook的帖子，翻译成中文，导出Excel，分析舆情",
+                             [("collect", {}), ("translate", {}), ("generate_excel", {})]) == \
+            ["collect", "translate", "generate_excel", "sentiment"]
+
+    def test_description_without_sentiment_is_untouched(self):
+        """没要就别跑 —— 舆情是要花钱调 LLM 的"""
+        assert self._resolve("采集帖子，翻译成中文") == ["collect", "translate"]
+
+    def test_no_duplicate_when_plan_already_has_one(self):
+        assert self._resolve("分析舆情", [("collect", {}), ("sentiment", {})]) == \
+            ["collect", "sentiment"]
+
+    def test_other_wordings_are_recognized(self):
+        for desc in ("做一下情感分析", "看看情感倾向", "输出舆情报告"):
+            assert self._resolve(desc)[-1] == "sentiment", desc
+
+
+class TestPipelineSentimentStepEndToEnd:
+    """描述里写「分析舆情」→ 任务跑完结论就在库里。真 HTTP LLM、真 SQLite、真步骤调度"""
+
+    def setup_method(self):
+        import app.config as cfg
+        import app.services.storage as storage_module
+        self.cfg = cfg
+        self.tmpdir = tempfile.mkdtemp()
+        self._old_dir = cfg.settings.data_dir
+        cfg.settings.data_dir = self.tmpdir
+        # exports_dir 是类定义时算好的常量（同 storage.DB_PATH 那个坑），只改
+        # data_dir 的话 generate_excel 会把报告写进真实的 backend/data/exports
+        self._old_exports = cfg.settings.exports_dir
+        cfg.settings.exports_dir = os.path.join(self.tmpdir, "exports")
+        os.makedirs(cfg.settings.exports_dir, exist_ok=True)
+        self.storage = storage_module
+        self._old_db = storage_module.DB_PATH
+        storage_module.DB_PATH = os.path.join(self.tmpdir, "hyxi.db")
+        storage_module.init_db()
+
+        self.storage.save_source({
+            "id": "src_p", "name": "小组来源", "collector_id": "group_feed",
+            "params": {"group_id": "g1", "base_url": "http://127.0.0.1:1"},
+            "enabled": True, "created_at": "2026-08-06T09:00:00",
+        })
+        self.storage.upsert_posts("src_p", [
+            {"username": "用户1", "timestamp": "01-07-2026 10:00",
+             "content": "De firmware update sloopte mijn WiFi-verbinding.",
+             "translation": "固件更新弄坏了我的 WiFi 连接。", "page_number": 1,
+             "fingerprint": "fp1", "source": "src_p",
+             "parent_fingerprint": None, "reply_level": 0,
+             "_processed": {"translated": True}},
+            {"username": "用户2", "timestamp": "02-07-2026 10:00",
+             "content": "Werkt hier prima na de update.",
+             "translation": "更新后这边一切正常。", "page_number": 1,
+             "fingerprint": "fp2", "source": "src_p",
+             "parent_fingerprint": None, "reply_level": 0,
+             "_processed": {"translated": True}},
+        ])
+
+    def teardown_method(self):
+        self.cfg.settings.data_dir = self._old_dir
+        self.cfg.settings.exports_dir = self._old_exports
+        self.storage.DB_PATH = self._old_db
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _run(self, description):
+        import asyncio
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures"))
+        import llm_site
+        from app.services.orchestrator import orchestrator
+
+        server = llm_site.LLMSite()
+        with server as base_url:
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-test", "base_url": base_url, "model_name": "test-model",
+            })
+            task_id = f"pipeline-{len(server.seen)}-{description[:4]}"
+            orchestrator.create_task(task_id, description)
+            asyncio.new_event_loop().run_until_complete(
+                orchestrator.execute_task(task_id)
+            )
+        return orchestrator.get_task(task_id), server.seen
+
+    def _conclusions(self):
+        posts = self.storage.load_posts(["src_p"])
+        return posts, [(p.get("_processed") or {}).get("sentiment_at") for p in posts]
+
+    def test_description_asking_for_sentiment_actually_analyzes(self):
+        """用户报的就是这个：描述里写了「分析舆情」，任务跑完一条都没分析。
+
+        LLM 的计划里永远没有 sentiment（parse_intent 的 prompt 里没这个动作），
+        全靠 _resolve_sentiment 补。补不上的话，页面上显示的是别的任务留下的结论，
+        看着像分析过了，用户根本发现不了。
+        """
+        task, seen = self._run("翻译已有数据，导出Excel，分析舆情")
+
+        assert task["status"] == "completed", task.get("error_message")
+        assert [s["action"] for s in task["plan"]] == ["generate_excel", "sentiment"]
+        assert "plan" in seen, f"意图解析没走到 LLM: {seen}"
+
+        posts, analyzed = self._conclusions()
+        assert all(analyzed), f"有帖子没被标记分析过: {analyzed}"
+        data = self.storage.get_sentiment(task["id"], posts)
+        assert data and len(data["results"]) == 2, data
+        assert all(r and r.get("sentiment") for r in data["results"]), data["results"]
+
+    def test_second_run_does_not_pay_for_the_same_posts_again(self):
+        """增量粒度是 sentiment_at，跨任务共享 —— 重跑不该再调一次 LLM"""
+        self._run("翻译已有数据，分析舆情")
+        _task, seen = self._run("翻译已有数据，分析舆情")
+        assert [s for s in seen if s != "plan"] == [], f"重复分析了: {seen}"
+
+    def test_no_sentiment_step_means_no_llm_analysis_calls(self):
+        task, seen = self._run("翻译已有数据，导出Excel")
+        assert [s["action"] for s in task["plan"]] == ["generate_excel"]
+        assert [s for s in seen if s != "plan"] == [], f"没要舆情却调了分析: {seen}"
+        _posts, analyzed = self._conclusions()
+        assert not any(analyzed), analyzed
+
+
 class TestTimestampNormalizationEndToEnd:
     """时间戳格式转换：荷兰 dd-mm-yyyy → yyyy-mm-dd"""
 

@@ -214,6 +214,7 @@ class TaskOrchestrator:
 
             plan = [PlanStep(**s) for s in plan_data.get("plan", [])]
             plan, source_warnings = _resolve_sources(task, plan, enabled_sources)
+            plan = _resolve_sentiment(task, plan)
             for w in source_warnings:
                 await self._task_log(task_id, "warning", w)
             task["plan"] = [s.model_dump() for s in plan]
@@ -345,6 +346,36 @@ class TaskOrchestrator:
                         )
                         context["excel_path"] = result.get("file_path", "")
                         context["excel_name"] = result.get("file_name", "")
+
+                    elif step.action == "sentiment":
+                        posts = context.get("posts", [])
+                        if not posts:
+                            posts, loaded_meta = _load_posts_from_sources(enabled_sources)
+                            context["sources"] = loaded_meta
+                            context["total_pages"] = sum(
+                                m["total_pages"] for m in loaded_meta.values()
+                            )
+                        if not posts:
+                            raise Exception("没有可分析的帖子数据")
+                        context["posts"] = posts
+
+                        # 增量粒度是 _processed.sentiment_at，跨任务共享 —— 同一条帖子
+                        # 不会因为换个任务重跑就再花一次钱。空内容帖（纯图片贴）永远
+                        # 不会有结论，analyze() 内部会滤掉，这里只用来说人话
+                        pending = [p for p in posts if not p.get("_processed", {}).get("sentiment_at")]
+                        with_content = [p for p in pending if (p.get("content") or "").strip()]
+                        if not with_content:
+                            await self._task_log(task_id, "info", "所有有内容的帖子都已完成舆情分析，跳过")
+                        else:
+                            await self._task_log(
+                                task_id, "info",
+                                f"增量舆情分析: {len(posts) - len(pending)} 条已跳过, "
+                                f"{len(with_content)} 条待分析",
+                            )
+                            # 这批帖子已知的结论（含别的任务分析出来的）要作为 existing
+                            # 一起传下去，否则本轮写回的全量会把它们抹掉
+                            existing = (storage.get_sentiment(task_id, posts) or {}).get("results") or []
+                            await self.run_sentiment(task_id, posts, pending, existing, idx)
 
                     else:
                         await self._task_log(task_id, "warning", f"未知动作: {step.action}，已跳过")
@@ -494,45 +525,63 @@ class TaskOrchestrator:
     def is_sentiment_running(self, task_id: str) -> bool:
         return task_id in self._sentiment_running
 
-    def run_sentiment_async(self, task_id: str, all_posts: list, pending_posts: list, existing_results: list = None):
-        """后台启动舆情分析（增量：仅分析 pending_posts，合并已有结果）"""
+    async def run_sentiment(self, task_id: str, all_posts: list, pending_posts: list,
+                            existing_results: list = None, step_index: int = 0):
+        """跑一轮舆情分析并等它结束（增量：仅分析 pending_posts，合并已有结果）。
+
+        失败会抛出来 —— 流水线的 sentiment 步骤要靠它决定这一步成没成。
+        页面按钮那条路不关心，见 run_sentiment_async。
+        """
         from app.services.sentiment_service import SentimentService
+        self._sentiment_running.add(task_id)
+        try:
+            # 构建 source:fingerprint → 绝对索引映射（用于合并）。
+            # 键必须带来源，只用 fingerprint 会跨来源碰撞
+            fp_to_idx = {}
+            for i, p in enumerate(all_posts):
+                if p.get("fingerprint"):
+                    fp_to_idx[post_key(p)] = i
+
+            # 来源名与父贴映射：让 prompt 能标注来源、给评论带上父贴上下文
+            source_names = {s["id"]: s["name"] for s in source_service.list_sources()}
+            by_key = {post_key(p): p for p in all_posts}
+            _roots, children = build_tree(all_posts)
+            parent_by_key = {}
+            for parent_k, kids in children.items():
+                for child in kids:
+                    parent_by_key[post_key(child)] = by_key[parent_k]
+
+            await SentimentService.analyze(
+                task_id, pending_posts, progress_manager, existing_results, fp_to_idx,
+                source_names, parent_by_key, all_posts, step_index,
+            )
+            await progress_manager.emit(task_id, "sentiment_complete", {
+                "task_id": task_id,
+                "status": "completed",
+            })
+        except Exception as e:
+            await progress_manager.emit(task_id, "sentiment_complete", {
+                "task_id": task_id,
+                "status": "failed",
+                "error": str(e),
+            })
+            raise
+        finally:
+            self._sentiment_running.discard(task_id)
+
+    def run_sentiment_async(self, task_id: str, all_posts: list, pending_posts: list, existing_results: list = None):
+        """舆情页按钮那条路：立刻返回，分析在后台跑。
+
+        _sentiment_running 必须在这里**同步**置上：等协程被调度起来再置的话，
+        POST 刚返回那一瞬间前端来问 GET /sentiment 会得到「没在跑」。
+        """
         self._sentiment_running.add(task_id)
 
         async def _run():
             try:
-                # 构建 source:fingerprint → 绝对索引映射（用于合并）。
-                # 键必须带来源，只用 fingerprint 会跨来源碰撞
-                fp_to_idx = {}
-                for i, p in enumerate(all_posts):
-                    if p.get("fingerprint"):
-                        fp_to_idx[post_key(p)] = i
-
-                # 来源名与父贴映射：让 prompt 能标注来源、给评论带上父贴上下文
-                source_names = {s["id"]: s["name"] for s in source_service.list_sources()}
-                by_key = {post_key(p): p for p in all_posts}
-                _roots, children = build_tree(all_posts)
-                parent_by_key = {}
-                for parent_k, kids in children.items():
-                    for child in kids:
-                        parent_by_key[post_key(child)] = by_key[parent_k]
-
-                await SentimentService.analyze(
-                    task_id, pending_posts, progress_manager, existing_results, fp_to_idx,
-                    source_names, parent_by_key, all_posts,
-                )
-                await progress_manager.emit(task_id, "sentiment_complete", {
-                    "task_id": task_id,
-                    "status": "completed",
-                })
-            except Exception as e:
-                await progress_manager.emit(task_id, "sentiment_complete", {
-                    "task_id": task_id,
-                    "status": "failed",
-                    "error": str(e),
-                })
-            finally:
-                self._sentiment_running.discard(task_id)
+                await self.run_sentiment(task_id, all_posts, pending_posts, existing_results)
+            except Exception:
+                pass  # 失败已经通过 sentiment_complete 事件报给前端了
 
         asyncio.create_task(_run())
 
@@ -641,6 +690,27 @@ def _resolve_sources(task: dict, plan: List[PlanStep], sources: List[dict]):
                for sid in picked]
     rebuilt += [s for s in plan if s.action != "collect"]
     return rebuilt, warnings
+
+
+_SENTIMENT_PATTERNS = ("舆情", "情感分析", "情感倾向")
+
+
+def _resolve_sentiment(task: dict, plan: List[PlanStep]) -> List[PlanStep]:
+    """用户在描述里要了舆情分析，就在计划末尾补一个 sentiment 步骤。
+
+    同 _resolve_sources 的路子：LLM 负责理解，后端负责保证。parse_intent 的 prompt
+    里压根没有 sentiment 这个动作，所以模型永远不会产出它 —— 而「分析舆情」是完全
+    自然的写法，任务跑完却一条都没分析，用户还得自己回舆情页再点一次按钮，而且不点
+    就永远不知道没分析（页面上是别的任务留下的结论，看着像已经分析过了）。
+
+    放最后：舆情要读翻译后的帖子，而且它是整条链上最贵的一步。
+    """
+    if any(s.action == "sentiment" for s in plan):
+        return plan
+    desc = task.get("description", "")
+    if not any(p in desc for p in _SENTIMENT_PATTERNS):
+        return plan
+    return plan + [PlanStep(action="sentiment", params={})]
 
 
 def _resolve_start_page(task: dict, params: dict) -> Optional[int]:

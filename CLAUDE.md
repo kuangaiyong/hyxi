@@ -315,16 +315,23 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
    - **要采哪些来源也不由 LLM 最终决定**：`_resolve_sources()` 在描述里出现「所有来源 / 全部平台 / 各渠道」时**无条件展开为全部已启用来源**，不看模型给了什么；模型编造的 `source_id` 被忽略并打 warning；一个有效来源都没给出时全采。来源一多模型很容易只挑一个，那是静默漏采——报告看起来完整、实际缺半个平台的声音，比任务失败糟得多。用户临时贴的新链接（`params.override`）**直接失败并提示去数据源页注册**，绝不拿已注册的源顶替
 2. **translate** → LLM 批量翻译（5 条/次），跳过 `_processed.translated == true` 且已有 `translation` 的帖子；完成后按 `post_key` 合并回原始顺序，并**按来源拆回各自的落盘文件**（整锅写回任何一个文件都会污染别的来源）
 3. **generate_excel** → openpyxl 生成 Excel：DFS 顺序（主贴 → 其评论 → 下一主贴）、「来源」「层级」两列、评论行加 `└─ ` 前缀与浅底
+4. **sentiment** → 舆情分析，**只在用户描述里要了才有这一步**，见下
 
-translate 和 generate_excel 在 context 里没有 posts 时会**从各数据源已落盘的 JSON 兜底加载**（`_load_posts_from_sources()`），所以可以只提交「翻译已有数据」这类任务。不再有 `_extract_thread_id()` 那套「从描述里抠 5 位数字」的猜测，也不再 glob `tweakers_thread_*.json`。
+translate、generate_excel 和 sentiment 在 context 里没有 posts 时会**从各数据源已落盘的 JSON 兜底加载**（`_load_posts_from_sources()`），所以可以只提交「翻译已有数据」这类任务。不再有 `_extract_thread_id()` 那套「从描述里抠 5 位数字」的猜测，也不再 glob `tweakers_thread_*.json`。
 
-**舆情分析不在流水线内**，由结果页按钮触发，增量粒度是 `_processed.sentiment_at` 为空的帖子。跨来源分组（`by_source` / `cross_source`）走**纯 Python**，不需要 LLM 感知来源；prompt 里只给每条帖子标 `[来源: xxx]` 并说明「按平台内部的相对水平判断」，**绝不描述某个平台的情感先验**——那会污染的正是我们想比较的那个维度。评论会带上父贴前 200 字作 `[回复上文: ...]`，否则「+1」「same here」全被判成 neutral 噪音。
+**sentiment 步骤由 `_resolve_sentiment()` 补，不是 LLM 给的**：`parse_intent` 的 prompt 里只有 collect / translate / generate_excel 三个动作，模型**永远产不出** sentiment。描述里出现「舆情 / 情感分析 / 情感倾向」就在计划末尾追加一步（放最后：它要读翻译后的帖子，且是整条链上最贵的一步）。同 `_resolve_sources` 的路子——LLM 负责理解，后端负责保证。**没写就不加**，舆情是要花钱的。
+
+漏掉这一步的后果特别隐蔽：结论按帖子身份跨任务共享，所以新任务一打开，页面上是**上一个任务留下的**结论，看着像已经分析过了；只有那几条新采到的帖子是空的，得逐条翻才发现。用户实测报过（95 条里只有第 95 条没分析，因为它是当天新增的唯一一条）。
+
+**舆情分析的另一条路是结果页按钮**（`POST /tasks/{id}/sentiment`，后台跑、立刻返回）。两条路共用 `orchestrator.run_sentiment()`，区别只有：流水线那条 `await` 到底并让异常冒出去（步骤要靠它判成败），按钮那条 `create_task` 后立刻返回、失败只发 `sentiment_complete` 事件。`run_sentiment_async()` 必须**同步**把 task_id 放进 `_sentiment_running`——等协程调度起来再放的话，POST 刚返回那一瞬间前端来问 `GET /sentiment` 会得到「没在跑」。
+
+两条路的增量粒度都是 `_processed.sentiment_at` 为空的帖子。跨来源分组（`by_source` / `cross_source`）走**纯 Python**，不需要 LLM 感知来源；prompt 里只给每条帖子标 `[来源: xxx]` 并说明「按平台内部的相对水平判断」，**绝不描述某个平台的情感先验**——那会污染的正是我们想比较的那个维度。评论会带上父贴前 200 字作 `[回复上文: ...]`，否则「+1」「same here」全被判成 neutral 噪音。
 
 **并发控制**：`max_concurrent_tasks` 超限时新任务进 `_task_queue` 排队，前一个任务在 `_run_with_queue` 结束后调 `_process_queue()` 自动出队执行，不会直接失败。
 
 ## 测试
 
-**224 个测试，必须全部 PASSED**（本机实测 `224 passed in 282s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**231 个测试，必须全部 PASSED**（本机实测 `231 passed in 286s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
@@ -388,6 +395,7 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 - **422 报文默认会回显提交值**：FastAPI 把 pydantic 的 `input` 字段序列化进 `detail`，密码超长这一种情况就够让明文进响应体、再被前端拦截器打进浏览器控制台。`main.py` 注册了 `RequestValidationError` handler 统一剔掉 `input`，新增敏感字段不用额外处理
 - **`_persist()` 永远不会删行**：`_save_tasks()` 在 SQLite 分支只对 `self.tasks` 里**剩余**的任务逐条 upsert，从不发 DELETE。所以任何"从 `self.tasks` 移除条目"的新逻辑都必须自己显式调 `db_delete_task()`，否则残留行会在下次启动被 `_load_tasks()` 读回来（`delete_task()` 曾因此让删除的任务重启后复活，已修）。JSON 回退分支是全量覆写，无此问题
 - **`storage.DB_PATH` 是 import 时算好的常量**：测试里只改 `settings.data_dir` **不会**改变 DB 位置，必须一并重定向 `storage.DB_PATH`，否则测试会写进真实的 `backend/data/hyxi.db`。`tests/test_core.py` 的 `_create_orchestrator()` 已这么做；`tests/test_api.py` 则是靠在 import 前改 `data_dir` 生效 —— 新增测试文件时注意这个先后顺序
+- **`settings.exports_dir` / `tasks_dir` 同理**：它们在 `config.py` 里是**类定义时**用默认 `data_dir` 算好的字段，不是属性。测试里改了 `settings.data_dir` 它们纹丝不动，跑 `generate_excel` 会把报告写进真实的 `backend/data/exports/`（实测踩过，堆了 20 个文件才发现，而且测试单独跑时是绿的 —— 真目录存在所以写得进去）。要改就三个一起改
 - **采集脚本的 stdout 只走 SSE，不落进 `task["logs"]`**：`CollectorRunner` 用 `progress.emit()` 转发，而 `task["logs"]` 只由 orchestrator 的 `_task_log()` 写。所以「复用会话，跳过登录」这类脚本自报的行只有在页面盯着 SSE 时看得到，任务跑完再翻记录是找不到的；要断言它就得在流上收
 - **退出码 2 的数据必须先入库再抛异常**：`CollectorRunner` 里「读交接文件 → upsert」这一段**排在退出码判断之前**。反过来写的话，脚本已经抓到并写出的那批帖子会连同临时交接文件一起被 `finally` 删掉 —— 160 页的长帖抓到第 100 页撞限流，那 100 页就白抓了，`/retry` 只能从第 1 页重来。改造前脚本写的是长期文件，Python 抛异常也不影响数据留在盘上；换成临时交接文件后这条不再自动成立。回归测试见 `TestScraperPartialExitEndToEnd::test_partial_results_are_persisted_so_retry_can_resume`
 - **爬虫退出码是契约**：`0` 完整 / `1` 硬失败（无可用数据）/ `2` 部分完成（数据已落盘，可增量续抓）/ `3` 需要人工授权（见「登录与会话」一节）。残缺时 `total_pages` 保留站点声明的真值**不再被截断点覆盖**，输出 JSON 带 `complete: false` + `stop_reason`，原因同时写 stderr 并被 `CollectorRunner` 拼进任务的 `error_message`。退出码非 0 一律让抓取步骤失败——残缺数据继续跑翻译→Excel→舆情，产出的是一份看起来完整、实际有偏的报告，比任务失败糟得多；续抓走 `POST /api/v1/tasks/{id}/retry`

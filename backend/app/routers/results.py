@@ -341,8 +341,13 @@ async def export_report(task_id: str, format: str = Query("xlsx")):
 # ===== 舆情分析 =====
 
 @router.post("/sentiment")
-async def trigger_sentiment_analysis(task_id: str):
-    """触发舆情分析（增量：自动跳过已分析的帖子）"""
+async def trigger_sentiment_analysis(task_id: str, force: bool = False):
+    """触发舆情分析（增量：自动跳过已分析的帖子）。
+
+    `force=true` 忽略 `_processed.sentiment_at`，把所有有正文的帖子重新分析一遍。
+    用在分析口径变了的时候（比如刚接上图片理解、或改了 prompt）—— 增量粒度是帖子
+    身份，不重跑的话老帖子永远停在旧口径下的结论上。**它会重新花钱**，所以不是默认。
+    """
     task = _get_task_or_404(task_id)
 
     # 检查是否正在分析中
@@ -357,9 +362,13 @@ async def trigger_sentiment_analysis(task_id: str):
     if not posts:
         raise HTTPException(status_code=400, detail="没有可分析的帖子数据")
 
-    # 增量：优先根据 _processed.sentiment_at 过滤已分析的帖子
-    already_analyzed = [p for p in posts if p.get("_processed", {}).get("sentiment_at")]
-    pending = [p for p in posts if not p.get("_processed", {}).get("sentiment_at")]
+    # 增量：优先根据 _processed.sentiment_at 过滤已分析的帖子。force 时全都算待分析
+    if force:
+        already_analyzed = []
+        pending = list(posts)
+    else:
+        already_analyzed = [p for p in posts if p.get("_processed", {}).get("sentiment_at")]
+        pending = [p for p in posts if not p.get("_processed", {}).get("sentiment_at")]
     # 区分有内容和空内容（空内容帖子不会被 LLM 分析）
     pending_with_content = [p for p in pending if (p.get("content") or "").strip()]
     pending_empty = len(pending) - len(pending_with_content)
@@ -376,7 +385,10 @@ async def trigger_sentiment_analysis(task_id: str):
 
     # 后台启动分析（仅分析增量帖子，合并已有结果）
     orchestrator.run_sentiment_async(task_id, posts, pending, existing_results)
-    msg = f"增量舆情分析: {len(already_analyzed)} 条已跳过, {len(pending_with_content)} 条待分析"
+    if force:
+        msg = f"强制重新分析: {len(pending_with_content)} 条全部重跑"
+    else:
+        msg = f"增量舆情分析: {len(already_analyzed)} 条已跳过, {len(pending_with_content)} 条待分析"
     if pending_empty > 0:
         msg += f"（{pending_empty} 条空内容帖子跳过）"
     return {

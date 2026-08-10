@@ -74,6 +74,39 @@ class TestAPIEndpointsEndToEnd:
         assert resp.status_code == 200
         assert resp.json()["is_configured"] is False
 
+    def test_vision_config_crud_is_isolated_from_the_llm_config(self):
+        """多模态配置走 app_config 的 vision 前缀，与 llm 前缀互不影响。
+
+        两组配置混在一起的话，改一个模型会把另一个也改掉 —— 翻译和图片理解用的
+        通常不是同一个供应商。
+        """
+        self.client.post("/api/v1/config", json={
+            "api_key": "sk-text", "base_url": "https://text.test", "model_name": "text-model",
+        })
+        resp = self.client.post("/api/v1/config/vision", json={
+            "api_key": "sk-vision", "base_url": "https://vision.test", "model_name": "vl-model",
+        })
+        assert resp.status_code == 200
+        assert resp.json()["is_configured"] is True
+
+        vision = self.client.get("/api/v1/config/vision").json()
+        assert vision["model_name"] == "vl-model"
+        assert "api_key" not in vision
+        # 文本模型没被带跑
+        assert self.client.get("/api/v1/config").json()["model_name"] == "text-model"
+
+        # 清掉视觉配置不影响文本配置
+        assert self.client.delete("/api/v1/config/vision").json()["is_configured"] is False
+        assert self.client.get("/api/v1/config").json()["is_configured"] is True
+
+    def test_vision_config_defaults_when_unset(self):
+        """没配置时回默认值且 is_configured=false —— 前端据此显示「纯文本分析」"""
+        self.client.delete("/api/v1/config/vision")
+        body = self.client.get("/api/v1/config/vision").json()
+        assert body["is_configured"] is False
+        assert body["base_url"] == "https://api.kimi.com/coding/v1"
+        assert body["model_name"] == "kimi-for-coding"
+
     def test_task_list_empty_initially(self):
         resp = self.client.get("/api/v1/tasks")
         assert resp.status_code == 200
@@ -835,6 +868,37 @@ class TestExportEndpointEndToEnd:
         assert [r["原文"] for r in rows] == ["主贴B", "主贴A", "评论A1", "评论A2"]
         roots = [r["发布时间"] for r in rows if r["层级"] == "0"]
         assert roots == sorted(roots, reverse=True), roots
+
+    def test_force_reanalyzes_posts_that_were_already_done(self):
+        """增量按帖子身份跳过已分析的，改了分析口径后老帖子会永远停在旧结论上。
+
+        实测库里 124/125 条都已分析、带图的 23 条**全部**已分析 —— 没有这个入口，
+        接上图片理解之后在现有数据上一点变化都看不到。
+        """
+        self.storage.mark_sentiment_analyzed([
+            dict(p, _processed={"sentiment_at": "2026-08-05T10:00:00"}) for p in self.posts
+        ])
+        try:
+            # 不带 force：全都跳过
+            body = self.client.post(f"/api/v1/tasks/{self.task_id}/sentiment").json()
+            assert body["status"] == "completed", body
+            assert "已完成舆情分析" in body["message"]
+
+            # 带 force：4 条全部重新进入待分析
+            body = self.client.post(
+                f"/api/v1/tasks/{self.task_id}/sentiment?force=true"
+            ).json()
+            assert body["status"] == "started", body
+            assert body["pending_count"] == 4, body
+            assert "强制重新分析" in body["message"]
+        finally:
+            conn = self.storage._get_conn()
+            try:
+                conn.execute("UPDATE posts SET sentiment_at = NULL WHERE source_id = 'src_x'")
+                conn.commit()
+            finally:
+                conn.close()
+            self.orchestrator._sentiment_running.discard(self.task_id)
 
     def test_unanalyzed_posts_still_export(self):
         """只翻译没跑舆情的任务也得导得出来，否则唯一的导出口对它永远是死的"""

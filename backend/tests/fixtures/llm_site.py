@@ -36,6 +36,7 @@ class _Handler(BaseHTTPRequestHandler):
         n_posts = len(re.findall(r"^帖子\d+ \[来源:", user_msg, re.M))
         self.server.seen.append("plan" if "智能调度器" in system_msg else n_posts)
         self.server.prompts.append(system_msg)
+        self.server.user_prompts.append(user_msg)
 
         if "智能调度器" in system_msg:
             # 替身模型：描述里要了舆情就给带 sentiment 的计划。真模型靠 prompt
@@ -74,6 +75,8 @@ class LLMSite:
 
     seen 记下每次请求里有几条帖子，用来断言重试确实是「一条一条」发出去的。
     prompts 记下每次请求的 system prompt，用来断言模型确实被告知了某个动作。
+    user_prompts 记下每次请求的 user message，用来断言帖子块里带上了讨论串上下文
+    和图片描述。
     """
 
     def __init__(self, port: int = 0):
@@ -82,11 +85,13 @@ class LLMSite:
         self._thread = None
         self.seen = []
         self.prompts = []
+        self.user_prompts = []
 
     def __enter__(self) -> str:
         self._server = ThreadingHTTPServer(("127.0.0.1", self._port), _Handler)
         self._server.seen = self.seen
         self._server.prompts = self.prompts
+        self._server.user_prompts = self.user_prompts
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         return "http://127.0.0.1:{}".format(self._server.server_address[1])

@@ -1,10 +1,14 @@
 import apiClient, { withApiKey } from './client'
 import type { SentimentData } from '@/types/sentiment'
 
+/** force=true 忽略 sentiment_at，把所有有正文的帖子按当前口径重跑（会重新花钱） */
 export async function triggerSentiment(
-  taskId: string
+  taskId: string,
+  force = false
 ): Promise<{ message: string; status: string; pending_count?: number }> {
-  const { data } = await apiClient.post(`/tasks/${taskId}/sentiment`)
+  const { data } = await apiClient.post(
+    `/tasks/${taskId}/sentiment${force ? '?force=true' : ''}`
+  )
   return data
 }
 

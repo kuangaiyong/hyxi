@@ -16,12 +16,15 @@ logger = logging.getLogger("hyxi.translator")
 # 批量翻译时每次 LLM 调用处理的帖子数量
 BATCH_SIZE = 5
 
-TRANSLATION_SYSTEM_PROMPT = """你是一位精通荷兰语、英语和中文的新能源光储行业专业翻译专家。
-你的任务是将论坛与社交媒体帖子翻译成中文。源文本可能是荷兰语或英语，同一批次内可能混杂，
-请自动识别语种并统一译为中文；已经是中文的原样返回。需要特别注意：
+# 人设句与术语表单独抽出来，是因为**图片理解要用同一个角色**（vision_service 直接
+# import 这两个常量）。依赖方向看着有点怪，但这正是需求要的「多模态模型的角色与翻译
+# 时一致」—— 看懂储能设备照片、App 截图、配电箱接线图靠的就是这份术语表。
+#
+# 拆分后 TRANSLATION_SYSTEM_PROMPT 拼出来必须与拆分前**逐字节相同**，翻译行为一个字
+# 都不能变；回归测试见 TestIndustryRoleIsSharedWithVision。
+INDUSTRY_ROLE = "你是一位精通荷兰语、英语和中文的新能源光储行业专业翻译专家。"
 
-1. **行业术语准确**：
-   - thuisbatterij / thuisaccu → 家用储能电池
+INDUSTRY_GLOSSARY = """   - thuisbatterij / thuisaccu → 家用储能电池
    - omvormer → 逆变器
    - terugleveren → 余电上网/向电网送电
    - salderen → 净计量/余额结算
@@ -36,7 +39,14 @@ TRANSLATION_SYSTEM_PROMPT = """你是一位精通荷兰语、英语和中文的�
    - BMS (Battery Management System) → 电池管理系统
    - firmware → 固件
    - mesh-netwerk → 网状网络
-   - stopcontact → 插座
+   - stopcontact → 插座"""
+
+TRANSLATION_SYSTEM_PROMPT = f"""{INDUSTRY_ROLE}
+你的任务是将论坛与社交媒体帖子翻译成中文。源文本可能是荷兰语或英语，同一批次内可能混杂，
+请自动识别语种并统一译为中文；已经是中文的原样返回。需要特别注意：
+
+1. **行业术语准确**：
+{INDUSTRY_GLOSSARY}
 
 2. **语言风格**：自然流畅的口语化中文，保留原文的语气和情感
 

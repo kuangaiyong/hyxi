@@ -8,16 +8,22 @@ from typing import List, Optional
 from app.services.post_tree import post_key
 from app.services.progress_manager import ProgressManager
 from app.services.llm_service import LLMService
-from app.services.llm_utils import get_llm_service
+from app.services.llm_utils import get_llm_service, get_vision_service
 from app.services.storage import (
     save_sentiment as db_save_sentiment,
     mark_sentiment_analyzed as db_mark_sentiment_analyzed,
+    save_image_descs as db_save_image_descs,
 )
+from app.services.vision_service import describe_post_images
 from app.models import LLMConfig
 
 logger = logging.getLogger("hyxi.sentiment")
 
 BATCH_SIZE = 3  # 详细分析每次发送的帖子数
+
+# 单条帖子的讨论串上下文字符上限。实测最长的一串才 1069 字符，平时够不着 ——
+# 这是给信息流类来源（一个主贴挂几十条评论）留的保险，防止 prompt 无上限膨胀
+THREAD_CONTEXT_LIMIT = 3000
 
 
 # 维度必须是封闭集合。放任 LLM 自由生成会把 top_dimensions 碎成上百个近义标签，
@@ -74,8 +80,12 @@ SENTIMENT_SYSTEM_PROMPT = f"""你是一位精通多语种和中文的市场舆�
 - 每条帖子前会标注 [来源: xxx]。不同平台的表达语气基线不同（论坛偏技术克制，
   社交媒体偏情绪化），评分请按**该平台内部的相对水平**判断，不要因为平台不同就
   预设某个平台更正面或更负面
-- 标了 [回复上文: ...] 的是对上文的回复，请结合上文判断；「+1」「同上」这类附和
-  要继承上文的情感倾向，而不是一律判 neutral
+- 帖子会附带它所在讨论串的上下文（主贴 + 该串的回复）。其中带 ▶ 标记、注明
+  「← 本条为待分析对象」的那一条**才是你要判定的对象**，其余仅供理解语境。
+  「+1」「同上」这类附和要结合上下文继承相应的情感倾向，而不是一律判 neutral；
+  但**绝不要**把上下文里别人的态度直接当成待分析对象自己的态度
+- [图片: ...] 是多模态模型对该帖配图的客观描述，请与正文同等参考 —— 有些帖子正文
+  很短，真正的信息（报错码、安装现场、账单金额）都在图上
 
 输入是多条帖子，请为每条帖子输出JSON，用 '---SENTIMENT_SEPARATOR---' 分隔每条结果。
 直接输出JSON对象序列，不要编号，不要额外解释。"""
@@ -120,6 +130,50 @@ class SentimentService:
         return full
 
     @staticmethod
+    async def _understand_images(task_id: str, targets: list, progress: ProgressManager) -> int:
+        """把带图帖子的配图交给多模态模型理解，结果写进 post["image_desc"] 并落库。
+
+        **整段是尽力而为**：模型没配就直接跳过，单张失败也只是这条没有描述 ——
+        舆情分析照常按正文进行。为一张图让整轮分析失败是不可接受的。
+        """
+        if not targets:
+            return 0
+        vision = get_vision_service()
+        if vision is None:
+            await progress.emit(task_id, "log", {
+                "level": "info",
+                "message": f"{len(targets)} 条帖子带图，但未配置多模态模型，本轮按纯文本分析",
+            })
+            return 0
+
+        await progress.emit(task_id, "log", {
+            "level": "info",
+            "message": f"开始理解 {len(targets)} 条帖子的配图（模型 {vision.config.model_name}）",
+        })
+        done = 0
+        try:
+            for post in targets:
+                desc = await describe_post_images(post, vision)
+                if desc:
+                    post["image_desc"] = desc
+                    done += 1
+                await asyncio.sleep(0.5)
+        finally:
+            await vision.close()
+
+        try:
+            db_save_image_descs(targets)
+        except Exception as e:
+            # 没落上只是下一轮要重新理解一次，比让整轮分析失败轻得多
+            logger.warning("回写 image_desc 失败: %s", e)
+
+        await progress.emit(task_id, "log", {
+            "level": "info" if done == len(targets) else "warning",
+            "message": f"图片理解完成: {done}/{len(targets)} 条成功",
+        })
+        return done
+
+    @staticmethod
     async def analyze(
         task_id: str,
         posts: list,
@@ -127,7 +181,7 @@ class SentimentService:
         existing_results: list = None,
         fp_to_idx: dict = None,
         source_names: dict = None,
-        parent_by_key: dict = None,
+        thread_by_key: dict = None,
         all_posts: list = None,
         step_index: int = 0,
     ) -> dict:
@@ -151,24 +205,84 @@ class SentimentService:
         if not llm:
             raise Exception("请先配置 LLM API")
 
+        # ===== 图片先交给多模态模型理解 =====
+        # 范围是「待分析帖子所在讨论串里的全部带图帖子」，不只是待分析的那几条 ——
+        # 主贴的图正是它下面每条回复的上下文，漏掉就等于回复看不见图。
+        # 已经有 image_desc 的跳过：那是上一轮花钱换来的，没必要再买一次。
+        need_desc = {}
+        for _i, p in non_empty:
+            for member in (thread_by_key or {}).get(post_key(p)) or [p]:
+                if member.get("images") and not (member.get("image_desc") or "").strip():
+                    need_desc[post_key(member)] = member
+        await SentimentService._understand_images(task_id, list(need_desc.values()), progress)
+
         results = [None] * total
         success_count = 0
         fail_count = 0
 
+        def _member_line(m: dict, is_target: bool) -> str:
+            """讨论串里的一条。待分析那条给足正文，其余压到 600 字够表达立场即可。"""
+            role = "回复" if m.get("parent_fingerprint") else "主贴"
+            name = m.get("username") or "匿名"
+            text = (m.get("content") or "")[:2000 if is_target else 600]
+            line = f"{'▶ ' if is_target else '  '}{role} @{name}: {text}"
+            desc = (m.get("image_desc") or "").strip()
+            if desc:
+                line += f"\n    [图片: {desc}]"
+            if is_target:
+                line += "\n    ← 本条为待分析对象"
+            return line
+
+        def _thread_block(thread: list, target: dict) -> str:
+            """整串上下文。超长时保留主贴与待分析条目，其余按距离由近及远地收。"""
+            # 用 post_key 而不是 `is` 认人：待分析的那批与组串用的 all_posts 今天恰好是
+            # 同一批对象，但只要有谁改成各自 load_posts() 一次，身份判断就会全部落空 ——
+            # 那时 ▶ 标记会消失、下面的 next() 还会抛 StopIteration 把整轮分析带走
+            tk = post_key(target)
+            lines = [_member_line(m, post_key(m) == tk) for m in thread]
+            target_idx = next((i for i, m in enumerate(thread) if post_key(m) == tk), 0)
+            if sum(len(x) for x in lines) > THREAD_CONTEXT_LIMIT:
+                keep = {0, target_idx}
+                used = sum(len(lines[i]) for i in keep)
+                for i in sorted(range(len(lines)), key=lambda i: abs(i - target_idx)):
+                    if i in keep:
+                        continue
+                    if used + len(lines[i]) > THREAD_CONTEXT_LIMIT:
+                        break
+                    keep.add(i)
+                    used += len(lines[i])
+                trimmed, prev = [], -1
+                for i in sorted(keep):
+                    if i != prev + 1:
+                        trimmed.append("  …（此处省略部分回复）…")
+                    trimmed.append(lines[i])
+                    prev = i
+                lines = trimmed
+            return "\n".join(lines)
+
         def _post_block(orig_idx: int, p: dict) -> str:
             """一条帖子在 prompt 里的样子。批量和单条重试必须用同一份 ——
-            来源标签和父贴上文都影响判定，重试时少给就成了另一道题。"""
-            content = p.get("content", "")
-            truncated = content[:2000] if len(content) > 2000 else content
+            来源标签、讨论串上下文和图片描述都影响判定，重试时少给就成了另一道题。"""
             sid = p.get("source", "")
             label = (source_names or {}).get(sid, sid) or "未知来源"
             block = f"帖子{orig_idx + 1} [来源: {label}]:\n"
-            # 评论多是「+1」「same here」，单独看全是 neutral 噪音，
-            # 带上父贴前 200 字才判得准
-            parent = (parent_by_key or {}).get(post_key(p))
-            if parent:
-                block += f"[回复上文: {(parent.get('content') or '')[:200]}]\n"
-            return block + f"{truncated}\n\n"
+
+            # 回复大量是「+1」「same here」，单独看全是 neutral 噪音；只给父贴前 200 字
+            # 又丢掉了同串其他人的信息。整串一起给（实测最长才 1069 字符，很便宜）
+            thread = (thread_by_key or {}).get(post_key(p)) or [p]
+            if len(thread) > 1:
+                block += "[讨论串上下文]\n"
+                block += _thread_block(thread, p) + "\n"
+                block += "[/讨论串上下文]\n"
+            else:
+                # 孤立的主贴没有上下文可言，别为它套一层空壳，正文照旧原样给。
+                # **不能走 _member_line(p, False)**：那条路按「上下文里的旁人」处理，
+                # 只给 600 字 —— 而这条正是待分析对象，改造前给的是 2000 字。
+                # 实测 65 个主贴里大多数没有回复，走的都是这一支
+                content = (p.get("content") or "")[:2000]
+                desc = (p.get("image_desc") or "").strip()
+                block += content + (f"\n[图片: {desc}]" if desc else "") + "\n"
+            return block + "\n"
 
         try:
             for batch_start in range(0, total_non_empty, BATCH_SIZE):

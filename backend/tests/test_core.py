@@ -3,6 +3,8 @@
 import os
 import sys
 import json
+import asyncio
+import base64
 import tempfile
 import shutil
 import hashlib
@@ -226,6 +228,363 @@ class TestSentimentRetryEndToEnd:
         # 重试必须是一条一条发的：批量那次 3 条，之后跟着一次 1 条的重试
         assert server.seen[0] == 3, server.seen
         assert server.seen[1:] == [1], f"重试没有按单条发出: {server.seen}"
+
+
+class TestIndustryRoleIsSharedWithVision:
+    """多模态模型的角色必须与翻译时一致（需求明确要求），且抽取常量没改动翻译行为"""
+
+    def test_translation_prompt_survived_the_extraction(self):
+        """把人设与术语表抽成常量后，翻译 prompt 必须还是原来那一份。
+
+        它一变，几百条帖子的译文口径就跟着变，而这次改动压根不该碰翻译。
+        """
+        from app.services.translator_service import TRANSLATION_SYSTEM_PROMPT as P
+        assert P.startswith("你是一位精通荷兰语、英语和中文的新能源光储行业专业翻译专家。\n")
+        for term in ("thuisbatterij / thuisaccu → 家用储能电池",
+                     "P1-poort / P1-meter → P1端口/P1电表",
+                     "LiFePO4 → 磷酸铁锂",
+                     "stopcontact → 插座"):
+            assert term in P, f"术语表少了: {term}"
+        for section in ("1. **行业术语准确**：", "2. **语言风格**：",
+                        "3. **格式要求**：", "4. 输入是一段外文文本"):
+            assert section in P, f"小节丢了: {section}"
+
+    def test_vision_prompt_uses_the_very_same_role_and_glossary(self):
+        from app.services.translator_service import INDUSTRY_GLOSSARY, INDUSTRY_ROLE
+        from app.services.vision_service import VISION_SYSTEM_PROMPT
+        assert VISION_SYSTEM_PROMPT.startswith(INDUSTRY_ROLE)
+        assert INDUSTRY_GLOSSARY in VISION_SYSTEM_PROMPT
+
+    def test_vision_prompt_forbids_drawing_conclusions(self):
+        """描述图片是它的活，判情感是下一步的活。混在一起会让舆情判定被描述者带跑"""
+        from app.services.vision_service import VISION_SYSTEM_PROMPT
+        assert "不要推测" in VISION_SYSTEM_PROMPT
+        assert "不要写「用户对此不满」这类结论" in VISION_SYSTEM_PROMPT
+
+
+class _VisionTmpEnv:
+    """图片理解相关测试的公共环境：临时 data_dir + 临时库 + 一张真图"""
+
+    # 一个合法的 1x1 PNG，不是随便几个字节 —— 断言「解回来与磁盘上逐字节相同」时
+    # 用的就是它
+    PNG = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+        "AAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    )
+
+    def setup_method(self):
+        import app.config as cfg
+        import app.services.storage as storage_module
+        self.cfg = cfg
+        self.tmpdir = tempfile.mkdtemp()
+        self._old_dir = cfg.settings.data_dir
+        cfg.settings.data_dir = self.tmpdir
+        self.storage = storage_module
+        self._old_db = storage_module.DB_PATH
+        storage_module.DB_PATH = os.path.join(self.tmpdir, "hyxi.db")
+        storage_module.init_db()
+
+        self.media_rel = "src_x/pic_0.png"
+        media_dir = os.path.join(self.tmpdir, "media", "src_x")
+        os.makedirs(media_dir, exist_ok=True)
+        with open(os.path.join(media_dir, "pic_0.png"), "wb") as f:
+            f.write(self.PNG)
+
+    def teardown_method(self):
+        self.cfg.settings.data_dir = self._old_dir
+        self.storage.DB_PATH = self._old_db
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _fixtures(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures"))
+        import llm_site
+        import vision_site
+        return llm_site, vision_site
+
+    def _run(self, coro):
+        return asyncio.new_event_loop().run_until_complete(coro)
+
+    def _analyze(self, posts, pending=None, all_posts=None):
+        from app.services.sentiment_service import SentimentService
+        from app.services.progress_manager import ProgressManager
+        from app.services.post_tree import thread_of, post_key
+        full = all_posts if all_posts is not None else posts
+        target = pending if pending is not None else posts
+        fp_to_idx = {post_key(p): i for i, p in enumerate(full)}
+        return self._run(SentimentService.analyze(
+            "vision-e2e", target, ProgressManager(),
+            fp_to_idx=fp_to_idx, source_names={"src_x": "Facebook"},
+            thread_by_key=thread_of(full), all_posts=full,
+        ))
+
+
+class TestImageUnderstandingEndToEnd(_VisionTmpEnv):
+    """图片先给多模态模型理解，描述再进舆情 prompt —— 真 HTTP、真 base64、真 SQLite"""
+
+    def _post(self, fp="fp1", images=None, **kw):
+        p = {"source": "src_x", "fingerprint": fp, "timestamp": "01-07-2026 10:00",
+             "username": "alice", "content": "Kijk zelf maar.", **kw}
+        if images is not None:
+            p["images"] = images
+        return p
+
+    def test_image_reaches_vision_intact_and_its_description_reaches_the_llm(self):
+        """整条链路：磁盘上的图 → data URI → 多模态模型 → 描述 → 舆情 prompt"""
+        llm_site, vision_site = self._fixtures()
+        from app.services.translator_service import INDUSTRY_ROLE
+
+        posts = [self._post(images=[self.media_rel])]
+        llm = llm_site.LLMSite()
+        vision = vision_site.VisionSite()
+        with llm as llm_url, vision as vision_url:
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-t", "base_url": llm_url, "model_name": "text-model"})
+            self.storage.set_app_config("vision", {
+                "api_key": "sk-v", "base_url": vision_url, "model_name": "vision-model"})
+            out = self._analyze(posts)
+
+        # 多模态模型确实收到了那张图，且解回来与磁盘上逐字节相同
+        assert vision.image_count == 1, vision.calls
+        assert vision.decoded_images() == [self.PNG]
+        # 角色与翻译一致
+        assert vision.calls[0]["system"].startswith(INDUSTRY_ROLE)
+        # 描述进了舆情 prompt
+        joined = "\n".join(llm.user_prompts)
+        assert "[图片: " in joined, joined
+        assert vision_site.DESCRIPTION in joined, joined
+        assert out["success"] == 1
+
+    def test_root_image_is_described_for_the_sake_of_its_reply(self):
+        """增量时待分析的只有回复，但主贴的图正是这条回复的上下文，必须一并理解。
+
+        只按 pending 收集带图帖子的话，回复就完全看不见主贴那张图。
+        """
+        llm_site, vision_site = self._fixtures()
+        root = self._post("root1", images=[self.media_rel], content="Zie foto.")
+        reply = self._post("c1", username="bob", content="+1", parent_fingerprint="root1")
+
+        llm = llm_site.LLMSite()
+        vision = vision_site.VisionSite()
+        with llm as llm_url, vision as vision_url:
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-t", "base_url": llm_url, "model_name": "text-model"})
+            self.storage.set_app_config("vision", {
+                "api_key": "sk-v", "base_url": vision_url, "model_name": "vision-model"})
+            self._analyze([root, reply], pending=[reply], all_posts=[root, reply])
+
+        assert vision.image_count == 1, "主贴的图没有被理解，回复就等于看不见图"
+        assert vision_site.DESCRIPTION in "\n".join(llm.user_prompts)
+
+    def test_description_is_persisted_and_not_bought_twice(self):
+        """image_desc 落库后，下一轮不该再为同一张图付一次钱"""
+        llm_site, vision_site = self._fixtures()
+        self.storage.upsert_posts("src_x", [self._post(images=[self.media_rel])])
+
+        llm = llm_site.LLMSite()
+        vision = vision_site.VisionSite()
+        with llm as llm_url, vision as vision_url:
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-t", "base_url": llm_url, "model_name": "text-model"})
+            self.storage.set_app_config("vision", {
+                "api_key": "sk-v", "base_url": vision_url, "model_name": "vision-model"})
+
+            self._analyze(self.storage.load_posts(["src_x"]))
+            assert vision.image_count == 1
+
+            reloaded = self.storage.load_posts(["src_x"])
+            assert reloaded[0]["image_desc"] == vision_site.DESCRIPTION, "描述没落库"
+
+            # 第二轮：描述已经在库里，不该再调多模态模型
+            self._analyze(reloaded)
+            assert vision.image_count == 1, f"同一张图被重复理解了: {vision.calls}"
+
+    def test_translation_never_touches_the_vision_model(self):
+        """需求明确：只有舆情分析要图片理解，翻译不要"""
+        llm_site, vision_site = self._fixtures()
+        from app.services.translator_service import TranslatorService
+        from app.services.progress_manager import ProgressManager
+
+        posts = [self._post(images=[self.media_rel])]
+        llm = llm_site.LLMSite()
+        vision = vision_site.VisionSite()
+        with llm as llm_url, vision as vision_url:
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-t", "base_url": llm_url, "model_name": "text-model"})
+            self.storage.set_app_config("vision", {
+                "api_key": "sk-v", "base_url": vision_url, "model_name": "vision-model"})
+            self._run(TranslatorService.execute("t", posts, {}, ProgressManager()))
+
+        assert vision.calls == [], f"翻译不该调用多模态模型: {vision.calls}"
+
+    def test_without_vision_config_analysis_still_completes(self):
+        """多模态模型是可选增强。没配就按纯文本分析，绝不能因此失败"""
+        llm_site, _vision_site = self._fixtures()
+        posts = [self._post(images=[self.media_rel])]
+        llm = llm_site.LLMSite()
+        with llm as llm_url:
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-t", "base_url": llm_url, "model_name": "text-model"})
+            out = self._analyze(posts)
+        assert out["success"] == 1
+        assert "[图片: " not in "\n".join(llm.user_prompts)
+
+    def test_vision_quota_exhausted_degrades_instead_of_failing(self):
+        """复刻实测踩到的 Kimi 403：配额用尽时舆情分析必须照常跑完"""
+        llm_site, vision_site = self._fixtures()
+        posts = [self._post(images=[self.media_rel])]
+        llm = llm_site.LLMSite()
+        vision = vision_site.VisionSite(fail_status=403)
+        with llm as llm_url, vision as vision_url:
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-t", "base_url": llm_url, "model_name": "text-model"})
+            self.storage.set_app_config("vision", {
+                "api_key": "sk-v", "base_url": vision_url, "model_name": "vision-model"})
+            out = self._analyze(posts)
+
+        assert vision.image_count >= 1, "应该尝试过"
+        assert out["success"] == 1, "403 不该让整轮分析失败"
+        assert "[图片: " not in "\n".join(llm.user_prompts)
+
+    def test_missing_image_file_is_skipped_quietly(self):
+        llm_site, vision_site = self._fixtures()
+        posts = [self._post(images=["src_x/does_not_exist.jpg"])]
+        llm = llm_site.LLMSite()
+        vision = vision_site.VisionSite()
+        with llm as llm_url, vision as vision_url:
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-t", "base_url": llm_url, "model_name": "text-model"})
+            self.storage.set_app_config("vision", {
+                "api_key": "sk-v", "base_url": vision_url, "model_name": "vision-model"})
+            out = self._analyze(posts)
+
+        assert vision.calls == [], "一张图都没读到就不该发请求"
+        assert out["success"] == 1
+
+    def test_path_traversal_in_images_is_refused(self):
+        """images 来自采集脚本，但 media 目录之外就是数据库和明文密钥"""
+        from app.services.vision_service import _media_path
+        assert _media_path("../hyxi.db") is None
+        assert _media_path("src_x/../../hyxi.db") is None
+        assert _media_path(self.media_rel) is not None
+
+
+class TestThreadContextInPromptEndToEnd(_VisionTmpEnv):
+    """回复贴的舆情判定要看整串，不能只看父贴前 200 字"""
+
+    def _thread(self):
+        return [
+            {"source": "src_x", "fingerprint": "root1", "username": "alice",
+             "content": "Mijn accu geeft foutcode E03 na de laatste firmware."},
+            {"source": "src_x", "fingerprint": "c1", "parent_fingerprint": "root1",
+             "username": "bob", "content": "Zelfde hier, al twee weken."},
+            {"source": "src_x", "fingerprint": "c2", "parent_fingerprint": "root1",
+             "username": "carol", "content": "+1"},
+        ]
+
+    def _prompt_for_reply(self):
+        llm_site, _ = self._fixtures()
+        posts = self._thread()
+        llm = llm_site.LLMSite()
+        with llm as llm_url:
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-t", "base_url": llm_url, "model_name": "text-model"})
+            self._analyze(posts, pending=[posts[2]], all_posts=posts)
+        return "\n".join(llm.user_prompts)
+
+    def test_reply_prompt_carries_root_and_sibling_replies(self):
+        """「+1」单独看必然是 neutral 噪音。整串给到，模型才判得出它在附和什么"""
+        prompt = self._prompt_for_reply()
+        assert "foutcode E03" in prompt, "主贴正文没进上下文"
+        assert "Zelfde hier" in prompt, "同串的另一条回复没进上下文"
+        assert "[讨论串上下文]" in prompt
+
+    def test_the_post_under_analysis_is_marked_and_others_are_not(self):
+        """不标出待分析对象，模型会把上下文里别人的态度当成这条的态度"""
+        prompt = self._prompt_for_reply()
+        assert "▶ 回复 @carol: +1" in prompt, prompt
+        assert "← 本条为待分析对象" in prompt
+        assert "▶ 主贴 @alice" not in prompt
+        assert "▶ 回复 @bob" not in prompt
+
+    def test_lone_root_gets_no_empty_context_wrapper(self):
+        """没有回复的孤立主贴不该套一层空的讨论串外壳"""
+        llm_site, _ = self._fixtures()
+        posts = [{"source": "src_x", "fingerprint": "solo", "username": "dave",
+                  "content": "Werkt prima hier."}]
+        llm = llm_site.LLMSite()
+        with llm as llm_url:
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-t", "base_url": llm_url, "model_name": "text-model"})
+            self._analyze(posts)
+        joined = "\n".join(llm.user_prompts)
+        assert "[讨论串上下文]" not in joined
+        assert "Werkt prima hier." in joined
+
+    def test_lone_root_keeps_the_full_2000_char_allowance(self):
+        """孤立主贴是**待分析对象**，不是上下文里的旁人，正文额度仍是 2000 字。
+
+        实测 65 个主贴里大多数没有回复，全走这一支 —— 按 600 字截等于大面积丢正文。
+        """
+        llm_site, _ = self._fixtures()
+        body = "A" * 1500 + "TAILMARKER" + "B" * 400
+        posts = [{"source": "src_x", "fingerprint": "solo", "username": "dave",
+                  "content": body}]
+        llm = llm_site.LLMSite()
+        with llm as llm_url:
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-t", "base_url": llm_url, "model_name": "text-model"})
+            self._analyze(posts)
+        assert "TAILMARKER" in "\n".join(llm.user_prompts), "正文被按上下文额度截短了"
+
+    def test_context_survives_when_pending_holds_different_objects(self):
+        """待分析的那批与组串用的 all_posts 可能不是同一批 dict（各自 load 一次就是）。
+
+        改造中一度按 `is` 认人：那种情况下 ▶ 标记会整个消失，定位待分析条目的 next()
+        还会抛 StopIteration 把整轮分析带走。身份一律走 post_key。
+        """
+        import copy
+        llm_site, _ = self._fixtures()
+        posts = self._thread()
+        detached = copy.deepcopy(posts[2])   # 同一条帖子，不同对象
+        llm = llm_site.LLMSite()
+        with llm as llm_url:
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-t", "base_url": llm_url, "model_name": "text-model"})
+            out = self._analyze(posts, pending=[detached], all_posts=posts)
+        prompt = "\n".join(llm.user_prompts)
+        assert out["success"] == 1, "分析被身份判断带崩了"
+        assert "▶ 回复 @carol: +1" in prompt, prompt
+        assert "foutcode E03" in prompt
+
+    def test_huge_thread_is_capped_but_keeps_root_and_target(self):
+        """信息流来源一个主贴能挂几十条评论，prompt 不能无上限膨胀。
+
+        但无论怎么裁，主贴和待分析那条都必须留着 —— 它们正是判定所依赖的两端。
+        """
+        from app.services.sentiment_service import THREAD_CONTEXT_LIMIT
+        llm_site, _ = self._fixtures()
+        posts = [{"source": "src_x", "fingerprint": "root1", "username": "alice",
+                  "content": "ROOTMARKER " + "x" * 300}]
+        for i in range(60):
+            posts.append({
+                "source": "src_x", "fingerprint": f"c{i}", "parent_fingerprint": "root1",
+                "username": f"u{i}", "content": f"reply{i} " + "y" * 300,
+            })
+        target = posts[-1]
+        target["content"] = "TARGETMARKER " + "z" * 300
+
+        llm = llm_site.LLMSite()
+        with llm as llm_url:
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-t", "base_url": llm_url, "model_name": "text-model"})
+            self._analyze(posts, pending=[target], all_posts=posts)
+
+        prompt = "\n".join(llm.user_prompts)
+        assert "ROOTMARKER" in prompt, "主贴被裁掉了"
+        assert "TARGETMARKER" in prompt, "待分析对象被裁掉了"
+        assert "…（此处省略部分回复）…" in prompt, "没有裁剪，prompt 会无上限膨胀"
+        # 整串块本身受限；给足两倍余量容纳帖子头、标记和省略号
+        assert len(prompt) < THREAD_CONTEXT_LIMIT * 2, len(prompt)
 
 
 class TestBuildSummaryEndToEnd:
@@ -738,6 +1097,49 @@ class TestPostKeyEndToEnd:
         merged = _merge_by_fingerprint(source_posts, translated)
         assert merged[0]["translation"] == "只属于A"
         assert "translation" not in merged[1]
+
+
+class TestThreadOfEndToEnd:
+    """每条帖子 → 它所属的整串。舆情分析拿它当上下文"""
+
+    def _posts(self):
+        return [
+            {"source": "s", "fingerprint": "root1", "content": "主贴1"},
+            {"source": "s", "fingerprint": "c1", "parent_fingerprint": "root1", "content": "评论1"},
+            {"source": "s", "fingerprint": "c2", "parent_fingerprint": "c1", "content": "评论1的回复"},
+            {"source": "s", "fingerprint": "root2", "content": "主贴2"},
+        ]
+
+    def test_every_member_maps_to_the_same_thread(self):
+        from app.services.post_tree import thread_of, post_key
+        posts = self._posts()
+        mapping = thread_of(posts)
+        thread = mapping[post_key(posts[1])]
+        assert [p["fingerprint"] for p in thread] == ["root1", "c1", "c2"]
+        # 同一串里的每个成员拿到的都是同一份（含嵌套回复）
+        assert mapping[post_key(posts[0])] is thread
+        assert mapping[post_key(posts[2])] is thread
+
+    def test_nested_reply_belongs_to_the_top_level_thread(self):
+        """嵌套回复归到顶层主贴那一串，不按子树再切 —— 讨论是围绕主贴发生的"""
+        from app.services.post_tree import thread_of, post_key
+        posts = self._posts()
+        thread = thread_of(posts)[post_key(posts[2])]
+        assert thread[0]["fingerprint"] == "root1"
+
+    def test_unrelated_threads_do_not_bleed_into_each_other(self):
+        from app.services.post_tree import thread_of, post_key
+        posts = self._posts()
+        mapping = thread_of(posts)
+        assert [p["fingerprint"] for p in mapping[post_key(posts[3])]] == ["root2"]
+
+    def test_orphan_reply_forms_its_own_thread(self):
+        """父贴不在本批里的回复自成一串，语义与 build_tree 一致，不能丢"""
+        from app.services.post_tree import thread_of, post_key
+        orphan = {"source": "s", "fingerprint": "x", "parent_fingerprint": "gone",
+                  "content": "孤儿回复"}
+        mapping = thread_of([orphan])
+        assert [p["fingerprint"] for p in mapping[post_key(orphan)]] == ["x"]
 
 
 class TestPostTreeEndToEnd:
@@ -1301,6 +1703,29 @@ class TestPostsStorageEndToEnd:
         assert got["_processed"]["translated"] is True
         assert got["_processed"]["sentiment_at"] == "2026-08-05T10:00:00"
         assert got["content"] == "正文被编辑过了", "采集字段没更新"
+
+    def test_upsert_never_clobbers_image_desc(self):
+        """图片描述与译文同类：花钱换来的，重扫不得抹掉。
+
+        抹掉就意味着每轮采集之后所有带图帖子都要重新调一次多模态模型。
+        """
+        self.storage.upsert_posts("src_x", [self._p("a")])
+        self.storage.save_image_descs([
+            {"source": "src_x", "fingerprint": "a", "image_desc": "一台报错的储能电池"},
+        ])
+
+        self.storage.upsert_posts("src_x", [self._p("a", content="正文被编辑过了")])
+
+        got = self.storage.load_posts(["src_x"])[0]
+        assert got["image_desc"] == "一台报错的储能电池", "图片描述被重扫抹掉了"
+
+    def test_empty_image_desc_is_not_written(self):
+        """空描述通常意味着模型没配或配额用尽。写个空串下去，下一轮就再也不会重试了"""
+        self.storage.upsert_posts("src_x", [self._p("a")])
+        assert self.storage.save_image_descs([
+            {"source": "src_x", "fingerprint": "a", "image_desc": "  "},
+        ]) == 0
+        assert "image_desc" not in self.storage.load_posts(["src_x"])[0]
 
     def test_added_count_reflects_only_new_posts(self):
         assert self.storage.upsert_posts("src_x", [self._p("a"), self._p("b")]) == 2

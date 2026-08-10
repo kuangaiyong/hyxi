@@ -68,6 +68,32 @@ def build_tree(posts: List[dict]) -> Tuple[List[dict], Dict[str, List[dict]]]:
     return roots, children
 
 
+def thread_of(posts: List[dict]) -> Dict[str, List[dict]]:
+    """每条帖子 → 它所属的完整讨论串（主贴在前，其余按 posts 里的原顺序）。
+
+    舆情分析拿它做上下文：回复贴大量是「+1」「same here」，只看自己判出来全是
+    neutral 噪音，只看父贴前 200 字也丢掉了同串其他人的信息。
+
+    嵌套回复归到它的**顶层主贴**那一串，不按层级再分组 —— 讨论是围绕主贴发生的，
+    按子树切会把同一场讨论劈成几段。父贴不在本批数据里的回复自成一串，
+    与 build_tree() 的既有语义一致。
+    """
+    roots, children = build_tree(posts)
+    mapping: Dict[str, List[dict]] = {}
+    for root in roots:
+        thread: List[dict] = []
+
+        def walk(post: dict):
+            thread.append(post)
+            for child in children.get(post_key(post), []):
+                walk(child)
+
+        walk(root)
+        for member in thread:
+            mapping[post_key(member)] = thread
+    return mapping
+
+
 def order_by_thread(posts: List[dict]) -> List[dict]:
     """按「主贴 → 它的评论 → 下一个主贴」重排，主贴按发表时间从新到旧，并回填 reply_level。
 

@@ -78,6 +78,7 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
     ├── app/services/collector_runner.py 驱动 Node 采集脚本（job.json + NDJSON，超时 + 取消清理）
     ├── app/services/post_tree.py       跨来源索引键 + 出口组树（存储层始终扁平）
     ├── app/services/translator_service.py LLM 翻译（5 条/批 + 失败条目单条重译）
+    ├── app/services/vision_service.py     多模态图片理解（只服务于舆情，翻译不用）
     ├── app/services/sentiment_service.py  LLM 舆情分析（3 条/批，结论按帖子身份落库）
     ├── app/services/excel_service.py   openpyxl 生成双语 Excel + 舆情报告
     ├── app/services/storage.py         SQLite 存储层（全部持久化，见「持久化」一节）
@@ -102,7 +103,7 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
 | `sentiment_runs` | 某个任务最近一次触发分析的时间，只此一列 |
 | `sentiment_results` | **舆情结论，按 `(source_id, fingerprint)` 存** |
 | `sources` / `credentials` | 数据源与加密凭据，`ON DELETE CASCADE` |
-| `app_config` | LLM 配置，按 `llm.api_key` / `llm.base_url` / `llm.model_name` 分列 |
+| `app_config` | LLM 配置，按 `llm.api_key` / `llm.base_url` / `llm.model_name` 分列；多模态模型同形，换 `vision.` 前缀 |
 | `schedules` | 定时任务业务配置 |
 | `apscheduler_jobs` | APScheduler 自建，调度触发器 |
 
@@ -268,7 +269,7 @@ GET    /api/v1/tasks/{id}/posts/{idx}  单条帖子详情（0-based）
 GET    /api/v1/tasks/{id}/stats        任务统计
 GET    /api/v1/tasks/{id}/export       **唯一的导出口**（?format=xlsx|csv）
 
-POST   /api/v1/tasks/{id}/sentiment           触发舆情分析（增量）
+POST   /api/v1/tasks/{id}/sentiment           触发舆情分析（增量；?force=true 忽略 sentiment_at 全量重跑）
 GET    /api/v1/tasks/{id}/sentiment           获取舆情结果（只读本任务）
 GET    /api/v1/tasks/{id}/sentiment/events    舆情分析 SSE 流
 
@@ -276,6 +277,11 @@ GET    /api/v1/config                LLM 配置（不含 api_key）
 POST   /api/v1/config                保存配置
 POST   /api/v1/config/test           测试连接
 DELETE /api/v1/config                重置配置
+
+GET    /api/v1/config/vision         多模态模型配置（可选，同形，不含 api_key）
+POST   /api/v1/config/vision         保存
+POST   /api/v1/config/vision/test    测试连接（只证明密钥有效，见下）
+DELETE /api/v1/config/vision         清除（清除后舆情回到纯文本）
 
 GET    /api/v1/schedules             定时任务列表（附 next_run）
 GET    /api/v1/schedules/presets     调度预设 (hourly / 6h / 12h / daily)
@@ -331,6 +337,47 @@ prompt 里有两条必须留着：一是**正例要列全**（各种语序和口
 
 漏掉这一步的后果特别隐蔽：结论按帖子身份跨任务共享，所以新任务一打开，页面上是**上一个任务留下的**结论，看着像已经分析过了；只有那几条新采到的帖子是空的，得逐条翻才发现。用户实测报过（95 条里只有第 95 条没分析，因为它是当天新增的唯一一条）。
 
+## 图片理解与整串上下文（只作用于舆情）
+
+**舆情分析前，带图帖子的配图先交给多模态模型转成中文描述**，再连同正文一起发给大语言模型。
+配置走 `app_config` 的 `vision.` 前缀（`get_app_config` 本来就按前缀分组，**没动任何表结构**），
+未配置时 `get_vision_service()` 返回 `None`，整条链路降级为纯文本。
+
+- **只有舆情走这条路，翻译不走**。译文对着的是正文，塞图进去只会污染译文，还要为每条带图
+  帖子多付一次多模态调用。回归测试见 `TestImageUnderstandingEndToEnd::test_translation_never_touches_the_vision_model`
+- **多模态的系统提示词复用翻译那份角色**（`INDUSTRY_ROLE` + `INDUSTRY_GLOSSARY`，从
+  `translator_service` import）。看懂储能设备照片、App 截图、配电箱接线图靠的正是那张术语表。
+  抽常量时 `TRANSLATION_SYSTEM_PROMPT` 拼出来**必须逐字节不变**，否则几百条帖子的译文口径跟着变
+- **prompt 里只让它描述、不让它下结论**（「不要写「用户对此不满」这类结论」）。混在一起会让
+  舆情判定被描述者带跑，而那正是下一步要独立做的事
+- **描述落 `posts.image_desc` 且重采集不覆盖**（与 `translation` / `sentiment_at` 同规矩）。
+  主贴的图会被它下面**每一条回复**的整串上下文引用，不存的话增量每轮都要把同一张图重新买一次
+- **失败一律降级不中断**：模型没配、配额 403、图丢了、路径越界 —— 都只是这条没有描述，
+  舆情照常按正文跑完。为一张图让整轮分析失败是不可接受的
+
+**回复贴的判定要看整串，不是父贴前 200 字**。`post_tree.thread_of()` 把每条帖子映射到它所属的
+完整讨论串（嵌套回复归到顶层主贴那一串），`_post_block()` 渲染成带 `▶` 标记的上下文块，
+注明哪一条才是待分析对象。「+1」「same here」单独看必然是 neutral 噪音 —— 实测 60 条回复里
+大量是这种。**`thread_by_key` 必须基于 `all_posts` 而不是 `pending_posts`**：增量时待分析的
+往往只是一条新回复，只拿它自己组串等于没有上下文。整串块有 `THREAD_CONTEXT_LIMIT`（3000 字符）
+上限，裁剪时**主贴与待分析条目永远保留**。
+
+**`/config/vision/test` 成功不代表图片理解可用**：`test_connection()` 先探 `/models`，而
+**配额用尽时那个接口照样返回 200**（实测 Kimi 就是这样：`/models` 200，`chat/completions` 403
+`access_terminated_error`）。界面文案已经写明这一点，别把它简化掉。
+
+> **当前状态（2026-08-10 实测）：用户给的 Kimi 账号配额已用尽。** `GET /models` 返回 200 且能
+> 列出 `kimi-for-coding` / `kimi-for-coding-highspeed` / `k3-256k` / `k3`，但任何
+> `chat/completions`（纯文本与图片都试过）都是 403。因此**「`kimi-for-coding` 是否支持图片输入」
+> 至今未经真机验证**（它名字上是编码模型）。自动化测试用 `tests/fixtures/vision_site.py` 这个
+> 本地替身覆盖，走真 HTTP、真 base64、真 JPEG 字节比对。配额恢复后需要补两件事：确认该模型
+> 接不接受图片（不接受就在界面上改配 `k3` 或别的视觉模型，**不用改代码**），以及跑一遍真机
+> 带图分析留证据。
+
+**增量粒度仍是 `sentiment_at`，所以改了分析口径必须走 `?force=true`**。接上图片理解那天，
+库里 124/125 条已分析、23 条带图的**全部**已分析 —— 不重跑的话新功能在现有数据上一点变化都
+看不到。舆情页的「🔄 强制重新分析」就是这个入口，点击弹确认框（它会重新花钱）。
+
 **舆情分析的另一条路是结果页按钮**（`POST /tasks/{id}/sentiment`，后台跑、立刻返回）。两条路共用 `orchestrator.run_sentiment()`，区别只有：流水线那条 `await` 到底并让异常冒出去（步骤要靠它判成败），按钮那条 `create_task` 后立刻返回、失败只发 `sentiment_complete` 事件。`run_sentiment_async()` 必须**同步**把 task_id 放进 `_sentiment_running`——等协程调度起来再放的话，POST 刚返回那一瞬间前端来问 `GET /sentiment` 会得到「没在跑」。
 
 两条路的增量粒度都是 `_processed.sentiment_at` 为空的帖子。跨来源分组（`by_source` / `cross_source`）走**纯 Python**，不需要 LLM 感知来源；prompt 里只给每条帖子标 `[来源: xxx]` 并说明「按平台内部的相对水平判断」，**绝不描述某个平台的情感先验**——那会污染的正是我们想比较的那个维度。评论会带上父贴前 200 字作 `[回复上文: ...]`，否则「+1」「same here」全被判成 neutral 噪音。
@@ -339,7 +386,7 @@ prompt 里有两条必须留着：一是**正例要列全**（各种语序和口
 
 ## 测试
 
-**233 个测试，必须全部 PASSED**（本机实测 `233 passed in 280s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**259 个测试，必须全部 PASSED**（本机实测 `259 passed in 376s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v

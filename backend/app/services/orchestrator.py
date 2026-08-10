@@ -11,7 +11,7 @@ from app.config import settings
 from app.logging_config import get_logger
 from app.collectors import get_collector
 from app.services import source_service
-from app.services.post_tree import build_tree, post_key
+from app.services.post_tree import post_key, thread_of
 from app.services.llm_service import LLMService
 from app.services.collector_runner import CollectorRunner, ManualAuthRequired
 from app.services.translator_service import TranslatorService
@@ -541,18 +541,15 @@ class TaskOrchestrator:
                 if p.get("fingerprint"):
                     fp_to_idx[post_key(p)] = i
 
-            # 来源名与父贴映射：让 prompt 能标注来源、给评论带上父贴上下文
+            # 来源名让 prompt 能标注来源；讨论串映射让每条帖子都带上「主贴 + 全部回复」
+            # 的上下文（**必须基于 all_posts 而不是 pending_posts** —— 增量时待分析的
+            # 往往只是一条新回复，只拿它自己组串就等于没有上下文）
             source_names = {s["id"]: s["name"] for s in source_service.list_sources()}
-            by_key = {post_key(p): p for p in all_posts}
-            _roots, children = build_tree(all_posts)
-            parent_by_key = {}
-            for parent_k, kids in children.items():
-                for child in kids:
-                    parent_by_key[post_key(child)] = by_key[parent_k]
+            thread_by_key = thread_of(all_posts)
 
             await SentimentService.analyze(
                 task_id, pending_posts, progress_manager, existing_results, fp_to_idx,
-                source_names, parent_by_key, all_posts, step_index,
+                source_names, thread_by_key, all_posts, step_index,
             )
             await progress_manager.emit(task_id, "sentiment_complete", {
                 "task_id": task_id,

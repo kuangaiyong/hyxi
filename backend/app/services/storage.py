@@ -121,6 +121,9 @@ CREATE TABLE IF NOT EXISTS posts (
     parent_fingerprint TEXT,
     reply_level        INTEGER NOT NULL DEFAULT 0,
     images_json        TEXT NOT NULL DEFAULT '[]',
+    -- 多模态模型对本帖配图的中文描述。落库是为了不重复付费：主贴的图会被它下面
+    -- 每一条回复的整串上下文引用，不存的话增量分析每轮都要把同一张图重新描述一遍
+    image_desc         TEXT NOT NULL DEFAULT '',
     translated         INTEGER NOT NULL DEFAULT 0,
     sentiment_at       TEXT,
     PRIMARY KEY (source_id, fingerprint)
@@ -150,10 +153,28 @@ def init_db():
         conn.commit()
         _rekey_sentiment_results(conn)
         _drop_stored_summary(conn)
+        _ensure_posts_image_desc(conn)
         conn.close()
         logger.info("SQLite 数据库初始化完成: %s", DB_PATH)
     except Exception as e:
         logger.error("数据库初始化失败: %s", str(e))
+
+
+def _ensure_posts_image_desc(conn) -> None:
+    """给既有库补上 posts.image_desc 列。
+
+    `CREATE TABLE IF NOT EXISTS` 对已存在的表什么都不做，所以新加的列必须自己 ALTER
+    上去，否则老库读写都会报 no such column。幂等，做法同 _drop_stored_summary。
+    """
+    cols = [d[1] for d in conn.execute("PRAGMA table_info(posts)")]
+    if "image_desc" in cols:
+        return
+    try:
+        conn.execute("ALTER TABLE posts ADD COLUMN image_desc TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+        logger.info("posts.image_desc 已补齐")
+    except Exception as e:
+        logger.error("补 posts.image_desc 列失败: %s", e)
 
 
 def _drop_stored_summary(conn) -> None:
@@ -681,6 +702,8 @@ def _row_to_post(row) -> dict:
     images = json.loads(row["images_json"] or "[]")
     if images:
         post["images"] = images
+    if row["image_desc"]:
+        post["image_desc"] = row["image_desc"]
     # 只放已置位的键：新采到的帖子本来就没有 _processed，凭空补一个空壳会让
     # 「这条处理过没有」多出一种表示形态
     processed = {}
@@ -812,7 +835,9 @@ def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True) -> 
             if not fp:
                 continue
             if fp in existing:
-                # seq 保持不变 —— 它是全链路的顺序锚点，动一下所有历史结论就错位了
+                # seq 保持不变 —— 它是全链路的顺序锚点，动一下所有历史结论就错位了。
+                # translation / translated / sentiment_at / image_desc 也一律不在这条
+                # UPDATE 里：它们都是花钱换来的结果，重新采集不得把它们冲回空值
                 conn.execute(
                     """UPDATE posts SET username=?, timestamp=?, content=?, page_number=?,
                        message_id=?, parent_fingerprint=?, reply_level=?, images_json=?
@@ -831,8 +856,8 @@ def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True) -> 
             conn.execute(
                 """INSERT INTO posts (source_id, fingerprint, seq, username, timestamp,
                    content, translation, page_number, message_id, parent_fingerprint,
-                   reply_level, images_json, translated, sentiment_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   reply_level, images_json, image_desc, translated, sentiment_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     source_id, fp, next_seq, post.get("username", ""),
                     post.get("timestamp", ""), post.get("content", ""),
@@ -840,6 +865,7 @@ def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True) -> 
                     post.get("message_id", ""), post.get("parent_fingerprint"),
                     int(post.get("reply_level", 0) or 0),
                     json.dumps(post.get("images") or [], ensure_ascii=False),
+                    post.get("image_desc", ""),
                     1 if processed.get("translated") else 0,
                     processed.get("sentiment_at"),
                 ),
@@ -873,6 +899,32 @@ def save_translations(posts: List[dict]) -> int:
                     1 if processed.get("translated") else 0,
                     post.get("source") or "tweakers", fp,
                 ),
+            )
+            updated += cur.rowcount
+        conn.commit()
+        return updated
+    finally:
+        conn.close()
+
+
+def save_image_descs(posts: List[dict]) -> int:
+    """把多模态模型给出的图片描述落库。
+
+    只写 image_desc 这一个字段，理由同 mark_sentiment_analyzed —— 别的列都是别的
+    步骤花钱换来的。空描述不写：那通常意味着模型没配、配额用尽或图丢了，
+    存一个空串会让下一轮以为「已经理解过、就是没内容」，从此再也不重试。
+    """
+    conn = _get_conn()
+    try:
+        updated = 0
+        for post in posts:
+            desc = (post.get("image_desc") or "").strip()
+            fp = post.get("fingerprint")
+            if not (desc and fp):
+                continue
+            cur = conn.execute(
+                "UPDATE posts SET image_desc=? WHERE source_id=? AND fingerprint=?",
+                (desc, post.get("source") or "tweakers", fp),
             )
             updated += cur.rowcount
         conn.commit()

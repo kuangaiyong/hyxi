@@ -330,15 +330,21 @@ async function checkStatus() {
   }
 }
 
-async function startAnalysis() {
+/** force=true 会忽略「已分析过」的标记，把所有帖子按当前口径重跑一遍 */
+async function startAnalysis(force = false) {
+  if (force && !window.confirm(
+    '将忽略「已分析」标记，把这个任务的所有帖子重新分析一遍。\n\n' +
+    '这会重新消耗大模型调用（带图的帖子还会额外调用多模态模型）。确定继续吗？'
+  )) return
+
   analyzing.value = true
   error.value = ''
-  progressMsg.value = '正在启动分析...'
+  progressMsg.value = force ? '正在启动强制重新分析...' : '正在启动分析...'
   progressPct.value = 0
   progressLogs.value = []
   pendingCount.value = 0
   try {
-    const result = await sentimentApi.triggerSentiment(taskId.value)
+    const result = await sentimentApi.triggerSentiment(taskId.value, force)
     // 优先使用 API 返回的 pending_count 字段，fallback 到正则匹配消息文本
     if (typeof result.pending_count === 'number') {
       pendingCount.value = result.pending_count
@@ -654,6 +660,17 @@ function viewPost(idx: number) {
             <button @click="handleExport('csv')">CSV (.csv)</button>
           </div>
         </div>
+        <!-- 增量分析按帖子身份跳过已分析的，所以改了分析口径（比如刚接上图片理解）
+             之后老帖子会一直停在旧结论上，需要这个入口把它们重跑一遍 -->
+        <button
+          v-if="data"
+          class="btn btn-outline btn-sm"
+          :disabled="analyzing"
+          title="忽略「已分析」标记，按当前口径重新分析全部帖子（会重新消耗大模型调用）"
+          @click="startAnalysis(true)"
+        >
+          🔄 强制重新分析
+        </button>
         <button class="btn btn-outline btn-sm" @click="router.push(`/tasks/${taskId}/results`)">
           ← 返回结果
         </button>
@@ -706,7 +723,7 @@ function viewPost(idx: number) {
     <div v-else-if="error" class="card text-center" style="padding: 48px;">
       <div style="font-size: 48px; margin-bottom: 12px;">📭</div>
       <p class="text-secondary mb-4">{{ error }}</p>
-      <button class="btn btn-primary btn-lg" @click="startAnalysis" :disabled="analyzing">
+      <button class="btn btn-primary btn-lg" @click="startAnalysis(false)" :disabled="analyzing">
         <span v-if="analyzing" class="spinner"></span>
         🔍 开始舆情分析
       </button>

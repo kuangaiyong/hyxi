@@ -26,6 +26,12 @@ MAX_IMAGE_BYTES = 6 * 1024 * 1024
 # 一条帖子最多送几张图。实测最多的一条带 3 张，这个上限是给异常数据兜底的
 MAX_IMAGES_PER_POST = 6
 
+# 输出 token 预算。**必须给得足够宽**：kimi-for-coding 这类推理模型会先吐一大段
+# reasoning_content，而那部分**照样计入 max_tokens**。实测给 512 时 512 个全被推理
+# 吃掉，finish_reason=length、content 是空串 —— 于是每张图都「理解成功但没有描述」，
+# 界面上完全看不出异常。实测推理约 300~700 token，2048 留足余量。
+MAX_OUTPUT_TOKENS = 2048
+
 VISION_SYSTEM_PROMPT = f"""{INDUSTRY_ROLE}
 你的任务是看懂论坛与社交媒体帖子里的配图，并用中文客观描述图片内容，供后续舆情分析使用。
 
@@ -113,16 +119,28 @@ async def describe_post_images(post: dict, vision: Optional[LLMService]) -> str:
     })
 
     try:
+        # **不要传 temperature**：真机实测 kimi-for-coding 只接受 temperature=1，
+        # 传 0.2 会被整个请求打回 400 `invalid temperature: only 1 is allowed for
+        # this model`，再被下面的降级逻辑吞成「这条没有描述」—— 功能看着在跑，实际
+        # 一张图都没理解。各家视觉模型对这个参数的约束不一样，交给服务端默认值最稳。
+        # 描述任务本身受 prompt 强约束，不依赖低温度。
         text = await vision.chat(
             [
                 {"role": "system", "content": VISION_SYSTEM_PROMPT},
                 {"role": "user", "content": parts},
             ],
-            temperature=0.2,
-            max_tokens=512,
+            max_tokens=MAX_OUTPUT_TOKENS,
         )
     except Exception as e:
         logger.warning("图片理解失败（已降级为纯文本分析）: %s", str(e)[:120])
         return ""
 
-    return (text or "").strip()
+    desc = (text or "").strip()
+    if not desc:
+        # 单独报出来：HTTP 200 + 空 content 是推理模型把 token 预算烧光的典型症状，
+        # 混进「没有描述」里会让人以为是模型看不懂图，从而查错方向
+        logger.warning(
+            "多模态模型返回了空描述（HTTP 正常）。若是推理模型，多半是 max_tokens "
+            "被 reasoning 吃光，当前预算 %d", MAX_OUTPUT_TOKENS,
+        )
+    return desc

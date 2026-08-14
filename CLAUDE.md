@@ -366,13 +366,28 @@ prompt 里有两条必须留着：一是**正例要列全**（各种语序和口
 **配额用尽时那个接口照样返回 200**（实测 Kimi 就是这样：`/models` 200，`chat/completions` 403
 `access_terminated_error`）。界面文案已经写明这一点，别把它简化掉。
 
-> **当前状态（2026-08-10 实测）：用户给的 Kimi 账号配额已用尽。** `GET /models` 返回 200 且能
-> 列出 `kimi-for-coding` / `kimi-for-coding-highspeed` / `k3-256k` / `k3`，但任何
-> `chat/completions`（纯文本与图片都试过）都是 403。因此**「`kimi-for-coding` 是否支持图片输入」
-> 至今未经真机验证**（它名字上是编码模型）。自动化测试用 `tests/fixtures/vision_site.py` 这个
-> 本地替身覆盖，走真 HTTP、真 base64、真 JPEG 字节比对。配额恢复后需要补两件事：确认该模型
-> 接不接受图片（不接受就在界面上改配 `k3` 或别的视觉模型，**不用改代码**），以及跑一遍真机
-> 带图分析留证据。
+### Kimi 真机实测结论（2026-08-14，配额恢复后对 api.kimi.com 实跑）
+
+**`kimi-for-coding` 支持图片输入**，实测能准确读出 App 弹窗里的荷兰语文案与设备序列号。
+`k3` / `k3-256k` 同样可用；`kimi-for-coding-highspeed` 返回 401（订阅层级不含）。
+**改这条链路的参数前先读这一段，别照着「常规做法」猜**：
+
+- **不能传 `temperature`**。它只接受 `1`，传 `0.2` 会被整个请求打回
+  `400 invalid temperature: only 1 is allowed for this model`，再被降级逻辑吞成
+  「这条没有描述」—— 功能看着在跑，一张图都没理解过。各家视觉模型对这个参数约束不同，
+  一律交给服务端默认值
+- **`max_tokens` 必须给够，因为它是推理模型**。`reasoning_content` 与正文分开返回，
+  但**照样计入 `max_tokens`**。实测给 512 时 512 个全被推理吃掉：HTTP **200**、
+  `finish_reason=length`、`content` 是**空串**。这比报错难查得多 —— 没有任何异常信号，
+  只是所有图片都「理解成功但没有描述」。实测推理约 300~700 token，`MAX_OUTPUT_TOKENS`
+  取 2048。`describe_post_images()` 在拿到空描述时会单独打一条警告点名这个原因
+- 这两条都有回归测试，且 `tests/fixtures/vision_site.py` 把两种真机行为一起复刻了
+  （temperature 不为 1 就 400；`max_tokens` 低于门限就返回 200 + 空 content）
+
+真机证据（真实帖子 `src_b32bc603` + 真实 31685 字节 JPEG）：多模态给出
+「HyXi Halo App设置界面弹窗提示：当前固件版本不支持并联运行，需先升级至最新固件。
+弹窗显示设备序列号SN:34302260600373……」，与主贴正文所述完全对得上；该描述随整串上下文
+进入文本模型，回复贴拿到 `neutral / 固件更新 + 扩展/兼容性` 的结论。
 
 **增量粒度仍是 `sentiment_at`，所以改了分析口径必须走 `?force=true`**。接上图片理解那天，
 库里 124/125 条已分析、23 条带图的**全部**已分析 —— 不重跑的话新功能在现有数据上一点变化都
@@ -386,7 +401,7 @@ prompt 里有两条必须留着：一是**正例要列全**（各种语序和口
 
 ## 测试
 
-**259 个测试，必须全部 PASSED**（本机实测 `259 passed in 376s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**261 个测试，必须全部 PASSED**（本机实测 `261 passed in 341s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v

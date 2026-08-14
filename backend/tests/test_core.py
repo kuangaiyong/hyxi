@@ -460,6 +460,54 @@ class TestImageUnderstandingEndToEnd(_VisionTmpEnv):
         assert vision.calls == [], "一张图都没读到就不该发请求"
         assert out["success"] == 1
 
+    def test_vision_call_does_not_pin_temperature(self):
+        """真机实测：kimi-for-coding 只接受 temperature=1，传别的值整个请求 400。
+
+        被降级逻辑吞掉之后，界面上看不出任何异常 —— 图片理解「在跑」，但一张图都
+        没理解过。各家视觉模型对这个参数的约束不同，一律交给服务端默认值。
+        """
+        llm_site, vision_site = self._fixtures()
+        posts = [self._post(images=[self.media_rel])]
+        llm = llm_site.LLMSite()
+        vision = vision_site.VisionSite()
+        with llm as llm_url, vision as vision_url:
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-t", "base_url": llm_url, "model_name": "text-model"})
+            self.storage.set_app_config("vision", {
+                "api_key": "sk-v", "base_url": vision_url, "model_name": "vision-model"})
+            self._analyze(posts)
+
+        assert vision.calls, "根本没调用多模态模型"
+        assert vision.calls[0]["temperature"] is None, \
+            f"请求里钉了 temperature={vision.calls[0]['temperature']}，真实模型会 400"
+        # 替身在 temperature 不合法时返回 400，描述就拿不到 —— 这条断言保证真的拿到了
+        assert vision_site.DESCRIPTION in "\n".join(llm.user_prompts)
+
+    def test_output_budget_leaves_room_for_reasoning_models(self):
+        """真机实测：kimi-for-coding 是推理模型，reasoning_content 也计入 max_tokens。
+
+        给 512 时 512 个全被推理吃掉，HTTP 200、finish_reason=length、content 是空串，
+        于是「每张图都理解成功但没有描述」—— 界面上完全看不出异常，最难查的一类。
+        """
+        from app.services.vision_service import MAX_OUTPUT_TOKENS
+        llm_site, vision_site = self._fixtures()
+        assert MAX_OUTPUT_TOKENS >= vision_site.REASONING_TOKEN_FLOOR, \
+            "输出预算太小，推理模型会把它烧光并返回空描述"
+
+        posts = [self._post(images=[self.media_rel])]
+        llm = llm_site.LLMSite()
+        vision = vision_site.VisionSite()
+        with llm as llm_url, vision as vision_url:
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-t", "base_url": llm_url, "model_name": "text-model"})
+            self.storage.set_app_config("vision", {
+                "api_key": "sk-v", "base_url": vision_url, "model_name": "vision-model"})
+            self._analyze(posts)
+
+        # 替身在预算不足时返回 200 + 空 content，描述就进不了 prompt
+        assert vision_site.DESCRIPTION in "\n".join(llm.user_prompts), \
+            "预算被推理吃光，拿到的是空描述"
+
     def test_path_traversal_in_images_is_refused(self):
         """images 来自采集脚本，但 media 目录之外就是数据库和明文密钥"""
         from app.services.vision_service import _media_path

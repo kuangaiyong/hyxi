@@ -17,6 +17,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DESCRIPTION = "图中是一台壁挂式家用储能电池，屏幕显示报错码 E03，下方接线未固定。"
 
+# 低于这个输出预算就当作「推理把 token 烧光」，返回空 content。实测真机推理约
+# 300~700 token，取 1024 作为替身的判定线
+REASONING_TOKEN_FLOOR = 1024
+
 
 class _Handler(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -41,12 +45,50 @@ class _Handler(BaseHTTPRequestHandler):
             elif content:
                 texts.append(content)
 
+        max_tokens = body.get("max_tokens")
         self.server.calls.append({
             "system": system_msg,
             "images": images,
             "texts": texts,
             "model": body.get("model"),
+            "temperature": body.get("temperature"),
+            "max_tokens": max_tokens,
         })
+
+        # 复刻真机行为：kimi-for-coding 是推理模型，reasoning_content 照样计入
+        # max_tokens。实测给 512 时全被推理吃掉，HTTP 200、finish_reason=length、
+        # content 是空串 —— 「理解成功但没有描述」，界面上完全看不出异常
+        if max_tokens is not None and max_tokens < REASONING_TOKEN_FLOOR:
+            payload = json.dumps({
+                "choices": [{
+                    "finish_reason": "length",
+                    "message": {"role": "assistant", "content": "",
+                                "reasoning_content": "思考中……" * 20},
+                }],
+                "usage": {"completion_tokens": max_tokens,
+                          "completion_tokens_details": {"reasoning_tokens": max_tokens}},
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        # 复刻真机行为：kimi-for-coding 只接受 temperature=1，传别的值整个请求 400。
+        # 实测踩过 —— 传了 0.2，每次图片理解都被打回并降级成「这条没有描述」，
+        # 功能看着在跑，实际一张图都没理解
+        if "temperature" in body and body["temperature"] != 1:
+            payload = json.dumps({"error": {
+                "message": "invalid temperature: only 1 is allowed for this model",
+                "type": "invalid_request_error",
+            }}).encode("utf-8")
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
 
         if self.server.fail_status:
             payload = json.dumps({"error": {

@@ -240,7 +240,7 @@ cd frontend; npm run build
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
 ```
 
-当前共 **259 个用例**，本机约 380 秒跑完，必须全部通过。
+当前共 **261 个用例**，本机约 340 秒跑完，必须全部通过。
 
 只跑某一个测试类：
 

@@ -10,18 +10,16 @@ HYXi 舆情分析平台 — 对荷兰 Tweakers.net 论坛的 HYXi Halo 家用储
 
 开发机是 **Windows**，Python 版本与 `C:\code\video_evaluation_new` 项目保持一致：**3.12**，依赖装在 `backend\.venv` 内，一律通过 venv 里的解释器调用。
 
-环境搭建 —— **`requirements.txt` 不完整，必须额外补装 `apscheduler`、`sqlalchemy`、`pytest`**：
+环境搭建 —— **`pytest` 不在 `requirements.txt` 里，跑测试必须单独装**：
 
 ```powershell
 py -3.12 -m venv backend\.venv
-.\backend\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt apscheduler sqlalchemy pytest
+.\backend\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt pytest
 npm ci
 cd frontend; npm install
 ```
 
-- `apscheduler` — `scheduler_service.py` 直接 import，缺失则应用无法启动
-- `sqlalchemy` — APScheduler 的 `SQLAlchemyJobStore` 需要，缺失则启动时抛 `ImportError: SQLAlchemyJobStore requires SQLAlchemy installed`
-- `deep-translator` 列在 requirements.txt 里但**全项目零引用**（翻译早已改用 LLM），是残留
+`requirements.txt` 里的 `APScheduler` 与 `SQLAlchemy` 都是运行时硬依赖，不是可选项：前者被 `scheduler_service.py` 直接 import，后者是 APScheduler 的 `SQLAlchemyJobStore` 所需，缺任何一个应用都起不来。
 
 启动后端（`main:app` 的 import 依赖 cwd，必须先进 `backend`）：
 
@@ -41,7 +39,15 @@ cd backend; .\.venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --po
 cd frontend; npm run dev
 ```
 
-生产构建见下方「前端」一节（注意不是 `npm run build`）。
+**日常起服务用根目录的 `start.ps1`**：它依次自检三处依赖、拉起两个进程，再**实际验证**后端 `/api/health`、前端首页、以及前端→后端的代理链路，失败会指出是哪一环。手动起两个进程只在需要看实时控制台输出时才用。面向使用者（而非改代码者）的完整安装 / 配置 / 排障说明在 `README.md`，改动启动方式或环境变量时两份都要跟。
+
+```powershell
+.\start.ps1
+```
+
+`start.ps1` 存的是 **UTF-8 带 BOM**：PS 5.1 会把无 BOM 的 UTF-8 当 ANSI 读，中文输出全是乱码。用别的工具改写它时注意别把 BOM 弄掉。
+
+生产构建是 `frontend` 目录下的 `npm run build`（= `vue-tsc -b && vite build`）。**必须在 `frontend` 里跑**——根 `package.json` 只有 playwright 依赖、`scripts` 是空的，在仓库根目录执行会直接报「Missing script: build」。
 
 **PowerShell 路径注意**：PS 5.1 下调用相对路径的 exe 必须带 `.\` 前缀，写 `backend\.venv\Scripts\python.exe` 会报 `CommandNotFoundException`；且 `&&` 是语法错误，串联用 `;`。
 

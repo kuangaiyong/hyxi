@@ -508,6 +508,43 @@ class TestImageUnderstandingEndToEnd(_VisionTmpEnv):
         assert vision_site.DESCRIPTION in "\n".join(llm.user_prompts), \
             "预算被推理吃光，拿到的是空描述"
 
+    def test_empty_description_is_retried_once(self):
+        """真机实测：预算给足了也会偶发跑飞，把 max_tokens 全烧在 reasoning 上。
+
+        23 张图里 2~4 张会中，且同一张图换一次就好。调大预算躲不开（4096 照样被
+        烧穿，只是多浪费一倍 token），所以拿到空描述就重打一次。
+        """
+        llm_site, vision_site = self._fixtures()
+        posts = [self._post(images=[self.media_rel])]
+        llm = llm_site.LLMSite()
+        vision = vision_site.VisionSite(empty_first=1)
+        with llm as llm_url, vision as vision_url:
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-t", "base_url": llm_url, "model_name": "text-model"})
+            self.storage.set_app_config("vision", {
+                "api_key": "sk-v", "base_url": vision_url, "model_name": "vision-model"})
+            self._analyze(posts)
+
+        assert len(vision.calls) == 2, f"没有重试，只打了 {len(vision.calls)} 次"
+        assert vision_site.DESCRIPTION in "\n".join(llm.user_prompts), "重试后仍然没拿到描述"
+
+    def test_persistently_empty_description_gives_up_instead_of_looping(self):
+        """重试也拿不到就认了 —— 一张图不能把整轮分析拖住，更不能无限打下去"""
+        llm_site, vision_site = self._fixtures()
+        posts = [self._post(images=[self.media_rel])]
+        llm = llm_site.LLMSite()
+        vision = vision_site.VisionSite(empty_first=99)
+        with llm as llm_url, vision as vision_url:
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-t", "base_url": llm_url, "model_name": "text-model"})
+            self.storage.set_app_config("vision", {
+                "api_key": "sk-v", "base_url": vision_url, "model_name": "vision-model"})
+            out = self._analyze(posts)
+
+        assert len(vision.calls) == 2, f"重试次数失控：{len(vision.calls)} 次"
+        assert "[图片: " not in "\n".join(llm.user_prompts)
+        assert out["success"] == 1, "拿不到描述时舆情分析必须照常跑完"
+
     def test_path_traversal_in_images_is_refused(self):
         """images 来自采集脚本，但 media 目录之外就是数据库和明文密钥"""
         from app.services.vision_service import _media_path

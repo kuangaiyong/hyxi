@@ -57,8 +57,14 @@ class _Handler(BaseHTTPRequestHandler):
 
         # 复刻真机行为：kimi-for-coding 是推理模型，reasoning_content 照样计入
         # max_tokens。实测给 512 时全被推理吃掉，HTTP 200、finish_reason=length、
-        # content 是空串 —— 「理解成功但没有描述」，界面上完全看不出异常
-        if max_tokens is not None and max_tokens < REASONING_TOKEN_FLOOR:
+        # content 是空串 —— 「理解成功但没有描述」，界面上完全看不出异常。
+        # empty_first 复刻的是同一症状的另一面：预算给足了也会偶发跑飞（真机 4096
+        # 照样被烧穿），所以这不是靠调大预算能躲开的，只能重试
+        burned = self.server.empty_first > 0
+        if burned:
+            self.server.empty_first -= 1
+        if burned or (max_tokens is not None and max_tokens < REASONING_TOKEN_FLOOR):
+            max_tokens = max_tokens or REASONING_TOKEN_FLOOR
             payload = json.dumps({
                 "choices": [{
                     "finish_reason": "length",
@@ -127,12 +133,13 @@ class VisionSite:
     calls 里是每次请求的 system / images / texts，供测试断言。
     """
 
-    def __init__(self, port: int = 0, fail_status: int = 0):
+    def __init__(self, port: int = 0, fail_status: int = 0, empty_first: int = 0):
         self._port = port
         self._server = None
         self._thread = None
         self.calls = []
         self.fail_status = fail_status
+        self.empty_first = empty_first
 
     @property
     def image_count(self) -> int:
@@ -153,6 +160,7 @@ class VisionSite:
         self._server = ThreadingHTTPServer(("127.0.0.1", self._port), _Handler)
         self._server.calls = self.calls
         self._server.fail_status = self.fail_status
+        self._server.empty_first = self.empty_first
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         return "http://127.0.0.1:{}".format(self._server.server_address[1])

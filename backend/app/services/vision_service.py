@@ -118,29 +118,35 @@ async def describe_post_images(post: dict, vision: Optional[LLMService]) -> str:
         ),
     })
 
-    try:
-        # **不要传 temperature**：真机实测 kimi-for-coding 只接受 temperature=1，
-        # 传 0.2 会被整个请求打回 400 `invalid temperature: only 1 is allowed for
-        # this model`，再被下面的降级逻辑吞成「这条没有描述」—— 功能看着在跑，实际
-        # 一张图都没理解。各家视觉模型对这个参数的约束不一样，交给服务端默认值最稳。
-        # 描述任务本身受 prompt 强约束，不依赖低温度。
-        text = await vision.chat(
-            [
-                {"role": "system", "content": VISION_SYSTEM_PROMPT},
-                {"role": "user", "content": parts},
-            ],
-            max_tokens=MAX_OUTPUT_TOKENS,
-        )
-    except Exception as e:
-        logger.warning("图片理解失败（已降级为纯文本分析）: %s", str(e)[:120])
-        return ""
+    # 空描述重试一次。推理模型偶尔陷进长推理，把整个 max_tokens 烧在 reasoning 上，
+    # 返回 HTTP 200 + finish_reason=length + 空 content。**调大预算解决不了** ——
+    # 真机实测 4096 照样被烧穿（4096 全进推理），只是每次跑飞多浪费一倍 token；
+    # 而重试立刻就好（同一张图另外几次只用 300~600 token）。实测 23 张里 2~4 张会中。
+    for attempt in (1, 2):
+        try:
+            # **不要传 temperature**：真机实测 kimi-for-coding 只接受 temperature=1，
+            # 传 0.2 会被整个请求打回 400 `invalid temperature: only 1 is allowed for
+            # this model`，再被下面的降级逻辑吞成「这条没有描述」—— 功能看着在跑，实际
+            # 一张图都没理解。各家视觉模型对这个参数的约束不一样，交给服务端默认值最稳。
+            # 描述任务本身受 prompt 强约束，不依赖低温度。
+            text = await vision.chat(
+                [
+                    {"role": "system", "content": VISION_SYSTEM_PROMPT},
+                    {"role": "user", "content": parts},
+                ],
+                max_tokens=MAX_OUTPUT_TOKENS,
+            )
+        except Exception as e:
+            logger.warning("图片理解失败（已降级为纯文本分析）: %s", str(e)[:120])
+            return ""
 
-    desc = (text or "").strip()
-    if not desc:
+        desc = (text or "").strip()
+        if desc:
+            return desc
         # 单独报出来：HTTP 200 + 空 content 是推理模型把 token 预算烧光的典型症状，
         # 混进「没有描述」里会让人以为是模型看不懂图，从而查错方向
         logger.warning(
-            "多模态模型返回了空描述（HTTP 正常）。若是推理模型，多半是 max_tokens "
-            "被 reasoning 吃光，当前预算 %d", MAX_OUTPUT_TOKENS,
+            "多模态模型返回了空描述（HTTP 正常，第 %d 次）。推理模型多半是 max_tokens "
+            "被 reasoning 吃光，当前预算 %d", attempt, MAX_OUTPUT_TOKENS,
         )
-    return desc
+    return ""

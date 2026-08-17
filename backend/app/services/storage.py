@@ -781,17 +781,41 @@ def drop_empty_posts(posts: List[dict]) -> List[dict]:
     （HYXi 安装检查报告，总分 88、发电异常 8/20 标橙），posts 表里一行都没有。
     采集脚本先下图、这个口再丢帖子，图留下、帖子没了，连「未分析」都不显示。
 
+    **有评论就不算空**：没人会去评论一片空白，所以「空正文 + 有人在下面发言」几乎一定
+    是**提取失败**而不是真的空帖。这种父贴必须留着 —— 丢了它，评论会被下面那段提成主贴，
+    而那个提升是**不可逆的**：下一轮正文提对了，父贴换个指纹重新入库（指纹吃正文），
+    评论却还挂在主贴身份上，除非它恰好又被重新提取到。真站核实过两例：
+      · 「Mijn HyXi Halo is gekoppeld aan:」那条正文没提出来，两条评论被提成主贴
+      · 纯图主贴被丢，回复「Is bij mij ook zo…」被提成主贴，舆情因此判成 neutral，
+        而它其实是在附和一条报「发电异常 8/20」的故障帖
+    代价是报告里会留一行空白的「未分析」，但那是实话 —— 「这里有条读不出来的帖子，
+    以下是它的回复」，比把回复冒充成主贴诚实得多。
+
     **丢主贴不能连累它的评论**：实测那条空主贴下面挂着 2 条有内容的评论，采集脚本
     的 flatten() 是按「主贴 → 它的评论」嵌套遍历的，在那里过滤会把评论一起带走。
-    所以过滤放在这个唯一的入库口，并把孤儿评论就地提成主贴 —— 父贴本来就没有正文，
-    评论失去的上下文是空的，没有损失。
+    所以过滤放在这个唯一的入库口。真被丢掉的父贴（整棵子树都没内容）才把孤儿评论
+    就地提成主贴，不留悬空 parent。
     """
-    dropped = {
+    empty = {
         p.get("fingerprint") for p in posts
         if p.get("fingerprint")
         and not (p.get("content") or "").strip()
         and not (p.get("images") or [])
     }
+    if not empty:
+        return posts
+
+    # 有**非空**的帖子认它当父贴，就把它捞回来。用空评论去捞空父贴没有意义：
+    # 整棵子树都没内容时，它就是真的什么都没有
+    anchored = {
+        p.get("parent_fingerprint") for p in posts
+        if p.get("parent_fingerprint") in empty and p.get("fingerprint") not in empty
+    }
+    dropped = empty - anchored
+    # 这条日志必须在下面那个提前返回**之前** —— 最常见的情况恰恰是「捞回一条、一条没丢」，
+    # 写在后面就等于这件事从来不出现在日志里
+    if anchored:
+        logger.info("%d 条空正文帖子因为下面有人发言而保留（多半是正文提取失败）", len(anchored))
     if not dropped:
         return posts
 
@@ -804,7 +828,7 @@ def drop_empty_posts(posts: List[dict]) -> List[dict]:
             post["parent_fingerprint"] = None
             post["reply_level"] = 0
         kept.append(post)
-    logger.info("丢弃 %d 条空正文帖子，保留 %d 条", len(dropped), len(kept))
+    logger.info("丢弃 %d 条无正文无配图的帖子，保留 %d 条", len(dropped), len(kept))
     return kept
 
 

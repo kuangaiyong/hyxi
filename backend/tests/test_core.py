@@ -597,11 +597,12 @@ class TestImageOnlyPostsAreAnalyzedEndToEnd(_VisionTmpEnv):
         assert "没有文字" in "\n".join(llm.user_prompts), llm.user_prompts
 
     def test_placeholder_never_promises_a_picture_that_does_not_exist(self):
-        """既没正文也没配图的帖子（历史迁移帖）不能套「内容全在配图上」。
-
-        那是句假话，后面也没有 [图片: ...] 跟着 —— 等于让模型去读一张不存在的图。
-        这类帖子只会作为讨论串上下文出现，留空才是实话。
+        """既没正文也没配图的帖子不能套「内容全在配图上」—— 那是句假话，后面也没有
+        [图片: ...] 跟着，等于让模型去读一张不存在的图。它该说的是「没取到」。
         """
+        from app.services.sentiment_service import (
+            NO_TEXT_PLACEHOLDER, UNREADABLE_PLACEHOLDER,
+        )
         llm_site, vision_site = self._fixtures()
         root = self._pic_post("root1")
         blank = {"source": "src_x", "fingerprint": "blank", "parent_fingerprint": "root1",
@@ -617,9 +618,46 @@ class TestImageOnlyPostsAreAnalyzedEndToEnd(_VisionTmpEnv):
             self._analyze([root, blank, reply])
 
         joined = "\n".join(llm.user_prompts)
-        # 主贴确实有图，占位该出现；@ghost 那条没有图，不该跟着一句「内容全在配图上」
-        assert "没有文字" in joined
-        assert "@ghost: （本帖没有文字" not in joined, joined
+        # 主贴有图 → 「内容全在配图上」；@ghost 没图 → 只能说「没取到」，两者不能混
+        assert f"@koen: {NO_TEXT_PLACEHOLDER}" in joined, joined
+        assert f"@ghost: {UNREADABLE_PLACEHOLDER}" in joined, joined
+        assert f"@ghost: {NO_TEXT_PLACEHOLDER}" not in joined, joined
+        # 系统提示词得告诉模型别把「没取到」当成「什么都没说」
+        from app.services.sentiment_service import SENTIMENT_SYSTEM_PROMPT
+        assert UNREADABLE_PLACEHOLDER.strip("（）") in SENTIMENT_SYSTEM_PROMPT
+
+    def test_placeholder_follows_the_description_not_the_mere_presence_of_images(self):
+        """有图**不等于**读得出图：图丢了、模型没配、调用失败时都拿不到描述。
+
+        占位文案的判据必须是「描述有没有真的到手」——[图片: ...] 那行只在 image_desc
+        非空时才跟在后面。按 images 判的话，这条会说出「内容全在配图上」却没有任何图
+        跟着，正是 UNREADABLE_PLACEHOLDER 存在要避免的那种假话。
+        """
+        from app.services.sentiment_service import (
+            NO_TEXT_PLACEHOLDER, UNREADABLE_PLACEHOLDER,
+        )
+        llm_site, vision_site = self._fixtures()
+        root = self._pic_post("root1")
+        # 有 images，但那个文件根本不在 media 目录里 —— 真实发生过的一类降级
+        gone = {"source": "src_x", "fingerprint": "gone", "parent_fingerprint": "root1",
+                "username": "ghost", "content": "", "timestamp": "01-07-2026 11:00",
+                "images": ["src_x/never_downloaded_0.png"]}
+        reply = {"source": "src_x", "fingerprint": "c1", "parent_fingerprint": "root1",
+                 "username": "bob", "content": "Zelfde probleem hier.",
+                 "timestamp": "01-07-2026 12:00"}
+
+        llm = llm_site.LLMSite()
+        vision = vision_site.VisionSite()
+        with llm as llm_url, vision as vision_url:
+            self._configure(llm_url, vision_url)
+            self._analyze([root, gone, reply])
+
+        joined = "\n".join(llm.user_prompts)
+        assert not gone.get("image_desc"), "前提不成立：丢失的图不该拿到描述"
+        assert f"@ghost: {UNREADABLE_PLACEHOLDER}" in joined, joined
+        assert f"@ghost: {NO_TEXT_PLACEHOLDER}" not in joined, joined
+        # 真读出图的那条仍要说「内容全在配图上」，两条路不能一起改坏
+        assert f"@koen: {NO_TEXT_PLACEHOLDER}" in joined, joined
 
     def test_image_only_post_without_a_description_is_left_unanalyzed(self):
         """多模态没配 / 调用失败时，纯图帖是**真的**没有可判断的内容。
@@ -1066,11 +1104,14 @@ class TestEmptyPostsNeverStoredEndToEnd:
         assert posts[1]["parent_fingerprint"] == "root"
         assert posts[1]["reply_level"] == 1
 
-    def test_comments_of_a_dropped_root_survive_as_roots(self):
-        """实测踩过：那条空主贴下面挂着 2 条有内容的评论。
+    def test_empty_root_with_comments_is_kept_because_nobody_comments_on_nothing(self):
+        """有人在它下面发言 → 它多半是**提取失败**，不是真的空帖。
 
-        采集脚本的 flatten() 是「主贴 → 它的评论」嵌套遍历的，在那里过滤会把评论
-        一起带走 —— 两条真实发言就这么没了。
+        实测踩过：真站上那条主贴写着「Mijn HyXi Halo is gekoppeld aan:」，8-10 那轮
+        正文没提取出来变成空帖，于是被丢掉、它的两条评论被提成主贴 —— 而那个提升是
+        **不可逆的**：下一轮正文提对了，父贴换了指纹重新入库，评论却还挂在主贴身份上。
+        真站核实过一模一样的第二例：纯图主贴被丢，回复「Is bij mij ook zo…」被提成主贴，
+        舆情因此判成 neutral，而它其实是在附和一条报故障的帖子。
         """
         self.storage.upsert_posts("src_e", [
             self._post("root", ""),
@@ -1078,10 +1119,38 @@ class TestEmptyPostsNeverStoredEndToEnd:
             self._post("c2", "评论二", parent="root", level=1),
         ])
         posts = self.storage.load_posts(["src_e"])
-        assert [p["fingerprint"] for p in posts] == ["c1", "c2"]
-        # 提成主贴，而不是留一个指向已删帖子的悬空 parent
-        assert [p["parent_fingerprint"] for p in posts] == [None, None]
-        assert [p["reply_level"] for p in posts] == [0, 0]
+        assert [p["fingerprint"] for p in posts] == ["root", "c1", "c2"]
+        assert [p["parent_fingerprint"] for p in posts] == [None, "root", "root"]
+        assert [p["reply_level"] for p in posts] == [0, 1, 1]
+
+    def test_empty_root_whose_comments_are_also_empty_is_still_dropped(self):
+        """整棵子树一个字都没有，那就是真的什么都没有，照旧一条都不留"""
+        added = self.storage.upsert_posts("src_e", [
+            self._post("root", ""),
+            self._post("c1", "", parent="root", level=1),
+            self._post("keep", "有正文的另一条"),
+        ])
+        assert added == 1
+        assert [p["fingerprint"] for p in self.storage.load_posts(["src_e"])] == ["keep"]
+
+    def test_kept_empty_root_still_anchors_its_thread_for_sentiment(self):
+        """留住父贴的意义在这里：评论能拿到同串上下文，而不是各自成为孤立主贴。
+
+        这正是被提升那条付出的代价 —— 「Is bij mij ook zo」单独看必然是 neutral。
+        """
+        from app.services.post_tree import thread_of, post_key
+
+        self.storage.upsert_posts("src_e", [
+            self._post("root", ""),
+            self._post("c1", "我这边也一样", parent="root", level=1),
+            self._post("c2", "我也是", parent="root", level=1),
+        ])
+        posts = self.storage.load_posts(["src_e"])
+        threads = thread_of(posts)
+        c1 = next(p for p in posts if p["fingerprint"] == "c1")
+        members = threads[post_key(c1)]
+        assert [m["fingerprint"] for m in members] == ["root", "c1", "c2"], \
+            "评论看不到父贴和同串的其他人，舆情就只能各判各的"
 
     def test_seq_still_has_no_holes_so_ordering_survives(self):
         """seq 是全链路的顺序锚点，被丢掉的帖子不能在里面留个洞"""
@@ -3512,8 +3581,8 @@ class TestGroupFeedCollectorEndToEnd:
         posts = data["posts"]
         roots = [p for p in posts if not p["parent_fingerprint"]]
         comments = [p for p in posts if p["parent_fingerprint"]]
-        assert len(roots) == 4, [p["username"] for p in roots]
-        assert len(comments) == 4
+        assert len(roots) == 5, [p["username"] for p in roots]
+        assert len(comments) == 5
 
         # 每条评论的 parent_fingerprint 必须真的指向本批数据里的某个主贴
         by_fp = {p["fingerprint"]: p for p in posts}
@@ -3526,6 +3595,34 @@ class TestGroupFeedCollectorEndToEnd:
         assert all(p["username"] for p in posts)
         # 时间统一成落盘格式 dd-mm-yyyy HH:MM
         assert posts[0]["timestamp"] == "02-06-2026 09:14"
+
+    def test_root_whose_body_failed_to_extract_survives_with_its_comment(self):
+        """真 Chrome 走一遍：正文没提取出来、但下面有人发言的主贴必须进得了库。
+
+        真站两次实证：一次是长正文没展开、一次是纯图帖。丢了它，那条评论会被提成
+        主贴，而提升是**不可逆的** —— 下一轮正文提对了，父贴换指纹重新入库，评论却
+        还挂在主贴身份上，舆情从此按孤立主贴判（实测「Is bij mij ook zo…」因此成了
+        neutral，它其实在附和一条报故障的帖子）。
+        """
+        self._skip_unless_ready()
+        from app.services.post_tree import thread_of, post_key
+
+        self._run(incremental=False)
+        stored = self.storage.load_posts(["fixture_group"])
+
+        blank = [p for p in stored if not (p.get("content") or "").strip()]
+        assert len(blank) == 1, f"正文提取失败的那条主贴没留住: {[p['username'] for p in blank]}"
+        assert blank[0]["username"] == "Koen_DH"
+        assert blank[0]["reply_level"] == 0
+
+        kid = next(p for p in stored if "zonnepanelen niet kunnen zien" in (p.get("content") or ""))
+        assert kid["parent_fingerprint"] == blank[0]["fingerprint"], "评论被提成主贴了"
+        assert kid["reply_level"] == 1
+
+        # 结构留住的意义：这条评论拿得到整串上下文，而不是自己一条孤零零的串
+        members = thread_of(stored)[post_key(kid)]
+        assert [m["fingerprint"] for m in members] == \
+            [blank[0]["fingerprint"], kid["fingerprint"]]
 
     def test_incremental_rerun_keeps_translations(self):
         """增量重跑绝不能覆盖已翻译的帖子。
@@ -3551,7 +3648,7 @@ class TestGroupFeedCollectorEndToEnd:
 
         again = self._run(incremental=True)
 
-        assert len(again["posts"]) == 8, "增量重跑后帖子数变了，说明历史数据被覆盖"
+        assert len(again["posts"]) == 10, "增量重跑后帖子数变了，说明历史数据被覆盖"
         kept = next(p for p in again["posts"] if p["fingerprint"] == first_fp)
         assert kept["translation"] == "我已经用了三个月", "译文被增量重跑抹掉了"
         assert kept["_processed"]["translated"] is True, "translated 标记被抹掉了"
@@ -3570,7 +3667,7 @@ class TestGroupFeedCollectorEndToEnd:
         for root, _dirs, files in os.walk(self.tmpdir):
             leftovers += [f for f in files if f.endswith(".json") and "_out" in f]
         assert leftovers == [], f"交接文件没删干净: {leftovers}"
-        assert self.storage.count_posts("fixture_group") == 8
+        assert self.storage.count_posts("fixture_group") == 10
 
 
 class TestFacebookLoginEndToEnd:

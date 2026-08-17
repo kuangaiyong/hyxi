@@ -25,6 +25,35 @@ BATCH_SIZE = 3  # 详细分析每次发送的帖子数
 # 这是给信息流类来源（一个主贴挂几十条评论）留的保险，防止 prompt 无上限膨胀
 THREAD_CONTEXT_LIMIT = 3000
 
+# 纯图帖在 prompt 里的正文占位。**不能留空**：一片空白看起来像一条被截断的帖子，
+# 模型会照着「没说什么」去判 neutral，而信息其实全在紧随其后的 [图片: ...] 里
+NO_TEXT_PLACEHOLDER = "（本帖没有文字，内容全在配图上）"
+
+
+def _body_or_placeholder(post: dict, text: str) -> str:
+    """正文为空时的占位。**只给真有配图的帖子用** —— 既没正文也没配图的
+    （历史迁移帖，`migrate_posts_file()` 传 drop_empty=False 保留了它们）说
+    「内容全在配图上」是句假话，后面还没有 [图片: ...] 跟着，等于诱导模型
+    去读一张不存在的图。这类帖子只会作为讨论串上下文出现，留空才是实话。
+    """
+    if text:
+        return text
+    return NO_TEXT_PLACEHOLDER if post.get("images") else ""
+
+
+def is_analyzable(post: dict) -> bool:
+    """这条帖子能不能送去判情感。
+
+    **正文为空但有配图的照样算**：图会先被多模态模型转成中文描述，而那正是最该看的
+    一类内容 —— 实测那条真实数据正文一个字都没有，图上是 HYXi 安装检查报告
+    （总分 88、发电异常 8/20 标橙）。只看正文的过滤器一刀切掉的恰恰是信息量最大的帖子。
+
+    这里只能看 `images` 不能看 `image_desc`：调用方（入库口、流水线、页面按钮）
+    要在图片理解**之前**就判断该不该把这条排进队列。理解完之后还拿不到描述的，
+    由 analyze() 内部再滤一次。
+    """
+    return bool((post.get("content") or "").strip()) or bool(post.get("images"))
+
 
 # 维度必须是封闭集合。放任 LLM 自由生成会把 top_dimensions 碎成上百个近义标签，
 # 跨来源对比直接失效 —— 维度表的全部价值就在于它是封闭的。
@@ -86,6 +115,9 @@ SENTIMENT_SYSTEM_PROMPT = f"""你是一位精通多语种和中文的市场舆�
   但**绝不要**把上下文里别人的态度直接当成待分析对象自己的态度
 - [图片: ...] 是多模态模型对该帖配图的客观描述，请与正文同等参考 —— 有些帖子正文
   很短，真正的信息（报错码、安装现场、账单金额）都在图上
+- 有的帖子**完全没有文字**（正文位置写着「本帖没有文字，内容全在配图上」），判断就
+  全靠图片描述加讨论串上下文。这类帖子照常给出结论，**不要**因为没有正文就一律判
+  neutral —— 一张写着报错码或异常读数的截图本身就是明确的表态
 
 输入是多条帖子，请为每条帖子输出JSON，用 '---SENTIMENT_SEPARATOR---' 分隔每条结果。
 直接输出JSON对象序列，不要编号，不要额外解释。"""
@@ -192,12 +224,17 @@ class SentimentService:
         第一个步骤（照着 ExcelService 的 step_index 来）。
         """
         total = len(posts)
-        non_empty = [(i, p) for i, p in enumerate(posts) if p.get("content", "").strip()]
-        total_non_empty = len(non_empty)
+        # 先按「有正文 or 有图」圈出候选。**必须排在图片理解之前** —— 用正文过滤的话，
+        # 纯图帖压根进不了下面的 need_desc，它的图永远不会被理解，于是永远分析不了
+        candidates = [(i, p) for i, p in enumerate(posts) if is_analyzable(p)]
+        pic_only = sum(1 for _i, p in candidates if not (p.get("content") or "").strip())
 
         await progress.emit(task_id, "log", {
             "level": "info",
-            "message": f"开始舆情分析，共 {total} 条帖子，{total_non_empty} 条有内容",
+            "message": (
+                f"开始舆情分析，共 {total} 条帖子，{len(candidates)} 条可分析"
+                + (f"（其中 {pic_only} 条只有图片）" if pic_only else "")
+            ),
         })
 
         # 加载 LLM 配置（使用统一工具函数）
@@ -210,11 +247,25 @@ class SentimentService:
         # 主贴的图正是它下面每条回复的上下文，漏掉就等于回复看不见图。
         # 已经有 image_desc 的跳过：那是上一轮花钱换来的，没必要再买一次。
         need_desc = {}
-        for _i, p in non_empty:
+        for _i, p in candidates:
             for member in (thread_by_key or {}).get(post_key(p)) or [p]:
                 if member.get("images") and not (member.get("image_desc") or "").strip():
                     need_desc[post_key(member)] = member
         await SentimentService._understand_images(task_id, list(need_desc.values()), progress)
+
+        # 理解完才知道纯图帖到底拿没拿到描述。没拿到（模型没配 / 调用失败 / 图丢了）
+        # 就是真的无从判断，剔出去按「未分析」处理 —— 送一个空块给 LLM 只会换回
+        # 一条编出来的结论，那比诚实地留「未分析」糟得多
+        non_empty = [
+            (i, p) for i, p in candidates
+            if (p.get("content") or "").strip() or (p.get("image_desc") or "").strip()
+        ]
+        total_non_empty = len(non_empty)
+        if total_non_empty < len(candidates):
+            await progress.emit(task_id, "log", {
+                "level": "warning",
+                "message": f"{len(candidates) - total_non_empty} 条纯图帖没能拿到图片描述，本轮跳过",
+            })
 
         results = [None] * total
         success_count = 0
@@ -224,7 +275,9 @@ class SentimentService:
             """讨论串里的一条。待分析那条给足正文，其余压到 600 字够表达立场即可。"""
             role = "回复" if m.get("parent_fingerprint") else "主贴"
             name = m.get("username") or "匿名"
-            text = (m.get("content") or "")[:2000 if is_target else 600]
+            text = _body_or_placeholder(
+                m, (m.get("content") or "")[:2000 if is_target else 600]
+            )
             line = f"{'▶ ' if is_target else '  '}{role} @{name}: {text}"
             desc = (m.get("image_desc") or "").strip()
             if desc:
@@ -279,7 +332,7 @@ class SentimentService:
                 # **不能走 _member_line(p, False)**：那条路按「上下文里的旁人」处理，
                 # 只给 600 字 —— 而这条正是待分析对象，改造前给的是 2000 字。
                 # 实测 65 个主贴里大多数没有回复，走的都是这一支
-                content = (p.get("content") or "")[:2000]
+                content = _body_or_placeholder(p, (p.get("content") or "")[:2000])
                 desc = (p.get("image_desc") or "").strip()
                 block += content + (f"\n[图片: {desc}]" if desc else "") + "\n"
             return block + "\n"

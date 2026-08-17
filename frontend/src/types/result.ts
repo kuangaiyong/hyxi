@@ -12,6 +12,8 @@ export interface PostData {
   matched: boolean
   /** 正文图，相对 data/media 的路径；渲染时拼成 /api/v1/media/<path>?api_key=… */
   images: string[]
+  /** 多模态模型读出来的图片内容。纯图帖的全部信息都在这里 */
+  image_desc: string
   replies: PostData[]
 }
 

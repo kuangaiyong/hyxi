@@ -547,10 +547,116 @@ class TestImageUnderstandingEndToEnd(_VisionTmpEnv):
 
     def test_path_traversal_in_images_is_refused(self):
         """images 来自采集脚本，但 media 目录之外就是数据库和明文密钥"""
-        from app.services.vision_service import _media_path
-        assert _media_path("../hyxi.db") is None
-        assert _media_path("src_x/../../hyxi.db") is None
-        assert _media_path(self.media_rel) is not None
+        from app.services.vision_service import media_path
+        assert media_path("../hyxi.db") is None
+        assert media_path("src_x/../../hyxi.db") is None
+        assert media_path(self.media_rel) is not None
+
+
+class TestImageOnlyPostsAreAnalyzedEndToEnd(_VisionTmpEnv):
+    """一个字都没有、只有一张图的帖子，照样要拿到舆情结论。
+
+    实测那条真实数据正是这样：正文空白，图上是 HYXi 安装检查报告（总分 88、
+    发电异常 8/20 标橙）—— 正文过滤器一刀切掉的恰恰是信息量最大的一类帖子。
+    """
+
+    def _pic_post(self, fp="pic1", **kw):
+        return {"source": "src_x", "fingerprint": fp, "timestamp": "01-07-2026 10:00",
+                "username": "koen", "content": "", "images": [self.media_rel], **kw}
+
+    def _configure(self, llm_url, vision_url=None):
+        self.storage.set_app_config("llm", {
+            "api_key": "sk-t", "base_url": llm_url, "model_name": "text-model"})
+        if vision_url:
+            self.storage.set_app_config("vision", {
+                "api_key": "sk-v", "base_url": vision_url, "model_name": "vision-model"})
+
+    def test_image_only_post_gets_a_verdict(self):
+        llm_site, vision_site = self._fixtures()
+        posts = [self._pic_post()]
+        llm = llm_site.LLMSite()
+        vision = vision_site.VisionSite()
+        with llm as llm_url, vision as vision_url:
+            self._configure(llm_url, vision_url)
+            out = self._analyze(posts)
+
+        assert vision.image_count == 1, "纯图帖的图根本没被送去理解"
+        joined = "\n".join(llm.user_prompts)
+        assert vision_site.DESCRIPTION in joined, joined
+        assert out["success"] == 1, "纯图帖必须能拿到结论"
+        assert posts[0]["_processed"]["sentiment_at"], "sentiment_at 没置位，下轮会重复花钱"
+
+    def test_image_only_post_reads_as_a_post_not_a_truncated_one(self):
+        """正文位置不能是一片空白 —— 那看起来像一条被截断的帖子，会把判定带偏"""
+        llm_site, vision_site = self._fixtures()
+        llm = llm_site.LLMSite()
+        vision = vision_site.VisionSite()
+        with llm as llm_url, vision as vision_url:
+            self._configure(llm_url, vision_url)
+            self._analyze([self._pic_post()])
+        assert "没有文字" in "\n".join(llm.user_prompts), llm.user_prompts
+
+    def test_placeholder_never_promises_a_picture_that_does_not_exist(self):
+        """既没正文也没配图的帖子（历史迁移帖）不能套「内容全在配图上」。
+
+        那是句假话，后面也没有 [图片: ...] 跟着 —— 等于让模型去读一张不存在的图。
+        这类帖子只会作为讨论串上下文出现，留空才是实话。
+        """
+        llm_site, vision_site = self._fixtures()
+        root = self._pic_post("root1")
+        blank = {"source": "src_x", "fingerprint": "blank", "parent_fingerprint": "root1",
+                 "username": "ghost", "content": "", "timestamp": "01-07-2026 11:00"}
+        reply = {"source": "src_x", "fingerprint": "c1", "parent_fingerprint": "root1",
+                 "username": "bob", "content": "Zelfde probleem hier.",
+                 "timestamp": "01-07-2026 12:00"}
+
+        llm = llm_site.LLMSite()
+        vision = vision_site.VisionSite()
+        with llm as llm_url, vision as vision_url:
+            self._configure(llm_url, vision_url)
+            self._analyze([root, blank, reply])
+
+        joined = "\n".join(llm.user_prompts)
+        # 主贴确实有图，占位该出现；@ghost 那条没有图，不该跟着一句「内容全在配图上」
+        assert "没有文字" in joined
+        assert "@ghost: （本帖没有文字" not in joined, joined
+
+    def test_image_only_post_without_a_description_is_left_unanalyzed(self):
+        """多模态没配 / 调用失败时，纯图帖是**真的**没有可判断的内容。
+
+        送一个空块给 LLM 只会换回一条编出来的结论 —— 那比「未分析」糟得多。
+        """
+        llm_site, _ = self._fixtures()
+        posts = [self._pic_post()]
+        llm = llm_site.LLMSite()
+        with llm as llm_url:
+            self._configure(llm_url)          # 只配文本模型，不配多模态
+            out = self._analyze(posts)
+
+        assert llm.user_prompts == [], f"没有描述就不该送去判情感: {llm.user_prompts}"
+        assert out["success"] == 0
+        assert out["failed"] == 1
+        assert not (posts[0].get("_processed") or {}).get("sentiment_at")
+
+    def test_text_reply_still_carries_the_image_only_root(self):
+        """纯图主贴进了分析队列，不能反过来把它评论的上下文弄丢"""
+        llm_site, vision_site = self._fixtures()
+        root = self._pic_post("root1")
+        reply = {"source": "src_x", "fingerprint": "c1", "parent_fingerprint": "root1",
+                 "username": "bob", "content": "Zelfde probleem hier.",
+                 "timestamp": "01-07-2026 11:00"}
+
+        llm = llm_site.LLMSite()
+        vision = vision_site.VisionSite()
+        with llm as llm_url, vision as vision_url:
+            self._configure(llm_url, vision_url)
+            out = self._analyze([root, reply])
+
+        joined = "\n".join(llm.user_prompts)
+        assert vision.image_count == 1, "同一张图只该理解一次"
+        assert "[讨论串上下文]" in joined
+        assert vision_site.DESCRIPTION in joined, "回复看不到主贴那张图"
+        assert out["success"] == 2, "主贴和回复都该有结论"
 
 
 class TestThreadContextInPromptEndToEnd(_VisionTmpEnv):
@@ -916,10 +1022,11 @@ class TestEmptyPostsNeverStoredEndToEnd:
         self.storage.DB_PATH = self._old_db
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def _post(self, fp, content, parent=None, level=0):
+    def _post(self, fp, content, parent=None, level=0, images=None):
         return {"username": "某人", "timestamp": "01-07-2026 10:00", "content": content,
                 "translation": "", "page_number": 1, "fingerprint": fp, "source": "src_e",
-                "parent_fingerprint": parent, "reply_level": level}
+                "parent_fingerprint": parent, "reply_level": level,
+                "images": images or []}
 
     def test_empty_post_is_not_stored(self):
         added = self.storage.upsert_posts("src_e", [
@@ -929,6 +1036,35 @@ class TestEmptyPostsNeverStoredEndToEnd:
         ])
         assert added == 1
         assert [p["fingerprint"] for p in self.storage.load_posts(["src_e"])] == ["a"]
+
+    def test_image_only_post_is_stored(self):
+        """没有正文但有配图的帖子**不是空帖** —— 内容全在图上。
+
+        实测丢过一条：真实文件 media/src_b32bc603/6680d5f13a6b2b4c_0.jpg 还在盘上
+        （HYXi 安装检查报告，总分 88、发电异常 8/20 标橙），posts 表里却一行都没有。
+        采集脚本先下图、再由这个入库口丢帖子，图留下、帖子没了 —— 它连「未分析」
+        都不会显示，是直接消失，比留一行空白更难发现。
+        """
+        added = self.storage.upsert_posts("src_e", [
+            self._post("a", "有正文的帖子"),
+            self._post("pic", "", images=["src_e/pic_0.jpg"]),
+            self._post("d", "", images=[]),   # 既没正文也没图，照旧丢掉
+        ])
+        assert added == 2
+        stored = self.storage.load_posts(["src_e"])
+        assert [p["fingerprint"] for p in stored] == ["a", "pic"]
+        assert stored[1]["images"] == ["src_e/pic_0.jpg"]
+
+    def test_comments_of_an_image_only_root_stay_attached_to_it(self):
+        """纯图主贴留下了，它的评论就该继续挂在它下面 —— 那张图正是这些评论的上下文"""
+        self.storage.upsert_posts("src_e", [
+            self._post("root", "", images=["src_e/root_0.jpg"]),
+            self._post("c1", "评论一", parent="root", level=1),
+        ])
+        posts = self.storage.load_posts(["src_e"])
+        assert [p["fingerprint"] for p in posts] == ["root", "c1"]
+        assert posts[1]["parent_fingerprint"] == "root"
+        assert posts[1]["reply_level"] == 1
 
     def test_comments_of_a_dropped_root_survive_as_roots(self):
         """实测踩过：那条空主贴下面挂着 2 条有内容的评论。
@@ -1437,6 +1573,7 @@ def _export_row(**over):
     row = {
         "index": 1, "source": "论坛来源", "level": 0, "username": "u",
         "timestamp": "2026-05-22 17:06", "content": "origineel", "translation": "原文",
+        "image_desc": "", "images": [],
         "sentiment": "中立", "intensity": 2, "reason": "询问", "dimensions": "",
     }
     row.update(over)
@@ -1955,6 +2092,7 @@ class TestExportWorkbookEndToEnd:
 
     def test_builds_two_sheets_with_readable_layout(self):
         from openpyxl import load_workbook
+        from openpyxl.utils import get_column_letter
         from app.services.excel_service import ExcelService, EXPORT_COLUMNS, FONT_NAME
 
         rows = [
@@ -1983,7 +2121,7 @@ class TestExportWorkbookEndToEnd:
         assert ws.max_row == 4
         # 冻结首行 + 自动筛选，88 行里找负面才不用人肉翻
         assert ws.freeze_panes == "A2"
-        assert ws.auto_filter.ref == "A1:K4"
+        assert ws.auto_filter.ref == f"A1:{get_column_letter(len(EXPORT_COLUMNS))}4"
         # Arial 没有中文字形，中英文混排会错位
         assert ws.cell(1, 1).font.name == FONT_NAME
         assert ws.cell(2, 1).font.name == FONT_NAME
@@ -2051,6 +2189,182 @@ class TestExportWorkbookEndToEnd:
         ))
         assert wb.sheetnames == ["概览", "帖子明细"]
         assert wb["帖子明细"].max_row == 1
+
+
+class TestExportImagesEndToEnd:
+    """报告里要看得见配图 —— 真图片文件、真 openpyxl、真 xlsx 字节流。
+
+    纯图帖的全部信息都在图上，报告只给一行文字等于什么都没说。
+    """
+
+    def setup_method(self):
+        import app.config as cfg
+        from PIL import Image as PILImage
+        self.cfg = cfg
+        self.tmpdir = tempfile.mkdtemp()
+        self._old_dir = cfg.settings.data_dir
+        cfg.settings.data_dir = self.tmpdir
+
+        # 造一张真图：600x400，宽高比 3:2，缩放对不对一眼能看出来
+        self.rel = "src_x/shot_0.png"
+        media = os.path.join(self.tmpdir, "media", "src_x")
+        os.makedirs(media, exist_ok=True)
+        self.abs_path = os.path.join(media, "shot_0.png")
+        PILImage.new("RGB", (600, 400), (30, 90, 160)).save(self.abs_path)
+
+    def teardown_method(self):
+        self.cfg.settings.data_dir = self._old_dir
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _build(self, rows):
+        from openpyxl import load_workbook
+        from app.services.excel_service import ExcelService, EXPORT_COLUMNS
+        return load_workbook(BytesIO(
+            ExcelService.build_export(rows, _export_meta(total=len(rows)), EXPORT_COLUMNS)
+        ))
+
+    def test_image_row_gets_a_thumbnail_and_a_link_to_the_full_size(self):
+        from app.services.excel_service import EXPORT_COLUMNS, IMAGE_SHEET, THUMB_MAX_PX
+
+        wb = self._build([
+            _export_row(index=1, images=[self.rel], image_desc="安装检查报告，总分 88"),
+            _export_row(index=2, username="别人"),
+        ])
+        assert IMAGE_SHEET in wb.sheetnames, "没有生成配图工作表"
+
+        ws = wb["帖子明细"]
+        assert len(ws._images) == 1, f"明细表里的缩略图数量不对: {len(ws._images)}"
+        thumb = ws._images[0]
+        assert max(thumb.width, thumb.height) <= THUMB_MAX_PX, "缩略图没缩小，行会被撑爆"
+        assert round(thumb.width / thumb.height, 2) == 1.5, "缩略图变形了"
+
+        # 超链接挂在「图片描述」格上 —— 图片本身盖着的格子点不着（openpyxl 也不支持
+        # 给图片挂链接），这一格既是最显眼的文字又点得到
+        col = [k for k, _ in EXPORT_COLUMNS].index("image_desc") + 1
+        cell = ws.cell(2, col)
+        assert cell.hyperlink is not None, "没有跳转大图的入口"
+        assert cell.hyperlink.location, "内部链接必须走 location，target 会被当成外部关系"
+        assert IMAGE_SHEET in cell.hyperlink.location
+        assert "安装检查报告" in str(cell.value)
+
+        # 链接指向的那一行确实有大图
+        target_row = int(cell.hyperlink.location.rsplit("A", 1)[1])
+        big = wb[IMAGE_SHEET]
+        anchored = {im.anchor._from.row + 1 for im in big._images}
+        assert anchored, "配图表里一张图都没有"
+        assert min(anchored) >= target_row, f"跳过去看不到图: 锚点 {anchored}, 目标行 {target_row}"
+
+    def test_full_size_is_bigger_than_the_thumbnail(self):
+        """「点击放大」得真的放大，否则跳过去毫无意义"""
+        from app.services.excel_service import IMAGE_SHEET, LARGE_MAX_PX
+
+        wb = self._build([_export_row(index=1, images=[self.rel], image_desc="报告")])
+        thumb = wb["帖子明细"]._images[0]
+        big = wb[IMAGE_SHEET]._images[0]
+        assert big.width > thumb.width
+        assert max(big.width, big.height) <= LARGE_MAX_PX
+
+    def test_tall_image_gets_enough_rows_instead_of_one_oversized_one(self):
+        """Excel 单行上限 409.5pt（≈546px）。真实 Facebook 截图是 367x795 这个量级，
+        钳到 700px 后仍有 525pt —— 压进一行会被 Excel 截回来，图盖到下面几行上。
+        """
+        from PIL import Image as PILImage
+        from app.services.excel_service import (
+            IMAGE_SHEET, MAX_ROW_POINT, LARGE_MAX_PX, DEFAULT_ROW_PX,
+        )
+
+        tall = os.path.join(self.tmpdir, "media", "src_x", "tall_0.png")
+        PILImage.new("RGB", (367, 795), (60, 60, 60)).save(tall)
+        wb = self._build([
+            _export_row(index=1, images=["src_x/tall_0.png"], image_desc="很高的截图"),
+            _export_row(index=2, images=[self.rel], image_desc="正常的截图"),
+        ])
+        big = wb[IMAGE_SHEET]
+        # 两张表一起查。配图表现在压根不设行高（大图靠占行数铺开），真正被这条断言
+        # 跑到的是明细表那些设了高度的行；但它同时钉住「别再把图高压进一行」——
+        # 那样写回来就是 531pt，立刻在这里翻车
+        heights = [
+            d.height
+            for sheet in (wb["帖子明细"], big)
+            for d in sheet.row_dimensions.values()
+            if d.height
+        ]
+        assert heights, "一行显式行高都没有，这条断言就没在查东西"
+        assert max(heights) <= MAX_ROW_POINT, f"最大行高 {max(heights)} 超了 Excel 上限"
+
+        # 显示尺寸存在 anchor 的 ext 里（EMU，9525 EMU = 1px）—— 重新读回来的
+        # img.height 是原始像素，不是我们钳过的那个值
+        placed = sorted(
+            (im.anchor._from.row + 1, im.anchor.ext.cy / 9525) for im in big._images
+        )
+        assert len(placed) == 2
+        assert placed[0][1] <= LARGE_MAX_PX, "大图没有被钳到上限以内"
+        # 两段不能叠在一起：第二段必须排在第一张图占掉的行之后
+        assert placed[1][0] - placed[0][0] >= placed[0][1] / DEFAULT_ROW_PX, \
+            f"第二段压在第一张大图上了: {placed}"
+
+    def test_rows_without_images_have_neither_picture_nor_link(self):
+        from app.services.excel_service import EXPORT_COLUMNS, IMAGE_SHEET
+
+        wb = self._build([_export_row(index=1), _export_row(index=2)])
+        ws = wb["帖子明细"]
+        assert ws._images == []
+        col = [k for k, _ in EXPORT_COLUMNS].index("image_desc") + 1
+        assert ws.cell(2, col).hyperlink is None
+        assert IMAGE_SHEET not in wb.sheetnames, "一张图都没有就别凭空多一张空表"
+
+    def test_missing_file_does_not_break_the_report(self):
+        """图片是采集时下载的，可能被清理掉。报告照出，只是这一行没有图"""
+        wb = self._build([
+            _export_row(index=1, images=["src_x/gone.png"], image_desc="描述还在"),
+            _export_row(index=2, images=[self.rel], image_desc="这张还在"),
+        ])
+        ws = wb["帖子明细"]
+        assert len(ws._images) == 1, "缺文件的那行不该插图，在的那行必须插"
+        assert ws.max_row == 3
+
+    def test_unreadable_file_gets_no_dead_link(self):
+        """文件在、但读不出来（截断 / 损坏）。不能留一个跳到空段落的 🔍"""
+        from app.services.excel_service import EXPORT_COLUMNS, IMAGE_SHEET
+
+        broken = os.path.join(self.tmpdir, "media", "src_x", "broken_0.png")
+        with open(broken, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + b"garbage")   # 有 PNG 头，内容是坏的
+        wb = self._build([_export_row(index=1, images=["src_x/broken_0.png"],
+                                      image_desc="描述还在")])
+        ws = wb["帖子明细"]
+        assert ws._images == []
+        col = [k for k, _ in EXPORT_COLUMNS].index("image_desc") + 1
+        assert ws.cell(2, col).hyperlink is None, "跳过去是一段没有图的空标题"
+        assert ws.cell(2, col).value == "描述还在", "描述本身还是要留着"
+        assert IMAGE_SHEET not in wb.sheetnames
+
+    def test_sheet_names_come_from_one_place(self):
+        """两张表互相跳转。名字写死字面量的话，改名就变成指向不存在的表，
+        Excel 打开时弹「需要修复」—— 比报错难查得多
+        """
+        from app.services.excel_service import DETAIL_SHEET, IMAGE_SHEET
+
+        wb = self._build([_export_row(index=1, images=[self.rel], image_desc="报告")])
+        assert wb.sheetnames == ["概览", DETAIL_SHEET, IMAGE_SHEET]
+        back = wb[IMAGE_SHEET].cell(3, 2)
+        assert back.hyperlink.location.startswith(f"'{DETAIL_SHEET}'!")
+
+    def test_path_traversal_never_reaches_the_workbook(self):
+        """images 来自采集脚本；media 目录之外是数据库和明文密钥"""
+        wb = self._build([_export_row(index=1, images=["../../hyxi.db"])])
+        assert wb["帖子明细"]._images == []
+
+    def test_multiple_images_on_one_post_all_show_up(self):
+        from PIL import Image as PILImage
+        from app.services.excel_service import IMAGE_SHEET
+
+        second = os.path.join(self.tmpdir, "media", "src_x", "shot_1.png")
+        PILImage.new("RGB", (400, 400), (200, 60, 60)).save(second)
+        wb = self._build([
+            _export_row(index=1, images=[self.rel, "src_x/shot_1.png"], image_desc="两张")
+        ])
+        assert len(wb[IMAGE_SHEET]._images) == 2, "第二张图在报告里丢了"
 
 
 class TestSearchFilteringEndToEnd:

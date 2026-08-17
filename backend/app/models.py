@@ -158,8 +158,11 @@ class PostData(BaseModel):
     reply_level: int = 0
     matched: bool = False  # 搜索命中标记：带出父贴时用来告诉前端高亮哪几条
     # 正文图，相对 data/media 的路径（如 src_xxx/abc_0.png），经 /api/v1/media 回读。
-    # 只给人看，不进翻译和舆情的 prompt
+    # 翻译不看它，舆情看 —— 图先经多模态转成 image_desc 再进 prompt
     images: List[str] = Field(default_factory=list)
+    # 多模态模型读出来的图片内容。纯图帖的全部信息都在这里，页面上不给出来的话
+    # 用户会看到一条「有结论、没内容」的帖子，无从判断结论是怎么来的
+    image_desc: str = ""
     replies: List["PostData"] = Field(default_factory=list)
 
 

@@ -964,14 +964,16 @@ class TestExportEndpointEndToEnd:
         resp = self.client.get(f"/api/v1/tasks/{self.task_id}/export", params={"format": "xlsx"})
         assert resp.status_code == 200
         wb = load_workbook(BytesIO(resp.content))
+        # 这批帖子都没有配图，所以不该多出一张「配图」表
         assert wb.sheetnames == ["概览", "帖子明细"]
         ws = wb["帖子明细"]
         assert ws.max_row == 5                       # 表头 + 4 条
-        assert ws.cell(1, 6).value == "原文"
-        assert ws.cell(1, 7).value == "中文翻译"
+        # 按列名定位，别写死列号 —— 加一列就得改一遍测试，改漏了还查不出来
+        col = {c.value: c.column for c in ws[1]}
+        assert {"原文", "中文翻译", "图片描述", "配图", "情感"} <= set(col)
         # 结论写给扁平数组第 0 条（主贴A），导出按时间倒序后它落在第 3 行
-        assert ws.cell(3, 6).value == "主贴A"
-        assert ws.cell(3, 8).value == "正面"
+        assert ws.cell(3, col["原文"]).value == "主贴A"
+        assert ws.cell(3, col["情感"]).value == "正面"
 
     def test_format_must_be_one_of_the_two(self):
         for bad in ("json", "pdf", "XLS", ""):
@@ -988,6 +990,109 @@ class TestExportEndpointEndToEnd:
         for path in ("download", "export/csv", "export/json", "sentiment/download"):
             resp = self.client.get(f"/api/v1/tasks/{self.task_id}/{path}")
             assert resp.status_code == 404, f"{path} 仍然可用（{resp.status_code}）"
+
+
+class TestImagesInExportAndApiEndToEnd:
+    """纯图帖走完整条出口：真 HTTP → 真 SQLite → 真图片文件 → 真 xlsx / csv"""
+
+    @classmethod
+    def setup_class(cls):
+        import app.config as cfg
+        from PIL import Image as PILImage
+
+        cls.cfg = cfg
+        cls.tmpdir = tempfile.mkdtemp()
+        cls._old_key = cfg.settings.api_key
+        cls._old_dir = cfg.settings.data_dir
+        cfg.settings.api_key = ""
+        cfg.settings.data_dir = cls.tmpdir
+
+        from main import app
+        from app.services import storage
+        cls.storage = storage
+        cls._old_db = storage.DB_PATH
+        storage.DB_PATH = os.path.join(cls.tmpdir, "hyxi.db")
+        storage.init_db()
+        cls.client = TestClient(app)
+
+        media = os.path.join(cls.tmpdir, "media", "src_p")
+        os.makedirs(media, exist_ok=True)
+        PILImage.new("RGB", (600, 400), (20, 120, 90)).save(os.path.join(media, "shot_0.png"))
+
+        cls.posts = [
+            {"username": "koen", "timestamp": "08-08-2026 12:37", "content": "",
+             "translation": "", "page_number": 1, "fingerprint": "pic",
+             "source": "src_p", "parent_fingerprint": None, "reply_level": 0,
+             "images": ["src_p/shot_0.png"], "image_desc": "安装检查报告，总分 88"},
+            {"username": "bob", "timestamp": "08-08-2026 13:00", "content": "Zelfde hier.",
+             "translation": "我也一样。", "page_number": 1, "fingerprint": "txt",
+             "source": "src_p", "parent_fingerprint": "pic", "reply_level": 1},
+        ]
+        storage.upsert_posts("src_p", cls.posts)
+
+        cls.task_id = "img-export-e2e"
+        from app.services.orchestrator import orchestrator
+        cls.orchestrator = orchestrator
+        orchestrator.tasks[cls.task_id] = {
+            "id": cls.task_id, "status": "completed", "description": "带图任务",
+            "plan": [], "logs": [], "progress": 1.0, "current_step": None,
+            "result": {"total_posts": 2, "sources": [
+                {"id": "src_p", "name": "Facebook", "collector_id": "facebook_group",
+                 "post_count": 2},
+            ]},
+        }
+
+    @classmethod
+    def teardown_class(cls):
+        cls.cfg.settings.api_key = cls._old_key
+        cls.cfg.settings.data_dir = cls._old_dir
+        cls.storage.DB_PATH = cls._old_db
+        cls.orchestrator.tasks.pop(cls.task_id, None)
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def test_image_only_post_survives_collection(self):
+        """一个字都没有、只有一张图的帖子必须进得了库 —— 曾经在入库口被静默丢掉"""
+        stored = self.storage.load_posts(["src_p"])
+        assert [p["fingerprint"] for p in stored] == ["pic", "txt"]
+        assert stored[0]["images"] == ["src_p/shot_0.png"]
+
+    def test_posts_api_exposes_the_image_description(self):
+        """页面靠它解释「这条没有正文的帖子凭什么得出这个结论」"""
+        resp = self.client.get(f"/api/v1/tasks/{self.task_id}/posts")
+        assert resp.status_code == 200
+        root = resp.json()["posts"][0]
+        assert root["images"] == ["src_p/shot_0.png"]
+        assert root["image_desc"] == "安装检查报告，总分 88"
+
+    def test_xlsx_carries_the_picture(self):
+        from io import BytesIO
+        from openpyxl import load_workbook
+        from app.services.excel_service import IMAGE_SHEET
+
+        resp = self.client.get(f"/api/v1/tasks/{self.task_id}/export",
+                               params={"format": "xlsx"})
+        assert resp.status_code == 200
+        wb = load_workbook(BytesIO(resp.content))
+        assert wb.sheetnames == ["概览", "帖子明细", IMAGE_SHEET]
+        assert len(wb["帖子明细"]._images) == 1, "明细行里没有缩略图"
+        assert len(wb[IMAGE_SHEET]._images) == 1, "配图表里没有大图"
+
+        col = {c.value: c.column for c in wb["帖子明细"][1]}
+        cell = wb["帖子明细"].cell(2, col["图片描述"])
+        assert "安装检查报告" in str(cell.value)
+        assert cell.hyperlink and IMAGE_SHEET in cell.hyperlink.location
+
+    def test_csv_lists_the_image_path_as_text(self):
+        import csv as _csv
+        from io import StringIO
+
+        resp = self.client.get(f"/api/v1/tasks/{self.task_id}/export",
+                               params={"format": "csv"})
+        assert resp.status_code == 200
+        rows = list(_csv.DictReader(StringIO(resp.content.decode("utf-8-sig"))))
+        assert rows[0]["配图"] == "src_p/shot_0.png", "CSV 里得留个能找到原图的线索"
+        assert rows[0]["图片描述"] == "安装检查报告，总分 88"
+        assert rows[1]["配图"] == ""
 
 
 class TestStatsTimeRangeEndToEnd:

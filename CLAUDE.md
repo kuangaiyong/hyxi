@@ -208,7 +208,8 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 - **评论正文是一串并列的 `div[dir="auto"]`，一段一个**（`commentText()`）。`querySelector` 只拿第一段 —— 实测一条 9 段的评论只存下第一段的 71 个字符，原文 811 个，丢了 92%；一轮 42 条评论里 13 条多段，共丢 2792 个字符。**层级限定不能省**：嵌套回复也是 `article`，不加 `closest(sel.post) === root` 就会把子回复的正文并进父评论，父子两条都错。主贴不走这条路（取的是 `[data-ad-comet-preview="message"]` 容器的 textContent，本来就含全部段落），所以主贴段落之间没有换行、评论之间有 —— 这是两条不同的取法，不是 bug
 - **「查看N条回复」/「查看更多评论」目前不点，那部分评论根本没进 DOM**（实测一页上有 26 条这样的回复）。要补齐得循环点击并等加载，会显著增加请求量，与反爬虫姿态需要一并权衡
 - **信息流里混着不是帖子的 `role="article"`**（广告、推荐小组卡片），既没有固定链接也没有正文容器，`flatten()` 用 `isNotAPost()` 把它们丢掉。存下来就是一条四个字段全空的记录 —— 白占一次翻译调用（清理前的落盘数据里有 55 条这种，全被标成「已翻译」），还会在结果页显示成一条什么都没有的帖子。`isNotAPost()` 的判据是 id 和正文全都没有。**正文为空但有 id 的那一类不在这里拦**（见下条）
-- **正文为空的帖子一条都不入库**，拦在 `storage.drop_empty_posts()`（`upsert_posts()` 开头调用）。它翻译不了（实测那条被标成「已翻译」、译文是空串）、舆情永远分析不了（`analyze()` 按 `non_empty` 过滤），在报告和舆情页上就一直挂着一行什么都没有的「未分析」。**拦在入库口而不是采集脚本里**，理由有两条：一是 `upsert_posts()` 是 posts 表唯一的门，三个采集器和以后新加的都不用各自记得过滤；二是**在 `flatten()` 里过滤会把评论一起带走** —— 它是「主贴 → 它的评论」嵌套遍历的，实测那条空主贴下面挂着 2 条有内容的真实发言。`drop_empty_posts()` 因此把孤儿评论就地提成主贴（`parent_fingerprint=None`、`reply_level=0`），而不是留一个指向已删帖子的悬空 parent；父贴本来就没正文，评论失去的上下文是空的。回归测试见 `TestEmptyPostsNeverStoredEndToEnd`
+- **既没正文又没配图的帖子一条都不入库**，拦在 `storage.drop_empty_posts()`（`upsert_posts()` 开头调用）。它翻译不了（实测那条被标成「已翻译」、译文是空串）、舆情永远分析不了，在报告和舆情页上就一直挂着一行什么都没有的「未分析」。**拦在入库口而不是采集脚本里**，理由有两条：一是 `upsert_posts()` 是 posts 表唯一的门，三个采集器和以后新加的都不用各自记得过滤；二是**在 `flatten()` 里过滤会把评论一起带走** —— 它是「主贴 → 它的评论」嵌套遍历的，实测那条空主贴下面挂着 2 条有内容的真实发言。`drop_empty_posts()` 因此把孤儿评论就地提成主贴（`parent_fingerprint=None`、`reply_level=0`），而不是留一个指向已删帖子的悬空 parent；父贴本来就没正文，评论失去的上下文是空的。回归测试见 `TestEmptyPostsNeverStoredEndToEnd`
+- **判据必须同时看 `images`，只看正文会静默丢掉纯图帖**（踩过，见下节）。这里只能看 `images` 不能看 `image_desc` —— 入库时图还没被理解过
 - **历史迁移不能套用这条规则**：`migrate_posts_file()` 传 `drop_empty=False`。迁移是**照原样重建**，旧舆情 blob 的 `results[i]` 对齐的正是那个数组的第 i 条 —— 少搬一条，条数就对不上，`migrate_sentiment_blob()` 的「条数不等整份跳过」会把那个来源的历史结论**永久**挡在门外，且没有任何报错。回归测试见 `TestPostsStorageEndToEnd::test_migration_keeps_empty_posts_so_sentiment_blob_still_aligns`
 - **正文图是 `<img>`，host 在 `scontent-*.xx.fbcdn.net` 上，渲染尺寸几百像素**（实测 367×795 这个量级，`alt` 是 Facebook 自动生成的「可能是包含下列内容的图片：…」）。界面图标是 `data:image/svg+xml`（16~18px）、emoji 在 `static.xx.fbcdn.net`，按 host 一刀就切干净；**头像是 `<svg><image>` 不是 `img`**，压根不会被 `querySelectorAll('img')` 选中。尺寸下限是第二道保险
 - **图片不必额外滚动去凑**：实测滚到底后逐个主贴 `scrollIntoView`，原有 15 个主贴的图片数**一张没变**（1→1、0→0），多出来的全是新滚出来的帖子 —— 也就是说「这条没图」是真没图，不是懒加载没触发
@@ -411,9 +412,71 @@ prompt 里有两条必须留着：一是**正例要列全**（各种语序和口
 
 **并发控制**：`max_concurrent_tasks` 超限时新任务进 `_task_queue` 排队，前一个任务在 `_run_with_queue` 结束后调 `_process_queue()` 自动出队执行，不会直接失败。
 
+### 纯图帖（一个字都没有、只有一张图）
+
+**「能不能分析」的判据是 `sentiment_service.is_analyzable()`：有正文 or 有配图。**
+入库口、流水线、页面按钮三处全部 import 它，不许各写各的 —— 曾经三处都是
+`(p.get("content") or "").strip()`，于是纯图帖在四个环节被一致地当成空气。
+
+代价是真实数据丢过：`media/src_b32bc603/6680d5f13a6b2b4c_0.jpg`（HYXi 安装检查报告，
+总分 88、发电异常 8/20 标橙）还躺在盘上，`posts` 表里一行都没有 —— 采集脚本先下图、
+`drop_empty_posts()` 再丢帖子。它连「未分析」都不显示，是**直接消失**，比留一行空白难发现得多。
+
+**`analyze()` 里筛选与图片理解的先后顺序是这条链路的命门**：
+
+1. 先按 `is_analyzable()` 圈 `candidates`（**必须排在图片理解之前** —— 用正文筛的话纯图帖
+   进不了 `need_desc`，它的图永远不会被理解，于是永远分析不了，形成死循环）
+2. `_understand_images()` 按 candidates 所在的**讨论串**收集带图帖
+3. **理解完之后**才定 `non_empty`：`正文非空 or image_desc 非空`
+
+第 3 步不能省。多模态没配 / 调用失败 / 图丢了的时候，纯图帖是**真的**没有可判断的内容，
+送一个空块给 LLM 只会换回一条编出来的结论 —— 那比诚实地留「未分析」糟得多。
+
+正文位置在 prompt 里**不能留空**，用 `NO_TEXT_PLACEHOLDER` 顶上（`_post_block` 与
+`_member_line` 共用同一句）：一片空白看起来像一条被截断的帖子，模型会照着「没说什么」判
+neutral，而信息其实全在紧随其后的 `[图片: ...]` 里。系统提示词里因此专门写了一条
+「不要因为没有正文就一律判 neutral」。
+
+主贴↔回复的关系不用另做 —— `thread_by_key` 已经让纯图主贴的描述随整串上下文进到它每一条
+回复的 prompt 里，反过来纯图主贴也拿得到回复。回归测试见 `TestImageOnlyPostsAreAnalyzedEndToEnd`。
+
+### 导出报告里的配图
+
+`EXPORT_COLUMNS` 里「图片描述」「配图」两列由 Excel 和 CSV 共用：CSV 的「配图」是相对路径
+文本（照着能在 media 目录里找到原图），Excel 那一格贴 150px 缩略图。大图另开一张
+**「配图」工作表**（`IMAGE_SHEET`），一条帖子一段：帖子头 + 完整描述 + 700px 大图 + 返回链接。
+
+**超链接挂不到图片上，别再试**：openpyxl 3.1.5 的 `Image` 只有 `anchor` / `path`，
+`SpreadsheetDrawing._picture_frame()` 里的 `cNvPr` 是现场写死的，没有注入 `hlinkClick` 的口子；
+Excel 本身也没有「点图放大」的原生行为。所以跳转入口放在同一行的**「图片描述」格**上 ——
+它既是纯图帖最显眼的文字，又不会被图片盖住点不着。内部跳转必须走
+`Hyperlink(location=...)`，给 `target` 会被当成外部关系，Excel 打开时报「需要修复」。
+
+缩略图**重新编码**（PIL `thumbnail()` → JPEG），大图**用原始字节只钳显示尺寸**：前者若直接
+拿原图按 150px 显示，xlsx 里会存两份原始字节；后者若重新编码，等于把要看清的细节又糊一遍。
+
+**大图不能把整张高度压进一行**：Excel 单行上限 409.5pt（≈546px），而真实 Facebook 截图是
+367×795 这个量级，钳到 700px 仍有 525pt —— 设过去会被 Excel 截回来、图盖到下面几行上
+（实测导出里出现过 25 行 531pt）。所以配图表**不设行高**，按默认行高（15pt≈20px）留够
+`ceil(高/20)` 行让图自己铺开。回归测试见
+`TestExportImagesEndToEnd::test_tall_image_gets_enough_rows_instead_of_one_oversized_one`。
+
+**导出的图片总量没有上限**，整份工作簿在内存里拼好再作为一个 Response 返回。当前
+138 条帖子 / 31 张图 ≈ 0.93MB，够用；来源长期跑下去图数是线性增长的，哪天导出变慢或吃内存，
+先看这里而不是先怀疑 LLM。
+
+**纯图帖拿不到描述时不写 `sentiment_at`**，所以下一轮增量会连图片理解一起重试。这与文本帖
+分析失败后重试是同一个规矩，没有单独的失败计数 —— 代价是一张**永远**描述不出来的图每轮多烧
+两次多模态调用（真机空描述率约 12%，重试一次后残留很低）。真出现这种图，先查图本身。
+
+`openpyxl` 插图硬依赖 **Pillow**（缺了直接 `ImportError`），已进 `requirements.txt`；
+`excel_service` 仍兜了一层 try/except，既有 venv 没更新时报告降级成无图而不是下载 500。
+路径解析复用 `vision_service.media_path()`（含 realpath 包含性校验）—— `images` 来自采集脚本，
+而 media 目录之外就是数据库和明文密钥。
+
 ## 测试
 
-**263 个测试，必须全部 PASSED**（本机实测 `263 passed in 331s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**283 个测试，必须全部 PASSED**（本机实测 `283 passed in 322s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v

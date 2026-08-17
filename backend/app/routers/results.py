@@ -16,6 +16,7 @@ from app.services.excel_service import (
 from app.services.post_tree import (
     build_tree, normalize_timestamp, order_by_thread, post_key, sort_time,
 )
+from app.services.sentiment_service import is_analyzable
 from app.services.orchestrator import orchestrator, load_task_posts
 
 router = APIRouter(prefix="/api/v1/tasks/{task_id}", tags=["结果"])
@@ -96,6 +97,7 @@ def _to_post_data(post: dict, index: int, names: dict, matched: bool = False) ->
         reply_level=int(post.get("reply_level", 0) or 0),
         matched=matched,
         images=post.get("images") or [],
+        image_desc=post.get("image_desc") or "",
     )
 
 
@@ -270,6 +272,11 @@ def _export_rows(task: dict, posts: list, results: list) -> list:
             "timestamp": normalize_timestamp(p.get("timestamp", "")),
             "content": p.get("content", ""),
             "translation": p.get("translation", ""),
+            # 多模态读出来的图片内容。纯图帖的全部信息都在这里 —— 报告里少了它，
+            # 那条帖子就只剩一行空白
+            "image_desc": p.get("image_desc") or "",
+            # 相对 media 的路径。Excel 拿它插缩略图，CSV 拼成文本
+            "images": p.get("images") or [],
             "sentiment": SENTIMENT_CN.get(r.get("sentiment"), UNANALYZED),
             "intensity": r.get("intensity") if r.get("sentiment") else "",
             "reason": r.get("reason_cn", ""),
@@ -321,7 +328,11 @@ async def export_report(task_id: str, format: str = Query("xlsx")):
         writer = csv.writer(output)
         writer.writerow([label for _, label in EXPORT_COLUMNS])
         for row in rows:
-            writer.writerow([row[key] for key, _ in EXPORT_COLUMNS])
+            # CSV 放不下图，「配图」列给相对路径 —— 用户照着能在 media 目录里找到原图
+            writer.writerow([
+                "、".join(row[key]) if key == "images" else row[key]
+                for key, _ in EXPORT_COLUMNS
+            ])
         # utf-8-sig：没有 BOM 时 Excel 会按本地代码页打开，中文全是乱码
         content = output.getvalue().encode("utf-8-sig")
         media_type = "text/csv; charset=utf-8"
@@ -344,7 +355,8 @@ async def export_report(task_id: str, format: str = Query("xlsx")):
 async def trigger_sentiment_analysis(task_id: str, force: bool = False):
     """触发舆情分析（增量：自动跳过已分析的帖子）。
 
-    `force=true` 忽略 `_processed.sentiment_at`，把所有有正文的帖子重新分析一遍。
+    `force=true` 忽略 `_processed.sentiment_at`，把所有可分析的帖子（有正文**或**有配图，
+    见 `sentiment_service.is_analyzable`）重新分析一遍。
     用在分析口径变了的时候（比如刚接上图片理解、或改了 prompt）—— 增量粒度是帖子
     身份，不重跑的话老帖子永远停在旧口径下的结论上。**它会重新花钱**，所以不是默认。
     """
@@ -369,14 +381,15 @@ async def trigger_sentiment_analysis(task_id: str, force: bool = False):
     else:
         already_analyzed = [p for p in posts if p.get("_processed", {}).get("sentiment_at")]
         pending = [p for p in posts if not p.get("_processed", {}).get("sentiment_at")]
-    # 区分有内容和空内容（空内容帖子不会被 LLM 分析）
-    pending_with_content = [p for p in pending if (p.get("content") or "").strip()]
-    pending_empty = len(pending) - len(pending_with_content)
+    # 区分可分析和真空帖。**纯图帖算可分析** —— 图会先被多模态转成中文描述，
+    # 判据统一在 sentiment_service.is_analyzable，三条入口不各写各的
+    pending_analyzable = [p for p in pending if is_analyzable(p)]
+    pending_empty = len(pending) - len(pending_analyzable)
 
-    if not pending_with_content:
+    if not pending_analyzable:
         msg = "所有帖子已完成舆情分析"
         if pending_empty > 0:
-            msg = f"所有有内容的帖子已完成舆情分析（{pending_empty} 条空内容帖子已跳过）"
+            msg = f"所有可分析的帖子已完成舆情分析（{pending_empty} 条无正文无配图的帖子已跳过）"
         return {"message": msg, "task_id": task_id, "status": "completed"}
 
     # 这批帖子已知的结论（含别的任务分析过的）。它们会作为 existing_results 参与合并，
@@ -386,14 +399,14 @@ async def trigger_sentiment_analysis(task_id: str, force: bool = False):
     # 后台启动分析（仅分析增量帖子，合并已有结果）
     orchestrator.run_sentiment_async(task_id, posts, pending, existing_results)
     if force:
-        msg = f"强制重新分析: {len(pending_with_content)} 条全部重跑"
+        msg = f"强制重新分析: {len(pending_analyzable)} 条全部重跑"
     else:
-        msg = f"增量舆情分析: {len(already_analyzed)} 条已跳过, {len(pending_with_content)} 条待分析"
+        msg = f"增量舆情分析: {len(already_analyzed)} 条已跳过, {len(pending_analyzable)} 条待分析"
     if pending_empty > 0:
-        msg += f"（{pending_empty} 条空内容帖子跳过）"
+        msg += f"（{pending_empty} 条无正文无配图的帖子跳过）"
     return {
         "message": msg,
-        "pending_count": len(pending_with_content),
+        "pending_count": len(pending_analyzable),
         "total_pending": len(pending),
         "task_id": task_id,
         "status": "started",

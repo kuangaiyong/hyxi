@@ -7,12 +7,22 @@ from datetime import datetime
 from typing import List, Optional
 from collections import Counter
 from openpyxl import Workbook
+from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.chart import PieChart, Reference
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.hyperlink import Hyperlink
 from app.config import settings
 from app.services.post_tree import order_by_thread
 from app.services.progress_manager import ProgressManager
+from app.services.vision_service import media_path
+
+# openpyxl 插图硬依赖 Pillow（缺了会直接 ImportError）。已写进 requirements.txt，
+# 但既有 venv 不会自己更新 —— 兜一层让报告降级成无图，而不是整个下载 500
+try:
+    from PIL import Image as PILImage
+except ImportError:  # pragma: no cover - 只在 venv 没更新时走到
+    PILImage = None
 
 
 # 复用 build_excel.py 的样式常量
@@ -54,19 +64,37 @@ SENTIMENT_STYLE = {
 
 EXPORT_WIDTHS = {
     "index": 6, "source": 16, "level": 6, "username": 14, "timestamp": 17,
-    "content": 50, "translation": 50, "sentiment": 8, "intensity": 11,
-    "reason": 40, "dimensions": 24,
+    "content": 50, "translation": 50, "image_desc": 34, "images": 24,
+    "sentiment": 8, "intensity": 11, "reason": 40, "dimensions": 24,
 }
 EXPORT_CENTERED = {"index", "level", "timestamp", "sentiment", "intensity"}
 
-# Excel 明细表和 CSV 共用这一份列定义，两种格式的列因此不可能走偏
+# Excel 明细表和 CSV 共用这一份列定义，两种格式的**列**因此不可能走偏。
+# 有两列的**渲染**是分家的，同一个 row 值各画各的：「配图」在 CSV 里是相对路径文本、
+# 在 Excel 里是缩略图；「图片描述」在 Excel 里多一个 🔍 前缀并挂跳转超链接，
+# 而 CSV 给纯描述（那个前缀是给点击用的，纯文本里只是噪音）
 EXPORT_COLUMNS = [
     ("index", "序号"), ("source", "来源"), ("level", "层级"),
     ("username", "用户名"), ("timestamp", "发布时间"),
     ("content", "原文"), ("translation", "中文翻译"),
+    ("image_desc", "图片描述"), ("images", "配图"),
     ("sentiment", "情感"), ("intensity", "强度"),
     ("reason", "分析理由"), ("dimensions", "涉及维度"),
 ]
+
+# ===== 配图 =====
+
+# 两张表互相跳转，名字必须是同一个来源 —— 写死字面量的话改名就成了指向不存在的表，
+# Excel 打开时弹「需要修复」，比报错还难查
+DETAIL_SHEET = "帖子明细"
+IMAGE_SHEET = "配图"
+THUMB_MAX_PX = 150   # 明细行里的缩略图，长边上限
+LARGE_MAX_PX = 700   # 配图表里的大图，长边上限
+PX_TO_POINT = 0.75   # Excel 行高单位是磅，96 DPI 下 1px = 0.75pt
+DEFAULT_ROW_PX = 20  # Excel 默认行高 15pt ≈ 20px
+MAX_ROW_POINT = 409  # Excel 单行高度上限（409.5pt ≈ 546px），设过头会被它自己截回来
+LINK_FONT = Font(name=FONT_NAME, size=10, color="0563C1", underline="single")
+NO_DESC_LINK_TEXT = "查看大图"
 
 
 def _star_level(value) -> int:
@@ -270,10 +298,124 @@ class ExcelService:
         """
         wb = Workbook()
         ExcelService._write_overview(wb.active, rows, meta)
-        ExcelService._write_details(wb.create_sheet("帖子明细"), rows, columns)
+        details = wb.create_sheet(DETAIL_SHEET)
+        # 配图表要先排好版，明细表的超链接得指向具体行号；但工作表顺序必须是
+        # 概览 → 明细 → 配图，所以先建明细的空表、再建配图表
+        resolved = ExcelService._resolve_images(rows) if PILImage else {}
+        anchors = {}
+        if resolved:
+            sheet = wb.create_sheet(IMAGE_SHEET)
+            anchors = ExcelService._write_image_sheet(sheet, rows, resolved)
+            if not anchors:
+                # 文件都在、但一张都读不出来（图坏了）。留一张只有标题的空表更费解
+                wb.remove(sheet)
+        ExcelService._write_details(details, rows, columns, resolved, anchors)
         buf = BytesIO()
         wb.save(buf)
         return buf.getvalue()
+
+    # ===== 配图：明细行放缩略图，大图另开一张表，靠内部超链接互跳 =====
+    #
+    # **超链接挂不到图片上**：openpyxl 的 Image 只有 anchor / path，
+    # SpreadsheetDrawing._picture_frame() 里的 cNvPr 是现场写死的，没有注入 hlink 的口子；
+    # Excel 本身也没有「点图放大」的原生行为。所以入口放在同一行的「图片描述」格上 ——
+    # 它既是纯图帖最显眼的文字，又不会被图片盖住点不着。
+
+    @staticmethod
+    def _resolve_images(rows: List[dict]) -> dict:
+        """{行下标: [绝对路径]}，只留磁盘上真读得到的。
+
+        路径解析复用 vision_service.media_path（含 realpath 包含性校验）——
+        images 来自采集脚本，而 media 目录之外就是数据库和明文密钥。
+        图是采集时下载的，可能已被清理：缺一张不该让整份报告出不来。
+        """
+        out = {}
+        for i, item in enumerate(rows):
+            paths = [p for p in (media_path(rel) for rel in (item.get("images") or [])) if p]
+            if paths:
+                out[i] = paths
+        return out
+
+    @staticmethod
+    def _thumbnail(abs_path: str):
+        """缩略图**重新编码**，不是把原图按小尺寸显示 —— 后者会让 xlsx 里存两份原始字节"""
+        try:
+            im = PILImage.open(abs_path)
+            im.thumbnail((THUMB_MAX_PX, THUMB_MAX_PX))
+            buf = BytesIO()
+            im.convert("RGB").save(buf, format="JPEG", quality=85)
+            buf.seek(0)
+            return XLImage(buf)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _full_size(abs_path: str):
+        """大图用原始字节，只钳显示尺寸 —— 重新编码等于把要看清的细节又糊一遍"""
+        try:
+            img = XLImage(abs_path)
+        except Exception:
+            return None
+        longest = max(img.width, img.height)
+        if longest > LARGE_MAX_PX:
+            scale = LARGE_MAX_PX / longest
+            img.width = int(img.width * scale)
+            img.height = int(img.height * scale)
+        return img
+
+    @staticmethod
+    def _link(cell, location: str, text: str) -> None:
+        """内部跳转必须走 location —— 给 target 会被当成外部关系，Excel 打开时报修复"""
+        cell.value = text
+        cell.hyperlink = Hyperlink(ref=cell.coordinate, location=location)
+        cell.font = LINK_FONT
+
+    @staticmethod
+    def _write_image_sheet(ws, rows: List[dict], resolved: dict) -> dict:
+        """一条帖子一段：帖子头 + 图片描述 + 大图 + 返回链接。返回 {行下标: 段首行号}"""
+        ws.column_dimensions["A"].width = 60
+        ws.column_dimensions["B"].width = 18
+        ws.cell(row=1, column=1,
+                value=f"{IMAGE_SHEET}（在「{DETAIL_SHEET}」的图片描述列点 🔍 跳到这里）"
+                ).font = EXPORT_TITLE_FONT
+
+        anchors = {}
+        row = 3
+        for idx, paths in resolved.items():
+            # **先把图读出来再决定要不要开这一段**：media_path 只验证了文件存在，
+            # 图坏了 XLImage 照样会失败。全都失败还留着锚点的话，明细表那个 🔍
+            # 会把人跳到一段有标题没图片的空段落上
+            images = [img for img in (ExcelService._full_size(p) for p in paths) if img]
+            if not images:
+                continue
+
+            item = rows[idx]
+            head = ws.cell(row=row, column=1,
+                           value=f"#{item['index']}  {item['username']}  {item['timestamp']}")
+            head.font = EXPORT_SECTION_FONT
+            # 明细表的第 idx 行数据在第 idx+2 行（第 1 行是表头）
+            ExcelService._link(ws.cell(row=row, column=2),
+                               f"'{DETAIL_SHEET}'!A{idx + 2}", f"← 返回{DETAIL_SHEET}")
+            anchors[idx] = row
+            row += 1
+
+            desc = (item.get("image_desc") or "").strip()
+            if desc:
+                cell = ws.cell(row=row, column=1, value=desc)
+                cell.font = EXPORT_BODY_FONT
+                cell.alignment = CONTENT_ALIGN
+                row += 1
+
+            for img in images:
+                ws.add_image(img, f"A{row}")
+                # **不能把整张图的高度压进一行**：Excel 单行上限 409.5pt（≈546px），
+                # 而大图长边到 700px（真实 Facebook 截图就是 367x795 这个量级），
+                # 设过去会被 Excel 截回来、图跟着盖到下面几行上。改成按默认行高
+                # 留够行数，图自然铺开
+                row += -(-img.height // DEFAULT_ROW_PX)
+                row += 1   # 图与下一段之间空一行
+            row += 1
+        return anchors
 
     @staticmethod
     def _section(ws, row: int, title: str) -> int:
@@ -383,7 +525,10 @@ class ExcelService:
                 row += 1
 
     @staticmethod
-    def _write_details(ws, rows: List[dict], columns: List[tuple]) -> None:
+    def _write_details(ws, rows: List[dict], columns: List[tuple],
+                       resolved: dict = None, anchors: dict = None) -> None:
+        resolved = resolved or {}
+        anchors = anchors or {}
         keys = [key for key, _ in columns]
         for col, (key, label) in enumerate(columns, 1):
             cell = ws.cell(row=1, column=col, value=label)
@@ -394,6 +539,7 @@ class ExcelService:
             ws.column_dimensions[get_column_letter(col)].width = EXPORT_WIDTHS.get(key, 16)
 
         sentiment_col = keys.index("sentiment") + 1
+        image_col = keys.index("images") + 1 if "images" in keys else 0
         for offset, item in enumerate(rows):
             row = offset + 2
             level = item["level"]
@@ -404,6 +550,9 @@ class ExcelService:
                 elif key == "intensity":
                     stars = _star_level(value)
                     value = "★" * stars + "☆" * (5 - stars) if stars else ""
+                elif key == "images":
+                    # 缩略图待会儿贴在这一格上，别再写一串路径垫在图底下
+                    value = None
                 cell = ws.cell(row=row, column=col, value=value)
                 cell.border = THIN_BORDER
                 cell.font = EXPORT_BODY_FONT
@@ -412,10 +561,25 @@ class ExcelService:
                 # 反而看不出哪行是评论
                 if level:
                     cell.fill = REPLY_FILL
+                if key == "image_desc" and offset in anchors:
+                    extra = len(resolved[offset])
+                    ExcelService._link(
+                        cell, f"'{IMAGE_SHEET}'!A{anchors[offset]}",
+                        f"🔍 {str(value or NO_DESC_LINK_TEXT)}"
+                        + (f"（共 {extra} 张）" if extra > 1 else ""),
+                    )
             ExcelService._paint_sentiment(ws.cell(row=row, column=sentiment_col), item["sentiment"])
 
             longest = max(len(item["content"] or ""), len(item["translation"] or ""))
-            ws.row_dimensions[row].height = min(180, max(30, (longest // 45 + 1) * 16))
+            height = min(180, max(30, (longest // 45 + 1) * 16))
+            if offset in resolved and image_col:
+                thumb = ExcelService._thumbnail(resolved[offset][0])
+                if thumb is not None:
+                    ws.add_image(thumb, f"{get_column_letter(image_col)}{row}")
+                    # 行高得让缩略图放得下，否则图会压到下一行上。
+                    # 缩略图长边 150px = 112.5pt，离 Excel 的 409.5pt 上限还远
+                    height = max(height, thumb.height * PX_TO_POINT + 6)
+            ws.row_dimensions[row].height = height
 
         ws.freeze_panes = "A2"
         # 让人能直接按情感、来源筛选，比翻 88 行找负面快得多

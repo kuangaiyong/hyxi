@@ -359,12 +359,13 @@ class TaskOrchestrator:
                         context["posts"] = posts
 
                         # 增量粒度是 _processed.sentiment_at，跨任务共享 —— 同一条帖子
-                        # 不会因为换个任务重跑就再花一次钱。空内容帖（纯图片贴）永远
-                        # 不会有结论，analyze() 内部会滤掉，这里只用来说人话
+                        # 不会因为换个任务重跑就再花一次钱。既没正文又没配图的才是真的
+                        # 分析不了，analyze() 内部还会再滤一次，这里只用来说人话
+                        from app.services.sentiment_service import is_analyzable
                         pending = [p for p in posts if not p.get("_processed", {}).get("sentiment_at")]
-                        with_content = [p for p in pending if (p.get("content") or "").strip()]
+                        with_content = [p for p in pending if is_analyzable(p)]
                         if not with_content:
-                            await self._task_log(task_id, "info", "所有有内容的帖子都已完成舆情分析，跳过")
+                            await self._task_log(task_id, "info", "所有可分析的帖子都已完成舆情分析，跳过")
                         else:
                             await self._task_log(
                                 task_id, "info",

@@ -770,10 +770,16 @@ def max_page_number(source_id: str) -> int:
 
 
 def drop_empty_posts(posts: List[dict]) -> List[dict]:
-    """丢掉正文为空的帖子，并把它们的评论提成主贴。
+    """丢掉**既没正文也没配图**的帖子，并把它们的评论提成主贴。
 
-    空正文帖在报告里是一行什么都没有的记录，还白占一次翻译调用（实测那条已被标成
+    真空帖在报告里是一行什么都没有的记录，还白占一次翻译调用（实测那条已被标成
     「已翻译」，译文是空串），舆情又永远分析不了它 —— 页面上就一直挂着一条「未分析」。
+
+    **有配图就不算空**：图会在舆情阶段被多模态转成中文描述，那正是最该看的一类内容。
+    这里只能看 `images` 不能看 `image_desc` —— 入库时图还没被理解过。曾经只看正文，
+    实测因此静默丢过一条：media/src_b32bc603/6680d5f13a6b2b4c_0.jpg 还躺在盘上
+    （HYXi 安装检查报告，总分 88、发电异常 8/20 标橙），posts 表里一行都没有。
+    采集脚本先下图、这个口再丢帖子，图留下、帖子没了，连「未分析」都不显示。
 
     **丢主贴不能连累它的评论**：实测那条空主贴下面挂着 2 条有内容的评论，采集脚本
     的 flatten() 是按「主贴 → 它的评论」嵌套遍历的，在那里过滤会把评论一起带走。
@@ -782,7 +788,9 @@ def drop_empty_posts(posts: List[dict]) -> List[dict]:
     """
     dropped = {
         p.get("fingerprint") for p in posts
-        if p.get("fingerprint") and not (p.get("content") or "").strip()
+        if p.get("fingerprint")
+        and not (p.get("content") or "").strip()
+        and not (p.get("images") or [])
     }
     if not dropped:
         return posts

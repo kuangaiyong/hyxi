@@ -7,6 +7,7 @@ import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/compon
 import { CanvasRenderer } from 'echarts/renderers'
 import * as sentimentApi from '@/api/sentiment'
 import * as resultsApi from '@/api/results'
+import { withApiKey } from '@/api/client'
 import { useToast } from '@/composables/useToast'
 import { downloadFile } from '@/utils/download'
 import type { SentimentData, PostWithSentiment } from '@/types/sentiment'
@@ -26,6 +27,8 @@ const downloading = ref(false)
 const showFormats = ref(false)
 const eventSource = ref<EventSource | null>(null)
 const showDetail = ref(false)
+/** 配图灯箱，写法与 ResultsView 一致：点缩略图放大，点遮罩关掉 */
+const zoomUrl = ref('')
 const detailPost = ref<PostWithSentiment | null>(null)
 // 帖子原始数据（用于对照查看）
 const postsMap = ref<Map<number, PostData>>(new Map())
@@ -632,9 +635,17 @@ function viewPost(idx: number) {
     username: post?.username || '',
     content: post?.content || '',
     translation: post?.translation || '',
+    images: post?.images || [],
+    image_desc: post?.image_desc || '',
     sentiment: r || null,
   }
   showDetail.value = true
+}
+
+/** 图片走后端受保护端点；<img> 带不了请求头，密钥只能挂 query（同 SSE） */
+function mediaUrl(rel: string): string {
+  const safe = rel.split('/').map(encodeURIComponent).join('/')
+  return withApiKey(`/api/v1/media/${safe}`)
 }
 </script>
 
@@ -1054,7 +1065,30 @@ function viewPost(idx: number) {
             </div>
           </div>
         </div>
+
+        <!-- 配图。纯图帖的正文两栏都是空的，结论正是照着这里下的 -->
+        <div v-if="detailPost?.images?.length" style="margin-top: 16px;">
+          <div class="form-label">🖼️ 配图</div>
+          <div v-if="detailPost?.image_desc" class="detail-img-desc">
+            {{ detailPost.image_desc }}
+          </div>
+          <div class="detail-images">
+            <img
+              v-for="(im, i) in detailPost.images"
+              :key="i"
+              :src="mediaUrl(im)"
+              loading="lazy"
+              alt="帖子配图"
+              @click="zoomUrl = mediaUrl(im)"
+            />
+          </div>
+        </div>
       </div>
+    </div>
+
+    <!-- 图片灯箱。挂在弹窗外面，否则会被 modal 的层叠上下文压住 -->
+    <div v-if="zoomUrl" class="lightbox" @click="zoomUrl = ''">
+      <img :src="zoomUrl" alt="帖子配图（放大）" />
     </div>
   </div>
 </template>
@@ -1064,6 +1098,48 @@ function viewPost(idx: number) {
 .trend-chart {
   width: 100%;
   height: 280px;
+}
+
+/* 底色和字色都走变量：写死 #F8FAFC 的话深色模式下是浅底 + 浅字，等于看不见
+   （周围那几个内联样式的面板正是这个毛病，不在本次改动范围内） */
+.detail-img-desc {
+  font-size: 13px;
+  line-height: 1.7;
+  padding: 10px 14px;
+  margin-bottom: 8px;
+  background: var(--bg);
+  color: var(--text);
+  border-radius: 8px;
+  border-left: 3px solid #10B981;
+}
+.detail-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.detail-images img {
+  width: 120px;
+  height: 120px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--border-light);
+  cursor: zoom-in;
+}
+/* .modal-overlay 是 z-index: 100，灯箱必须压过它才看得见 */
+.lightbox {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+  cursor: zoom-out;
+}
+.lightbox img {
+  max-width: 92vw;
+  max-height: 92vh;
+  object-fit: contain;
 }
 
 .export-menu {

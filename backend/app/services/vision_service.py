@@ -51,11 +51,14 @@ VISION_SYSTEM_PROMPT = f"""{INDUSTRY_ROLE}
 4. 直接输出一段 100 字以内的中文描述，不要分点，不要加任何前缀或解释"""
 
 
-def _media_path(rel_path: str) -> Optional[str]:
-    """把 images 里的相对路径解析成 media 目录内的绝对路径。
+def media_path(rel_path: str) -> Optional[str]:
+    """把 images 里的相对路径解析成 media 目录内的绝对路径，取不到就返回 None。
 
     包含性校验照抄 main.py 的 get_media：图片路径来自采集脚本，理论上可信，
     但这道校验只要几行，而 media 目录之外就是数据库和明文密钥。
+
+    导出报告要往 Excel 里插图，走的也是这一份 —— 新增调用方一律 import 它，别再抄。
+    （`main.py::get_media` 里还有一份同样的校验，那是 HTTP 入口自己的防线，没动它。）
     """
     root = os.path.realpath(os.path.join(settings.data_dir, "media"))
     target = os.path.realpath(os.path.join(root, rel_path))
@@ -98,7 +101,7 @@ async def describe_post_images(post: dict, vision: Optional[LLMService]) -> str:
 
     parts = []
     for rel in images[:MAX_IMAGES_PER_POST]:
-        abs_path = _media_path(rel)
+        abs_path = media_path(rel)
         if not abs_path:
             logger.info("图片不存在，跳过: %r", rel)
             continue

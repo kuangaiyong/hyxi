@@ -479,7 +479,7 @@ Excel 本身也没有「点图放大」的原生行为。所以跳转入口放�
 
 ## 测试
 
-**287 个测试，必须全部 PASSED**（本机实测 `287 passed in 364s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**288 个测试，必须全部 PASSED**（本机实测 `288 passed in 394s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
@@ -508,7 +508,7 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 ## 关键设计决策
 
 - **增量机制**：每个帖子有 fingerprint，各步骤执行前检查 `_processed` 标记跳过已处理帖子
-- **SSE 进度推送**：`progress_manager` 按 task_id 做 pub/sub，30s 无事件发 `: keepalive` 注释帧防代理断连
+- **SSE 进度推送**：`progress_manager` 按 task_id 做 pub/sub，30s 无事件发 `: keepalive` 注释帧防代理断连。**每条流的结束事件由端点自己给**（`event_generator(channel, terminal_event)`）：任务进度流等 `task_complete`、舆情流等 `sentiment_complete`、人工授权流等 `task_complete`。三者跑在同一套频道机制上，共用一份「终止事件表」会让流水线的 sentiment 步骤一发完 `sentiment_complete` 就把任务进度流掐断 —— 紧随其后的 `step_complete` 和 `task_complete` 全没人收得到，而前端只在收到 `task_complete` 时才 `fetchTask()`，于是带舆情的任务跑完后进度页永远停在 running，不跳转也不出现「查看结果」，最后一行是「连接中断」（用户实测报过）。回归测试见 `TestPipelineSentimentStepEndToEnd::test_progress_stream_survives_the_sentiment_step_and_delivers_task_complete`
 - **绝不按下标跨任务顶替舆情结果**：曾经查不到就 fallback 到最新一条，而那份结果是按别的任务的帖子列表编号的，取来与当前帖子完全对不上；更糟的是增量分析会把它当作 `existing_results` 合并后持久化，直接污染目标任务。**按帖子身份取则相反 —— 必须跨任务共享**，见「持久化」一节
 - **导出只有一个口**：`GET /export?format=xlsx|csv` 出一份含原文 + 译文 + 舆情结论的文件，界面入口只在舆情页。**报告每次下载现算、不落盘**（`ExcelService.build_export` 返回字节流）——落盘既会在 `exports/` 堆垃圾，两个人同时下载还会撞成一个在写另一个在读。流水线的 `generate_excel` 步骤照旧生成它自己那份，但那份不再被任何人下载
 - **导出与页面读同一份结论**（`results.py::_task_sentiment()`）：按帖子身份取，取到什么就写什么，所以报告里的「未分析」条数与舆情页显示的完全一致。它不再有「本任务 / 别的任务」之分 —— 那个区分只在按下标取整数组的年代才有意义

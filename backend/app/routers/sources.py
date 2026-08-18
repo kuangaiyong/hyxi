@@ -144,7 +144,7 @@ async def authorize_events(source_id: str):
     if not source_service.get_source(source_id):
         raise HTTPException(status_code=404, detail="数据源不存在")
     return StreamingResponse(
-        progress_manager.event_generator(_auth_channel(source_id)),
+        progress_manager.event_generator(_auth_channel(source_id), "task_complete"),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

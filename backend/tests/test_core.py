@@ -1268,6 +1268,65 @@ class TestPipelineSentimentStepEndToEnd:
         _task, seen = self._run("翻译已有数据，分析舆情")
         assert [s for s in seen if s != "plan"] == [], f"重复分析了: {seen}"
 
+    def _run_watching_the_progress_stream(self, description):
+        """真跑一遍流水线，同时像页面那样连着 /tasks/{id}/events。
+
+        走的是**路由函数本身**而不是直接调 event_generator —— 这条流的结束条件由
+        端点决定，绕过它就测不到真正会出错的那个选择。
+        """
+        import asyncio
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures"))
+        import llm_site
+        from app.services.orchestrator import orchestrator
+        from app.services.progress_manager import progress_manager
+        from app.routers.tasks import task_events
+
+        server = llm_site.LLMSite()
+        events = []
+        with server as base_url:
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-test", "base_url": base_url, "model_name": "test-model",
+            })
+            task_id = f"stream-{len(server.seen)}"
+            orchestrator.create_task(task_id, description)
+
+            async def main():
+                resp = await task_events(task_id)
+
+                async def consume():
+                    async for chunk in resp.body_iterator:
+                        if chunk.startswith("event: "):
+                            events.append(chunk.splitlines()[0][len("event: "):])
+
+                consumer = asyncio.ensure_future(consume())
+                # 订阅是在生成器第一次被拉动时才建立的，抢在任务开跑之前
+                for _ in range(200):
+                    if progress_manager.subscribers.get(task_id):
+                        break
+                    await asyncio.sleep(0.01)
+                await orchestrator.execute_task(task_id)
+                await asyncio.wait_for(consumer, timeout=15)
+
+            asyncio.new_event_loop().run_until_complete(main())
+        return orchestrator.get_task(task_id), events
+
+    def test_progress_stream_survives_the_sentiment_step_and_delivers_task_complete(self):
+        """用户报的：带舆情的任务跑完，进度页停在 running，最后一行是「连接中断」。
+
+        两条 SSE 流跑在同一个频道上，却共用一份结束条件。流水线的 sentiment 步骤一发完
+        `sentiment_complete`，任务进度流就自己 break 了 —— 紧随其后的 `task_complete`
+        没人收得到。前端的 task_complete 处理器是唯一会调 fetchTask() 的地方，收不到
+        就没人刷新 currentTask，isCompleted 永远是 false：不跳转、也不出现「查看结果」。
+        """
+        task, events = self._run_watching_the_progress_stream("翻译已有数据，分析舆情")
+
+        assert task["status"] == "completed", task.get("error_message")
+        assert "sentiment_complete" in events, f"这一轮压根没跑舆情: {events}"
+        assert "task_complete" in events, f"任务结束了，进度流却没收到 task_complete: {events}"
+        assert events.index("sentiment_complete") < events.index("task_complete"), events
+        # task_complete 之后流才该结束，它必须是最后一个
+        assert events[-1] == "task_complete", events
+
     def test_no_sentiment_step_means_no_llm_analysis_calls(self):
         """模型没给 sentiment 步骤时，一次分析调用都不该发生 —— 那是要花钱的"""
         task, seen = self._run("翻译已有数据，导出Excel")
@@ -3054,26 +3113,38 @@ class TestProgressManagerResourceEndToEnd:
         pm.unsubscribe("t2", q)
         assert "t2" not in pm.subscribers, "订阅字典会随任务数单调增长"
 
-    def test_sentiment_complete_terminates_stream(self):
+    def test_stream_ends_on_its_own_terminal_event_and_only_that_one(self):
+        """结束条件由端点各自给：舆情流等 sentiment_complete，任务进度流等 task_complete。
+
+        两条流跑在同一个频道上。若共用一份「终止事件表」，流水线里的 sentiment 步骤一发完
+        sentiment_complete 就会把任务进度流也掐断，紧随其后的 task_complete 没人收得到。
+        """
         import asyncio
         from app.services.progress_manager import ProgressManager
 
         pm = ProgressManager()
 
-        async def run():
-            gen = pm.event_generator("t3")
-            asyncio.ensure_future(_emit_later(pm))
-            frames = [frame async for frame in gen]
-            return frames
-
-        async def _emit_later(manager):
+        async def _emit_later(manager, channel):
             await asyncio.sleep(0.05)
-            await manager.emit("t3", "log", {"message": "x"})
-            await manager.emit("t3", "sentiment_complete", {"status": "completed"})
+            await manager.emit(channel, "log", {"message": "x"})
+            await manager.emit(channel, "sentiment_complete", {"status": "completed"})
+            await manager.emit(channel, "task_complete", {"status": "completed"})
+
+        async def collect(channel, terminal):
+            asyncio.ensure_future(_emit_later(pm, channel))
+            return [f async for f in pm.event_generator(channel, terminal)]
 
         loop = asyncio.new_event_loop()
-        frames = loop.run_until_complete(asyncio.wait_for(run(), timeout=10))
+
+        frames = loop.run_until_complete(asyncio.wait_for(collect("t3", "sentiment_complete"), timeout=10))
         assert any("sentiment_complete" in f for f in frames)
+        assert not any("task_complete" in f for f in frames), "舆情流不该继续收后面的事件"
+
+        # 同样一串事件，等 task_complete 的那条流必须挺过 sentiment_complete
+        frames = loop.run_until_complete(asyncio.wait_for(collect("t4", "task_complete"), timeout=10))
+        assert any("sentiment_complete" in f for f in frames)
+        assert any("task_complete" in f for f in frames), "sentiment_complete 把任务进度流掐断了"
+
         assert not pm.subscribers
 
 

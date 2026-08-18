@@ -9,9 +9,6 @@ from collections import defaultdict
 # 单个订阅者最多积压的事件数
 QUEUE_MAXSIZE = 1000
 
-# 收到这些事件后 SSE 流自行结束
-TERMINAL_EVENTS = ("task_complete", "sentiment_complete")
-
 
 class ProgressManager:
     """管理任务进度事件的发布/订阅"""
@@ -55,8 +52,15 @@ class ProgressManager:
         for q in dead_queues:
             self.unsubscribe(task_id, q)
 
-    async def event_generator(self, task_id: str):
-        """SSE 事件生成器 (async generator)"""
+    async def event_generator(self, task_id: str, terminal_event: str):
+        """SSE 事件生成器 (async generator)。收到 `terminal_event` 后这条流自行结束。
+
+        **结束条件必须由端点各自给**：任务进度流和舆情流跑在同一个频道上，但一条等的是
+        `task_complete`、另一条等的是 `sentiment_complete`。共用一份「终止事件表」会让
+        流水线里的 sentiment 步骤一发完 `sentiment_complete` 就把任务进度流掐断 ——
+        紧随其后的 `task_complete` 没人收得到，而前端只有在收到它时才会刷新任务状态，
+        于是进度页永远停在 running，既不跳转也不出现「查看结果」（用户实测报过）。
+        """
         queue = self.subscribe(task_id)
         try:
             while True:
@@ -66,7 +70,7 @@ class ProgressManager:
                     data_str = json.dumps(message["data"], ensure_ascii=False)
                     yield f"event: {event_type}\ndata: {data_str}\n\n"
 
-                    if event_type in TERMINAL_EVENTS:
+                    if event_type == terminal_event:
                         break
                 except asyncio.TimeoutError:
                     # 发送心跳（SSE 注释，防止代理断开连接）

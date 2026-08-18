@@ -450,7 +450,7 @@ async def sentiment_events(task_id: str):
     from app.services.progress_manager import progress_manager
 
     return StreamingResponse(
-        progress_manager.event_generator(task_id),
+        progress_manager.event_generator(task_id, "sentiment_complete"),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

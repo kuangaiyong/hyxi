@@ -80,7 +80,7 @@ async def task_events(task_id: str):
         raise HTTPException(status_code=404, detail="任务不存在")
 
     return StreamingResponse(
-        progress_manager.event_generator(task_id),
+        progress_manager.event_generator(task_id, "task_complete"),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

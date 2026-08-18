@@ -236,8 +236,41 @@ cd frontend; npm run build
 
 该命令等价于 `vue-tsc -b && vite build`，产物在 `frontend/dist`。
 
-> **注意**：后端目前**不托管**这份静态产物（`main.py` 只提供 API）。
-> 生产部署需要另外配置 web 服务器（如 nginx）来发布 `dist`，并把 `/api` 反向代理到 8000 端口。
+开发态下这份产物没人用（前端跑在 Vite 5173 上，由它把 `/api` 代理到 8000）。
+交付给使用者时它会被拷进便携包的 `web/`，**由后端自己发布**，见下一节 —— 不需要 nginx。
+
+---
+
+## 交付给使用者
+
+给不装 Python / Node 的人用时，打一个**免安装便携包**：
+
+```powershell
+.\build\build.ps1
+```
+
+产出 `build\out\HYXi-<版本>-win64.zip`（解压约 250MB）。对方解压后双击
+「启动 HYXi.bat」即可，不需要管理员权限、不写注册表、删目录即卸载。
+
+包里的东西：
+
+| 内容 | 说明 |
+|---|---|
+| `app\hyxi.exe` | Nuitka 编译成原生机器码的后端，自带 uvicorn，单端口同时供 API 和页面 |
+| `web\` | 前端构建产物 |
+| `collectors\` | 采集脚本，esbuild 打包压缩过 |
+| `node\node.exe` | 便携 Node 运行时，目标机器不必装 Node |
+| `node_modules\` | playwright（第三方依赖，原样带） |
+| `data\` `.env` | 首次启动时自动创建，加密密钥当场生成 |
+
+构建脚本最后一步是**泄漏自检**：包里出现任何 `.py`、未压缩的采集脚本、
+`.env` / `hyxi.db` / 会话文件 / 构建期依赖，一律中止出包。
+
+目标机器需要预装 **Google Chrome**（采集脚本用它驱动）。缺了不影响启动和其余功能，
+启动自检会给出提示。
+
+**`node_modules` 必须留在包根**：Node 的 `require` 从请求文件所在目录逐级向上找，
+`collectors/` 的上一级正好是包根。挪进 `app\` 就解析不到 playwright。
 
 ---
 
@@ -283,6 +316,7 @@ hyxi/
 │   └── lib/                     browser / auth / job 等公共模块
 ├── frontend/
 │   └── src/                     views / api / stores / components
+├── build/                       便携包构建（build.ps1 + 采集脚本打包 + 启动器与说明）
 ├── start.ps1                    一键启动脚本（含就绪验证）
 ├── package.json                 仅 playwright，供采集脚本使用
 ├── .env                         密钥配置（不提交）

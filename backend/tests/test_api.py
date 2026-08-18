@@ -31,6 +31,13 @@ class TestAPIEndpointsEndToEnd:
         from main import app
         from app.services import storage
         cls.storage = storage
+        # DB_PATH 是 storage 被 import 那一刻算好的常量，只改 data_dir 不生效。
+        # 本类原先靠「自己是第一个 import storage 的人」侥幸成立 —— 只要有别的用例
+        # 先 import 了它，这里的写入就会全部落到真实的 backend/data/hyxi.db 上
+        # （实测因此往生产库里写进过测试任务）。文件里其余每个类都显式重定向，补齐它
+        cls._old_db_path = storage.DB_PATH
+        storage.DB_PATH = os.path.join(cls.tmpdir, "hyxi.db")
+        storage.init_db()
         storage.set_app_config("llm", {
             "api_key": "sk-test", "base_url": "https://api.test.com",
             "model_name": "test-model",
@@ -41,6 +48,7 @@ class TestAPIEndpointsEndToEnd:
     def teardown_class(cls):
         import app.config as cfg
         cfg.settings.api_key = cls._old_key
+        cls.storage.DB_PATH = cls._old_db_path
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 
     def test_health_check(self):
@@ -48,8 +56,9 @@ class TestAPIEndpointsEndToEnd:
         assert resp.status_code == 200
         assert resp.json() == {"status": "ok"}
 
-    def test_root_endpoint(self):
-        resp = self.client.get("/")
+    def test_version_endpoint(self):
+        """服务身份走 /api/version：便携包里 / 是前端首页，不再回 JSON"""
+        resp = self.client.get("/api/version")
         assert resp.status_code == 200
         assert resp.json()["service"] == "HYXi 舆情分析 API"
 
@@ -1307,3 +1316,106 @@ class TestApiKeyAuthEndToEnd:
             assert resp.status_code == 401
         finally:
             self.cfg.settings.api_key = ""
+
+
+class TestFrontendHostingEndToEnd:
+    """便携包里后端自己发布前端：单端口同时供 /api/* 和页面，不引入 nginx。
+
+    真 TestClient 请求、真文件落盘 —— 这条路只在打包态生效，源码态 web/ 不存在。
+    """
+
+    def setup_method(self):
+        from fastapi import FastAPI
+
+        self.tmpdir = tempfile.mkdtemp()
+
+        # **必须在 import main 之前重定向**。main 会拉起 orchestrator，而它在 import 期
+        # 就 init_db() + 加载历史任务；storage.DB_PATH 又是 import 时算好的常量。
+        # 本类若碰巧是进程里第一个 import main 的，这两样就绑到真实的
+        # backend/data/hyxi.db 上了 —— 实测因此往生产库里写进过 3 条测试任务
+        import app.config as cfg
+        import app.services.storage as storage_module
+        self.cfg, self.storage = cfg, storage_module
+        self._old = (cfg.settings.data_dir, cfg.settings.tasks_dir,
+                     cfg.settings.exports_dir, storage_module.DB_PATH)
+        cfg.settings.data_dir = self.tmpdir
+        cfg.settings.tasks_dir = os.path.join(self.tmpdir, "tasks")
+        cfg.settings.exports_dir = os.path.join(self.tmpdir, "exports")
+        storage_module.DB_PATH = os.path.join(self.tmpdir, "hyxi.db")
+
+        self.web = os.path.join(self.tmpdir, "web")
+        os.makedirs(os.path.join(self.web, "assets"))
+        with open(os.path.join(self.web, "index.html"), "w", encoding="utf-8") as f:
+            f.write("<!doctype html><title>HYXi</title><div id=app></div>")
+        with open(os.path.join(self.web, "assets", "index-abc123.js"), "w", encoding="utf-8") as f:
+            f.write("console.log('bundle')")
+        with open(os.path.join(self.web, "favicon.ico"), "wb") as f:
+            f.write(bytes([0, 0, 1, 0]))
+        # 包外的东西：路径穿越拿到它就等于泄露数据库和明文密钥
+        with open(os.path.join(self.tmpdir, "secret.txt"), "w", encoding="utf-8") as f:
+            f.write("TWEAKERS_SECRET_KEY=leaked")
+
+        from main import mount_frontend
+
+        self.app = FastAPI()
+
+        @self.app.get("/api/health")
+        async def _health():
+            return {"status": "ok"}
+
+        assert mount_frontend(self.app, self.web) is True
+        self.client = TestClient(self.app)
+
+    def teardown_method(self):
+        (self.cfg.settings.data_dir, self.cfg.settings.tasks_dir,
+         self.cfg.settings.exports_dir, self.storage.DB_PATH) = self._old
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_index_is_served_at_root(self):
+        resp = self.client.get("/")
+        assert resp.status_code == 200
+        assert "<div id=app>" in resp.text
+
+    def test_deep_link_falls_back_to_index(self):
+        """路由是 createWebHistory()，/tasks/{id}/progress 直接刷新必须落到 SPA 上，
+        否则用户刷新一次就是白屏"""
+        resp = self.client.get("/tasks/abc-123/progress")
+        assert resp.status_code == 200
+        assert "<div id=app>" in resp.text
+
+    def test_unknown_api_path_stays_a_json_404(self):
+        """catch-all 谁都接得住，但打错的接口地址必须还是 404 JSON。
+
+        回一张 HTML 页面会让排查彻底走偏：调用方拿到 200 + <!doctype html>，
+        报出来的是 JSON 解析失败，跟真实原因毫无关系。
+        """
+        resp = self.client.get("/api/v1/definitely-not-a-route")
+        assert resp.status_code == 404
+        assert "html" not in resp.headers.get("content-type", "")
+
+    def test_existing_api_route_is_not_shadowed(self):
+        resp = self.client.get("/api/health")
+        assert resp.status_code == 200 and resp.json() == {"status": "ok"}
+
+    def test_real_file_beats_the_fallback(self):
+        resp = self.client.get("/favicon.ico")
+        assert resp.status_code == 200
+        assert resp.content == bytes([0, 0, 1, 0]), "favicon 被 index.html 顶掉了"
+
+    def test_bundle_is_served_from_assets(self):
+        resp = self.client.get("/assets/index-abc123.js")
+        assert resp.status_code == 200 and "bundle" in resp.text
+
+    def test_path_traversal_cannot_escape_the_web_dir(self):
+        """web 目录之外就是 data/ 和 .env —— 裸的 ../ 通常在客户端就被规范化掉，
+        %2e%2e%2f 会被框架解码后原样送进来"""
+        for attack in ("../secret.txt", "%2e%2e%2fsecret.txt", "..%2Fsecret.txt"):
+            resp = self.client.get(f"/{attack}")
+            assert "leaked" not in resp.text, f"{attack} 读到了 web 目录外的文件"
+
+    def test_without_web_dir_it_stays_out_of_the_way(self):
+        """源码开发态没有 web/，整段跳过 —— start.ps1 那条路径不受影响"""
+        from fastapi import FastAPI
+        from main import mount_frontend
+
+        assert mount_frontend(FastAPI(), os.path.join(self.tmpdir, "nope")) is False

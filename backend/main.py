@@ -8,6 +8,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from app.auth import require_api_key
 from app.config import settings
 from app.logging_config import get_logger
@@ -103,8 +104,13 @@ async def get_media(rel_path: str):
     return FileResponse(target)
 
 
-@app.get("/")
-async def root():
+@app.get("/api/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/api/version")
+async def version():
     return {
         "service": "HYXi 舆情分析 API",
         "version": "1.5.1",
@@ -112,6 +118,52 @@ async def root():
     }
 
 
-@app.get("/api/health")
-async def health():
-    return {"status": "ok"}
+def mount_frontend(target_app: FastAPI, web_dir: str) -> bool:
+    """把前端构建产物挂到同一个应用上。挂上了返回 True。
+
+    便携包里没有 nginx，也不该有第二个要配置的服务：单端口同时供 `/api/*` 和页面。
+    `web/` 不存在就是源码开发态（前端跑在 Vite 5173 上，由它代理 /api），整段跳过。
+
+    **必须在所有路由注册之后调用** —— 下面那条 catch-all 谁都接得住。
+    """
+    index_html = os.path.join(web_dir, "index.html")
+    if not os.path.isfile(index_html):
+        return False
+
+    assets = os.path.join(web_dir, "assets")
+    if os.path.isdir(assets):
+        target_app.mount("/assets", StaticFiles(directory=assets), name="assets")
+
+    web_root = os.path.realpath(web_dir)
+
+    @target_app.get("/{full_path:path}")
+    async def spa(full_path: str):
+        """SPA 回退。
+
+        路由是 `createWebHistory()`，`/tasks/{id}/progress` 这类深链**直接刷新**时
+        浏览器会向后端要这个路径，没有回退就是 404，用户看到的是白屏。
+
+        **`api/` 开头的必须排除掉**：这条 catch-all 只接没人认领的路径，而打错的接口
+        地址也在其中 —— 回一张 HTML 页面会让排查彻底走偏（调用方拿到 200 +
+        `<!doctype html>`，JSON 解析失败，报的错跟真实原因毫无关系）。
+        """
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="不存在")
+        # favicon 之类根目录下的真实文件直接给，别一律回 index.html。
+        # 包含性校验同 get_media：web 目录之外就是数据库和明文密钥
+        candidate = os.path.realpath(os.path.join(web_dir, full_path))
+        if full_path and candidate.startswith(web_root + os.sep) and os.path.isfile(candidate):
+            return FileResponse(candidate)
+        return FileResponse(index_html)
+
+    return True
+
+
+if not mount_frontend(app, os.path.join(settings.project_root, "web")):
+    @app.get("/")
+    async def root():
+        return {
+            "service": "HYXi 舆情分析 API",
+            "version": "1.5.1",
+            "docs": "/docs",
+        }

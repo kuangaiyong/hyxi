@@ -31,7 +31,7 @@ cd backend; .\.venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --po
 
 密钥留空则放行并在启动日志打告警——既有部署不会因为漏配就整个不可用。`/api/health` 与 `/` 始终公开，`/api/v1/*` 全部受保护。浏览器的 `EventSource` 不能自定义请求头，所以两个 SSE 端点额外接受 `?api_key=` 查询参数。
 
-注意 `settings.host` / `settings.port` **是死配置**——项目不调 `uvicorn.run()`，实际监听地址只由命令行 `--host` 决定，改环境变量 `TWEAKERS_HOST` 不会生效。`enable_docs` 则是真实生效的（`main.py` 用它决定 `docs_url`）。
+注意 `settings.host` / `settings.port` 在**源码开发态是死配置**——那条路由命令行 `--host` 决定，改 `TWEAKERS_HOST` 不生效。但**便携包里它们是真配置**：`run_server.py` 把它们传给 `uvicorn.run()`，所以给使用者的《使用说明》里「改 .env 开局域网访问」那段是成立的。`enable_docs` 两边都真实生效（`main.py` 用它决定 `docs_url`）。
 
 启动前端（localhost:5173，Vite 把 `/api` 代理到 localhost:8000）：
 
@@ -477,9 +477,52 @@ Excel 本身也没有「点图放大」的原生行为。所以跳转入口放�
 路径解析复用 `vision_service.media_path()`（含 realpath 包含性校验）—— `images` 来自采集脚本，
 而 media 目录之外就是数据库和明文密钥。
 
+## 便携包交付（给不装 Python / Node 的使用者）
+
+`build\build.ps1` 出一个免安装 ZIP：前端构建 → 采集脚本打包压缩 → Nuitka 编译后端 →
+组装 → **泄漏自检** → 压缩。解压双击「启动 HYXi.bat」即用。
+
+- **单端口自服务前端**：`main.py::mount_frontend()` 挂 `web/` 静态资源 + SPA 回退，
+  便携包里没有 nginx。**必须在所有路由注册之后调用**（catch-all 谁都接得住），
+  且回退里要**排除 `api/` 开头**的路径 —— 否则打错的接口地址会拿到一张 HTML 页面，
+  调用方报的是「JSON 解析失败」，跟真实原因毫无关系。`web/` 不存在就整段跳过，
+  开发态（Vite 5173 代理 `/api`）不受影响
+- **冻结态路径**：`app/paths.py` 是唯一一份算法。冻结时 `project_root` 取
+  `sys.executable` 的上两级（`app\hyxi.exe` → 包根），`data_dir` 取包根下的 `data/`
+  （便携包里没有 `backend/` 这一层）。**它单独成模块是因为 `run_server.py` 必须先算出
+  包根、生成 `.env`，才能 import `app.config`** —— `settings` 是 import 期实例化并当场
+  读 `.env` 的，顺序反了就读不到刚生成的密钥，用户会卡在「数据源」页存不了凭据
+- **`node_modules` 必须放在包根**：Node 的 `require` 从请求文件所在目录逐级向上找，
+  `collectors/` 的上一级正好是包根。挪进 `app\` 就解析不到 playwright。保持这个布局，
+  `collector_runner.py` 那句依赖自检一行都不用改
+- **node 可执行文件走 `config.resolve_node_executable()`**：显式配置 → 包内
+  `node\node.exe` → PATH 上的 `node`。目标机器不会装 Node
+
+### 采集脚本只能压缩，不能编成字节码（实测结论，别再试）
+
+最初用 bytenode 编 V8 字节码，真跑 fixture 站点当场炸：
+`page.evaluate: Passed function is not well-serializable!`
+
+根因是原理冲突，不是 bytenode 的 bug：**Playwright 的 `page.evaluate(fn)` 靠
+`fn.toString()` 把函数当文本送进浏览器执行**，而 bytenode 把函数源文本替换成等长的
+零宽字符（实测 `(a) => a.querySelectorAll(...)` 的 `toString()` 长度仍是 52，
+内容全是 U+200B）。采集器的 DOM 提取全建立在 `page.evaluate` 上。
+
+**反过来说：只要 `page.evaluate` 要能用，那段 DOM 代码就必须以可读源文本存在于进程里。**
+这对 pkg / SEA / 任何字节码方案一视同仁。所以采集脚本的上限就是 esbuild
+`bundle + minify`（标识符改名、注释格式抹掉、死代码消除），与任何线上 web 应用同级；
+后端 Python 那边是 Nuitka 真编译，不受这条限制。
+
+顺带一个坑：压缩**必须限行宽**（`lineLimit: 120`）。压成一整行时 Node 打栈回溯会把
+那一整行原样吐进 stderr，而 `CollectorRunner` 只取前 500 字符拼进 `error_message` ——
+真正的报错会被挤掉。
+
+验证方式是与源码版跑同一个 fixture 站点逐条比对（指纹 / 作者 / 时间 / 正文 /
+父子关系 / 层级全同），压缩不该改变任何行为。
+
 ## 测试
 
-**288 个测试，必须全部 PASSED**（本机实测 `288 passed in 394s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**305 个测试，必须全部 PASSED**（本机实测 `305 passed in 341s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v

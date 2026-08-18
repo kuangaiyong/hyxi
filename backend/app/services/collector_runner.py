@@ -12,7 +12,7 @@ import logging
 from typing import Any, Dict
 
 from app.collectors.base import Collector
-from app.config import settings
+from app.config import resolve_node_executable, settings
 from app.services import storage
 from app.services.progress_manager import ProgressManager
 
@@ -186,8 +186,10 @@ class CollectorRunner:
             "message": f"启动采集器 {collector.id}（来源 {source_id}）",
         })
 
+        node_exe = resolve_node_executable()
+        logger.info("采集子进程使用 node: %s", node_exe)
         proc = await asyncio.create_subprocess_exec(
-            "node", collector.script_path(), f"--job={job_file}",
+            node_exe, collector.script_path(), f"--job={job_file}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=settings.project_root,

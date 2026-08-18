@@ -4343,3 +4343,142 @@ class TestSessionStateReflectsReality:
 
         assert data["complete"] is True, data.get("stop_reason")
         assert source_service.get_source(source["id"])["last_auth_at"] == before
+
+
+class TestPortablePackagePathsEndToEnd:
+    """便携包的路径解析与首启自举 —— 真文件、真 Fernet 密钥、真环境变量"""
+
+    def setup_method(self):
+        import sys as _sys
+        self.tmpdir = tempfile.mkdtemp()
+        self._sys = _sys
+        self._had_frozen = hasattr(_sys, "frozen")
+        self._old_frozen = getattr(_sys, "frozen", None)
+        self._old_exe = _sys.executable
+
+    def teardown_method(self):
+        if self._had_frozen:
+            self._sys.frozen = self._old_frozen
+        elif hasattr(self._sys, "frozen"):
+            del self._sys.frozen
+        self._sys.executable = self._old_exe
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _freeze_at(self, pkg_root):
+        """假装自己是解压在 pkg_root 里的便携包（PyInstaller 就是这么标记的）"""
+        app_dir = os.path.join(pkg_root, "app")
+        os.makedirs(app_dir, exist_ok=True)
+        self._sys.frozen = True
+        self._sys.executable = os.path.join(app_dir, "hyxi.exe")
+
+    def test_source_mode_paths_are_unchanged(self):
+        """源码态一个字都不能变，否则开发流程和现有数据全部错位"""
+        from app import paths
+
+        assert not paths.is_frozen()
+        assert os.path.isfile(os.path.join(paths.project_root(), "backend", "main.py"))
+        assert paths.data_dir().endswith(os.path.join("backend", "data"))
+
+    def test_frozen_paths_point_at_the_package_root(self):
+        """app/hyxi.exe 的上一级才是包根。这一处错了会连锁带偏数据、密钥、
+        采集脚本和 playwright 四个位置"""
+        from app import paths
+
+        self._freeze_at(self.tmpdir)
+        assert paths.is_frozen()
+        assert paths.project_root() == self.tmpdir
+        # 便携包里没有 backend/ 这一层
+        assert paths.data_dir() == os.path.join(self.tmpdir, "data")
+
+    def test_bundled_node_beats_whatever_is_on_path(self):
+        """目标机器不会装 Node，PATH 上没有 node —— 必须用包里自带的那个"""
+        import app.config as cfg
+
+        node_dir = os.path.join(self.tmpdir, "node")
+        os.makedirs(node_dir)
+        exe = os.path.join(node_dir, "node.exe")
+        with open(exe, "wb") as f:
+            f.write(b"MZ")
+
+        old_root, old_path = cfg.settings.project_root, cfg.settings.node_path
+        try:
+            cfg.settings.project_root = self.tmpdir
+            cfg.settings.node_path = ""
+            assert cfg.resolve_node_executable() == exe
+        finally:
+            cfg.settings.project_root, cfg.settings.node_path = old_root, old_path
+
+    def test_without_a_bundled_node_it_falls_back_to_path(self):
+        """源码态包里没有 node 目录，回退到 PATH，start.ps1 那条路不受影响"""
+        import app.config as cfg
+
+        old_root, old_path = cfg.settings.project_root, cfg.settings.node_path
+        try:
+            cfg.settings.project_root = self.tmpdir
+            cfg.settings.node_path = ""
+            assert cfg.resolve_node_executable() == "node"
+        finally:
+            cfg.settings.project_root, cfg.settings.node_path = old_root, old_path
+
+    def test_explicit_node_path_wins(self):
+        import app.config as cfg
+
+        old_path = cfg.settings.node_path
+        try:
+            cfg.settings.node_path = r"D:\custom\node.exe"
+            assert cfg.resolve_node_executable() == r"D:\custom\node.exe"
+        finally:
+            cfg.settings.node_path = old_path
+
+    def test_first_run_generates_a_usable_fernet_key(self):
+        """缺 SECRET_KEY 时后端会拒绝保存数据源凭据并返回 400（绝不降级成明文落库），
+        用户会卡在「数据源」页且看不出为什么。首启必须把它备好"""
+        from cryptography.fernet import Fernet
+        import run_server
+
+        run_server.ensure_env_file(self.tmpdir)
+
+        env = os.path.join(self.tmpdir, ".env")
+        assert os.path.isfile(env)
+        line = [l for l in open(env, encoding="utf-8").read().splitlines()
+                if l.startswith("TWEAKERS_SECRET_KEY=")]
+        assert len(line) == 1, line
+        key = line[0].split("=", 1)[1]
+        # 真的能拿来加解密，不是随便一串
+        token = Fernet(key.encode()).encrypt(b"hunter2")
+        assert Fernet(key.encode()).decrypt(token) == b"hunter2"
+
+    def test_existing_secret_key_is_never_replaced(self):
+        """换掉 SECRET_KEY 会让已录入的凭据全部解不开 —— 每次启动重生成就是每次清空凭据"""
+        import run_server
+
+        env = os.path.join(self.tmpdir, ".env")
+        with open(env, "w", encoding="utf-8") as f:
+            f.write("TWEAKERS_SECRET_KEY=already-here\n")
+
+        run_server.ensure_env_file(self.tmpdir)
+        assert open(env, encoding="utf-8").read().count("TWEAKERS_SECRET_KEY=") == 1
+        assert "already-here" in open(env, encoding="utf-8").read()
+
+    def test_other_settings_in_env_survive(self):
+        """用户可能自己加了 API_KEY、代理、超时 —— 补一行密钥不能把它们冲掉"""
+        import run_server
+
+        env = os.path.join(self.tmpdir, ".env")
+        with open(env, "w", encoding="utf-8") as f:
+            f.write("TWEAKERS_API_KEY=mine\nTWEAKERS_TASK_TIMEOUT_MINUTES=60\n")
+
+        run_server.ensure_env_file(self.tmpdir)
+        text = open(env, encoding="utf-8").read()
+        assert "TWEAKERS_API_KEY=mine" in text
+        assert "TWEAKERS_TASK_TIMEOUT_MINUTES=60" in text
+        assert "TWEAKERS_SECRET_KEY=" in text
+
+    def test_no_api_key_is_invented(self):
+        """便携包绑 127.0.0.1，按既定姿态「未设 API_KEY 时不鉴权」正合适。
+        自动生成一把反而要求用户先去前端粘贴一次才能用"""
+        import run_server
+
+        run_server.ensure_env_file(self.tmpdir)
+        assert "TWEAKERS_API_KEY" not in open(
+            os.path.join(self.tmpdir, ".env"), encoding="utf-8").read()

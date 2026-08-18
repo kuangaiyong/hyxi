@@ -1,23 +1,28 @@
 """应用配置 - 使用 pydantic-settings 管理"""
 
 import os
-from pathlib import Path
 from typing import List
 from pydantic_settings import BaseSettings
+from app.paths import data_dir as _resolve_data_dir, project_root as _resolve_project_root
+
+# 冻结后 __file__ 不再指向源码树，这两条路径错了会连锁带偏数据、密钥、采集脚本和
+# playwright 四个位置。算法只有 app/paths.py 那一份，别在这里另写
+_ROOT = _resolve_project_root()
+_DATA = _resolve_data_dir()
 
 
 class Settings(BaseSettings):
     """应用全局配置"""
 
     # 项目路径
-    project_root: str = str(Path(__file__).parent.parent.parent)
-    data_dir: str = os.path.join(project_root, "backend", "data")
-    tasks_dir: str = os.path.join(data_dir, "tasks")
-    exports_dir: str = os.path.join(data_dir, "exports")
+    project_root: str = _ROOT
+    data_dir: str = _DATA
+    tasks_dir: str = os.path.join(_DATA, "tasks")
+    exports_dir: str = os.path.join(_DATA, "exports")
 
     # 服务配置
-    # 注意：host/port 目前无任何代码引用（项目不调 uvicorn.run），
-    # 实际监听地址取决于启动命令的 --host。此处默认值仅表达「无鉴权应只绑本机」的意图。
+    # 源码态用命令行 `uvicorn --host` 起，这两项不生效；打包态由 run_server.py
+    # 传给 uvicorn.run()，那时它们才是真配置。默认值表达「无鉴权就只绑本机」的意图。
     host: str = "127.0.0.1"
     port: int = 8000
     cors_origins: List[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
@@ -32,9 +37,26 @@ class Settings(BaseSettings):
     task_timeout_minutes: int = 30
     sse_keepalive_seconds: int = 15
 
+    # 采集子进程用的 node 可执行文件，留空则按 resolve_node_executable() 自动找
+    node_path: str = ""
+
     # env_file 锚死在项目根：写相对路径时 pydantic-settings 按 cwd 找，而文档里的启动命令
     # 先 cd 进 backend，根目录的 .env 会被整个跳过（密钥漏配却毫无提示）
-    model_config = {"env_prefix": "TWEAKERS_", "env_file": os.path.join(project_root, ".env")}
+    model_config = {"env_prefix": "TWEAKERS_", "env_file": os.path.join(_ROOT, ".env")}
 
 
 settings = Settings()
+
+
+def resolve_node_executable() -> str:
+    """采集子进程该用哪个 node。
+
+    便携包的目标机器上不会装 Node，也不会有 PATH 上的 `node` —— 包内自带一个，
+    优先用它。源码态包内没有这个目录，回退到 PATH，开发流程不受影响。
+    """
+    if settings.node_path:
+        return settings.node_path
+    bundled = os.path.join(settings.project_root, "node", "node.exe")
+    if os.path.exists(bundled):
+        return bundled
+    return "node"

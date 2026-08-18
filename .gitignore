@@ -29,6 +29,10 @@ venv/
 
 # 构建产物
 frontend/dist/
+frontend/tsconfig.tsbuildinfo
+# 便携包的中间产物与成品（几百 MB，且 build/out/collectors 是压缩后的采集脚本）
+build/out/
+build/*.log
 
 # IDE
 .vscode/

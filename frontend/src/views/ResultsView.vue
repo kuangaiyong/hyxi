@@ -84,6 +84,10 @@ function visibleReplies(t: { root: PostData; replies: PostData[] }): PostData[] 
   if (openThreads.value.has(threadKey(t.root))) return t.replies
   // 搜索命中的评论必须露出来，否则用户搜到了却看不见
   if (t.replies.some((r) => r.matched)) return t.replies
+  // 老主贴上的新回复同理，而且更该露出来：它正是因为排序被埋才做的这个功能，
+  // 结果又被这里的「只显示前 3 条」截掉，卡片上一个橙色标记都看不到 ——
+  // 用户还得先猜到要点展开
+  if (t.replies.some((r) => r.fresh_reply)) return t.replies
   return t.replies.slice(0, REPLY_PREVIEW)
 }
 
@@ -282,6 +286,13 @@ function getStatusText(): string {
             </button>
             <span class="text-sm text-secondary">#{{ t.root.index }}</span>
             <span v-if="t.replies.length" class="reply-count">💬 {{ t.replies.length }}</span>
+            <!-- 这条主贴很旧，但下面有新回复。按主贴时间倒序排的话它会沉到下面去，
+                 徽标是用户在列表里唯一能看出「这里有新动静」的东西 -->
+            <span
+              v-if="t.root.fresh_reply_count"
+              class="fresh-count-badge"
+              :title="`这个讨论串上有 ${t.root.fresh_reply_count} 条新回复`"
+            >🔥 {{ t.root.fresh_reply_count }} 条新回复</span>
           </header>
 
           <PostContent :post="t.root" :mode="viewMode" @zoom="zoomUrl = $event" />
@@ -292,12 +303,17 @@ function getStatusText(): string {
               v-for="r in visibleReplies(t)"
               :key="threadKey(r)"
               class="reply"
-              :class="{ hit: r.matched }"
+              :class="{ hit: r.matched, fresh: r.fresh_reply }"
               :style="{ marginLeft: Math.min(r.reply_level - 1, 3) * 18 + 'px' }"
             >
               <div class="reply-head">
                 <span class="reply-arrow" aria-hidden="true">↳</span>
                 <span class="reply-user">{{ r.username }}</span>
+                <span
+                  v-if="r.fresh_reply"
+                  class="fresh-tag"
+                  :title="`老主贴上的新回复：主贴发表于 ${r.days_since_root} 天前`"
+                >🔥 新回复 · 主贴 {{ r.days_since_root }} 天前</span>
                 <span class="text-sm text-secondary">{{ postTime(r) }}</span>
                 <span class="grow" />
                 <button
@@ -523,5 +539,29 @@ function getStatusText(): string {
   max-width: 92vw;
   max-height: 92vh;
   object-fit: contain;
+}
+
+/* ===== 老主贴上的新回复 =====
+   颜色与舆情页面板、Excel 那两处一致（#F59E0B / #B45309），三处是同一个视觉信号 */
+.fresh-count-badge {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(245, 158, 11, 0.15);
+  color: #B45309;
+  white-space: nowrap;
+}
+.reply.fresh {
+  border-left: 3px solid #F59E0B;
+  background: rgba(245, 158, 11, 0.07);
+}
+.fresh-tag {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: #FDE68A;
+  color: #92400E;
+  white-space: nowrap;
 }
 </style>

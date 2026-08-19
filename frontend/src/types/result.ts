@@ -14,6 +14,16 @@ export interface PostData {
   images: string[]
   /** 多模态模型读出来的图片内容。纯图帖的全部信息都在这里 */
   image_desc: string
+  /**
+   * 「老主贴上的新回复」：这条回复发在近 N 天内，而它所属主贴早于 N 天。
+   * 列表按主贴时间从新到旧排、评论跟着主贴走，所以这类回复会被排到很后面 ——
+   * 真实数据里有一条今天的回复挂在两个月前的主贴上，排在第 40 多个主贴之后。
+   */
+  fresh_reply: boolean
+  /** 距其主贴的天数，只在 fresh_reply 为真时有意义 */
+  days_since_root: number
+  /** 主贴专用：整棵子树里有几条这样的新回复，用来做徽标 */
+  fresh_reply_count: number
   replies: PostData[]
 }
 

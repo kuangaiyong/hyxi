@@ -14,7 +14,8 @@ from app.services.excel_service import (
     ExcelService, EXPORT_COLUMNS, SENTIMENT_CN, UNANALYZED,
 )
 from app.services.post_tree import (
-    build_tree, normalize_timestamp, order_by_thread, post_key, sort_time,
+    FRESH_DAYS_CHOICES, FRESH_DAYS_DEFAULT, baseline_time, build_tree,
+    mark_fresh_replies, normalize_timestamp, order_by_thread, post_key, sort_time,
 )
 from app.services.sentiment_service import is_analyzable
 from app.services.orchestrator import orchestrator, load_task_posts
@@ -84,8 +85,26 @@ def _attachment(name: str) -> dict:
     return {"Content-Disposition": f"attachment; filename*=utf-8''{quote(name)}"}
 
 
-def _to_post_data(post: dict, index: int, names: dict, matched: bool = False) -> PostData:
+def _validate_fresh_days(days: int) -> int:
+    """窗口必须是封闭集合里的值。
+
+    这个数字会进 Excel 的文案和概览统计，放任调用方传任意整数等于让它决定报告口径 ——
+    两份报告就再也对不上了。非法值直接 400，不静默回落到默认值：那样用户以为自己
+    换了窗口，实际看到的还是 7 天的结果。
+    """
+    if days not in FRESH_DAYS_CHOICES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"fresh_days 只能是 {'/'.join(str(d) for d in FRESH_DAYS_CHOICES)} 之一",
+        )
+    return days
+
+
+def _to_post_data(post: dict, index: int, names: dict, matched: bool = False,
+                  fresh_days_gap: int = None) -> PostData:
     return PostData(
+        fresh_reply=fresh_days_gap is not None,
+        days_since_root=fresh_days_gap or 0,
         index=index,
         username=post.get("username", ""),
         timestamp=normalize_timestamp(post.get("timestamp", "")),
@@ -109,6 +128,7 @@ async def get_posts(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     search: str = Query("", description="搜索关键词（匹配用户名、原文、翻译）"),
+    fresh_days: int = Query(FRESH_DAYS_DEFAULT, description="「老帖新回复」的时间窗口（天）"),
 ):
     """获取分页帖子结果，支持全文搜索。
 
@@ -164,13 +184,22 @@ async def get_posts(
     index_of = {post_key(p): i + 1 for i, p in enumerate(posts)}
 
     names = _source_names(task)
+    # 标记基于**全量** posts 而不是本页 —— 基准是数据集里最新的帖子时间，
+    # 只拿本页算的话，翻到第 3 页时基准会变成那一页最新的帖子，标出来的东西
+    # 每页都不一样
+    fresh = mark_fresh_replies(posts, _validate_fresh_days(fresh_days))
 
     def build(post) -> PostData:
         item = _to_post_data(
             post, index_of.get(post_key(post), 0), names,
             matched=bool(hit_keys) and post_key(post) in hit_keys,
+            fresh_days_gap=fresh.get(post_key(post)),
         )
         item.replies = [build(c) for c in children.get(post_key(post), [])]
+        # 整棵子树里有几条新回复，主贴上挂个数好做徽标（嵌套回复也算进来）
+        item.fresh_reply_count = sum(
+            (1 if r.fresh_reply else 0) + r.fresh_reply_count for r in item.replies
+        )
         return item
 
     items = [build(r) for r in page_roots]
@@ -247,7 +276,8 @@ def _task_sentiment(task_id: str, posts: list) -> dict:
     return data
 
 
-def _export_rows(task: dict, posts: list, results: list) -> list:
+def _export_rows(task: dict, posts: list, results: list,
+                 fresh_days: int = FRESH_DAYS_DEFAULT) -> list:
     """把舆情结论贴到帖子上，再按「主贴 → 它的评论 → 下一主贴」、主贴时间从新到旧排序。
 
     `results[i]` 对齐的是**扁平数组**的第 i 条（下标来自 `enumerate(all_posts)`），
@@ -260,11 +290,19 @@ def _export_rows(task: dict, posts: list, results: list) -> list:
         if i < len(results) and results[i]
     }
     names = _source_names(task)
+    # 标记基于**全量 posts**，且必须在 order_by_thread 之前算 —— 判据看的是
+    # 「回复 vs 它的顶层主贴」的时间关系，与呈现次序无关
+    fresh = mark_fresh_replies(posts, fresh_days)
     rows = []
     for i, p in enumerate(order_by_thread(posts), 1):
         r = by_key.get(post_key(p)) or {}
         sid = p.get("source", "")
+        gap = fresh.get(post_key(p))
         rows.append({
+            # 「老主贴上的新回复」的提醒文案。排序把这类回复埋到了很后面，
+            # 这一列是用户在明细表里唯一能扫到它的东西
+            "fresh": f"🔥 新回复（主贴 {gap} 天前）" if gap is not None else "",
+            "fresh_gap": gap if gap is not None else -1,
             "index": i,
             "source": names.get(sid, sid),
             "level": int(p.get("reply_level", 0) or 0),
@@ -285,9 +323,11 @@ def _export_rows(task: dict, posts: list, results: list) -> list:
     return rows
 
 
-def _export_meta(task: dict, rows: list, sentiment: dict) -> dict:
+def _export_meta(task: dict, rows: list, sentiment: dict, posts: list = None,
+                 fresh_days: int = FRESH_DAYS_DEFAULT) -> dict:
     """概览表要用的任务级信息。时间区间同样排序取极值，不能取首尾（见 _build_stats）"""
     stamps = sorted(r["timestamp"] for r in rows if r["timestamp"])
+    baseline = baseline_time(posts or [])
     users = Counter(r["username"] for r in rows if r["username"])
     return {
         "description": task.get("description", ""),
@@ -300,11 +340,19 @@ def _export_meta(task: dict, rows: list, sentiment: dict) -> dict:
         "time_end": stamps[-1] if stamps else "",
         "summary": sentiment.get("summary") or {},
         "top_users": users.most_common(15),
+        # 窗口和基准**必须写进报告**：不写的话「这次和上次为什么不一样」无从解释
+        "fresh_days": fresh_days,
+        "fresh_count": sum(1 for r in rows if r.get("fresh")),
+        "fresh_baseline": f"{baseline:%Y-%m-%d %H:%M}" if baseline else "",
     }
 
 
 @router.get("/export")
-async def export_report(task_id: str, format: str = Query("xlsx")):
+async def export_report(
+    task_id: str,
+    format: str = Query("xlsx"),
+    fresh_days: int = Query(FRESH_DAYS_DEFAULT, description="「老帖新回复」的时间窗口（天）"),
+):
     """导出原文 + 译文 + 舆情分析的单一报告。全站唯一的导出口。
 
     舆情没跑过照样能导，情感列填「未分析」—— 只翻译不分析的任务否则永远导不出东西。
@@ -320,8 +368,9 @@ async def export_report(task_id: str, format: str = Query("xlsx")):
     if not posts:
         raise HTTPException(status_code=404, detail="无帖子数据")
 
+    days = _validate_fresh_days(fresh_days)
     sentiment = _task_sentiment(task_id, posts)
-    rows = _export_rows(task, posts, sentiment.get("results") or [])
+    rows = _export_rows(task, posts, sentiment.get("results") or [], days)
 
     if fmt == "csv":
         output = StringIO()
@@ -338,7 +387,7 @@ async def export_report(task_id: str, format: str = Query("xlsx")):
         media_type = "text/csv; charset=utf-8"
     else:
         content = ExcelService.build_export(
-            rows, _export_meta(task, rows, sentiment), EXPORT_COLUMNS
+            rows, _export_meta(task, rows, sentiment, posts, days), EXPORT_COLUMNS
         )
         media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 

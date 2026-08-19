@@ -274,10 +274,10 @@ DELETE /api/v1/tasks/{id}             取消运行中 / force=true 删除已结�
 POST   /api/v1/tasks/{id}/retry       重试终态任务（复用原描述创建新任务，返回新 id）
 GET    /api/v1/tasks/{id}/events      SSE 实时进度流
 
-GET    /api/v1/tasks/{id}/posts        帖子查询（**按主贴分页**，评论在 replies 里，**主贴按时间倒序**）
+GET    /api/v1/tasks/{id}/posts        帖子查询（**按主贴分页**，评论在 replies 里，**主贴按时间倒序**；?fresh_days=3|7|14 标出老帖新回复）
 GET    /api/v1/tasks/{id}/posts/{idx}  单条帖子详情（0-based）
 GET    /api/v1/tasks/{id}/stats        任务统计
-GET    /api/v1/tasks/{id}/export       **唯一的导出口**（?format=xlsx|csv）
+GET    /api/v1/tasks/{id}/export       **唯一的导出口**（?format=xlsx|csv&fresh_days=3|7|14）
 
 POST   /api/v1/tasks/{id}/sentiment           触发舆情分析（增量；?force=true 忽略 sentiment_at 全量重跑）
 GET    /api/v1/tasks/{id}/sentiment           获取舆情结果（只读本任务）
@@ -477,6 +477,32 @@ Excel 本身也没有「点图放大」的原生行为。所以跳转入口放�
 路径解析复用 `vision_service.media_path()`（含 realpath 包含性校验）—— `images` 来自采集脚本，
 而 media 目录之外就是数据库和明文密钥。
 
+## 老帖新回复（避免被时间倒序埋掉）
+
+出口一律「主贴按发表时间从新到旧、评论跟着自己的主贴走」（见上一节），副作用是
+**今天发在两个月前主贴上的回复，会被排到两个月前的位置去**。真实数据实测：163 行的
+报告里，4 条这样的回复落在 #68 / #133 / #134 / #147，三条都在报告底部。
+
+判据只有一份，在 `post_tree.mark_fresh_replies()`，理由同 `order_by_thread()` ——
+导出、结果页、舆情页三个出口共用一条规则，各写各的迟早分家。
+
+- **基准是数据集里最新的帖子时间**（`baseline_time()`），不是 `datetime.now()`。
+  按 now 算的话，隔一阵子没采集、或翻看几个月前的历史报告时**一条都不会亮**，
+  而那份报告当初想标出来的东西并没有变。报告要自洽、可复现
+- **窗口 `FRESH_DAYS_CHOICES = (3, 7, 14)` 是封闭集合**，`_validate_fresh_days()` 拦非法值
+  并返回 400，**不静默回落到默认值** —— 那样用户以为自己换了窗口，实际看到的还是 7 天
+- **三条不标的边界**：主贴也在窗口内（整串都新，本来就排在最前面）；回复或主贴的时间
+  读不出来（早期采集故意留空，「实际很新」是推测，宁可漏标）；父贴不在本批数据里
+  （`build_tree()` 已把它按主贴处理，它就不是回复）
+- Excel 新增「更新提醒」列 + 命中行整行暖色（`FRESH_FILL` **优先于** `REPLY_FILL`，
+  两个底色叠在一起就都看不出来了），并新增工作表「近期新回复」，顺序是
+  **概览 → 近期新回复 → 帖子明细 → 配图**（工作簿默认停在第一张，第二张最容易被看到）
+- **聚焦表把主贴完整带上**：一条「你能通过 HA 控制它吗」脱离主贴根本读不懂在说什么，
+  用户不该为了看懂一条新回复再去别处翻主贴。但**不带该主贴的其他旧回复** —— 热帖十几条
+  全搬过来就长得没法一口气读完，末尾给一条跳转即可
+- **明细表的排序一个字没动**。聚焦是新增入口而不是重排 —— 两个出口共用一条排序规则
+  这条既定约束不能破
+
 ## 便携包交付（给不装 Python / Node 的使用者）
 
 `build\build.ps1` 出一个免安装 ZIP：前端构建 → 采集脚本打包压缩 → Nuitka 编译后端 →
@@ -528,7 +554,7 @@ Excel 本身也没有「点图放大」的原生行为。所以跳转入口放�
 
 ## 测试
 
-**306 个测试，必须全部 PASSED**（本机实测 `306 passed in 454s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**329 个测试，必须全部 PASSED**（本机实测 `329 passed in 353s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v

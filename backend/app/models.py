@@ -163,6 +163,13 @@ class PostData(BaseModel):
     # 多模态模型读出来的图片内容。纯图帖的全部信息都在这里，页面上不给出来的话
     # 用户会看到一条「有结论、没内容」的帖子，无从判断结论是怎么来的
     image_desc: str = ""
+    # 「老主贴上的新回复」：这条回复发在近 N 天内，而它所属主贴早于 N 天。
+    # 出口按主贴时间从新到旧排、评论跟着主贴走，所以这类回复会被排到很后面 ——
+    # 标出来才看得见（判据见 post_tree.mark_fresh_replies）
+    fresh_reply: bool = False
+    days_since_root: int = 0   # 距其主贴的天数，只在 fresh_reply 为真时有意义
+    # 主贴专用：它名下有几条这样的新回复，供列表页做徽标
+    fresh_reply_count: int = 0
     replies: List["PostData"] = Field(default_factory=list)
 
 

@@ -1702,6 +1702,8 @@ def _export_row(**over):
         "index": 1, "source": "论坛来源", "level": 0, "username": "u",
         "timestamp": "2026-05-22 17:06", "content": "origineel", "translation": "原文",
         "image_desc": "", "images": [],
+        # 「老帖新回复」的提醒；不命中就是空串（fresh_gap 只在命中时有意义）
+        "fresh": "", "fresh_gap": -1,
         "sentiment": "中立", "intensity": 2, "reason": "询问", "dimensions": "",
     }
     row.update(over)
@@ -1714,6 +1716,8 @@ def _export_meta(**over):
         "exported_at": "2026-08-05 11:00:00", "total": 1, "replies": 0, "analyzed": 1,
         "time_start": "2026-05-22 17:06", "time_end": "2026-05-22 17:06",
         "summary": {"top_dimensions": []}, "top_users": [],
+        # 窗口与基准会进概览表；不给的话那一行会显示成「近  天老帖新回复」
+        "fresh_days": 7, "fresh_count": 0, "fresh_baseline": "",
     }
     meta.update(over)
     return meta
@@ -4511,3 +4515,370 @@ class TestPortablePackagePathsEndToEnd:
         run_server.ensure_env_file(self.tmpdir)
         assert "TWEAKERS_API_KEY" not in open(
             os.path.join(self.tmpdir, ".env"), encoding="utf-8").read()
+
+
+class TestFreshReplyDetectionEndToEnd:
+    """「老主贴上的新回复」判据。
+
+    明细按主贴时间从新到旧排，评论跟着自己的主贴走 —— 于是今天发在两个月前主贴上的
+    回复，会被排到两个月前的位置去，用户翻不到。真实数据里有一条 08-15 的回复挂在
+    06-06 的主贴上，排在第 40 多个主贴之后。
+    """
+
+    def _post(self, fp, ts, parent=None, source="src_a", **kw):
+        return {"source": source, "fingerprint": fp, "parent_fingerprint": parent,
+                "username": fp, "content": fp, "timestamp": ts, **kw}
+
+    def _mark(self, posts, days=7):
+        from app.services.post_tree import mark_fresh_replies
+        return mark_fresh_replies(posts, days)
+
+    def test_new_reply_on_an_old_root_is_marked(self):
+        """要抓的就是这一类：主贴很旧、回复很新，排序把它埋了"""
+        from app.services.post_tree import post_key
+
+        root = self._post("root", "06-06-2026 10:00")
+        reply = self._post("r1", "15-08-2026 09:00", parent="root")
+        newest = self._post("other", "19-08-2026 12:00")
+
+        marked = self._mark([root, reply, newest])
+        assert post_key(reply) in marked, marked
+        # 距主贴的天数要能算对，报告上要显示「主贴 69 天前」。
+        # 06-06 10:00 → 15-08 09:00 差 69 天 23 小时，向下取整 69 —— 与真实数据里
+        # 那条（08-15 的回复挂在 06-06 的主贴上）实测的天数一致
+        assert marked[post_key(reply)] == 69, marked
+
+    def test_reply_on_a_root_that_is_also_new_is_not_marked(self):
+        """整串都是新的 —— 它本来就排在最前面，没被埋，标了反而稀释重点"""
+        from app.services.post_tree import post_key
+
+        root = self._post("root", "18-08-2026 10:00")
+        reply = self._post("r1", "19-08-2026 09:00", parent="root")
+        assert post_key(reply) not in self._mark([root, reply])
+
+    def test_old_reply_on_an_old_root_is_not_marked(self):
+        from app.services.post_tree import post_key
+
+        root = self._post("root", "06-06-2026 10:00")
+        reply = self._post("r1", "07-06-2026 09:00", parent="root")
+        newest = self._post("other", "19-08-2026 12:00")
+        assert post_key(reply) not in self._mark([root, reply, newest])
+
+    def test_the_root_itself_is_never_marked(self):
+        """只标回复。主贴新不新，排序已经表达了"""
+        from app.services.post_tree import post_key
+
+        root = self._post("root", "19-08-2026 10:00")
+        old = self._post("old", "06-06-2026 10:00")
+        marked = self._mark([root, old])
+        assert post_key(root) not in marked and post_key(old) not in marked
+
+    def test_missing_timestamps_are_never_marked(self):
+        """早期采集读不到 tooltip 时是**故意**留空的（写相对时间会污染指纹）。
+
+        这批帖子实际很新，但那是推测 —— 宁可漏标，也不能凭空标一条出来。
+        """
+        from app.services.post_tree import post_key
+
+        root = self._post("root", "06-06-2026 10:00")
+        no_time = self._post("r1", "", parent="root")
+        rootless_time = self._post("root2", "")
+        r2 = self._post("r2", "19-08-2026 09:00", parent="root2")
+        newest = self._post("other", "19-08-2026 12:00")
+
+        marked = self._mark([root, no_time, rootless_time, r2, newest])
+        assert post_key(no_time) not in marked, "回复没有时间也被标了"
+        assert post_key(r2) not in marked, "主贴没有时间，无从判断它算不算老"
+
+    def test_orphan_reply_is_not_marked(self):
+        """父贴不在本批数据里的评论，build_tree 已按主贴处理 —— 它就不是回复了"""
+        from app.services.post_tree import post_key
+
+        orphan = self._post("r1", "19-08-2026 09:00", parent="not-here")
+        newest = self._post("other", "19-08-2026 12:00")
+        assert post_key(orphan) not in self._mark([orphan, newest])
+
+    def test_same_fingerprint_across_sources_does_not_cross_wire(self):
+        """指纹不含来源，只用 fingerprint 判会让两个平台的帖子互相顶替"""
+        from app.services.post_tree import post_key
+
+        a_root = self._post("root", "06-06-2026 10:00", source="src_a")
+        a_reply = self._post("r1", "15-08-2026 09:00", parent="root", source="src_a")
+        b_root = self._post("root", "18-08-2026 10:00", source="src_b")
+        b_reply = self._post("r1", "19-08-2026 09:00", parent="root", source="src_b")
+
+        marked = self._mark([a_root, a_reply, b_root, b_reply])
+        assert post_key(a_reply) in marked, "src_a 的老帖新回复没标出来"
+        assert post_key(b_reply) not in marked, "src_b 整串都是新的，不该被 src_a 带标"
+
+    def test_baseline_is_the_newest_post_not_now(self):
+        """基准取数据集里最新的帖子，不是 datetime.now()。
+
+        按 now 算的话，隔一阵子没采集、或者翻看几个月前的历史报告时，**一条都不会亮** ——
+        而那份报告当初想标出来的东西并没有变。报告要自洽、可复现。
+        """
+        from app.services.post_tree import post_key
+
+        # 整批都是两年前的数据，按 now 算没有任何一条落在 7 天窗口里
+        root = self._post("root", "01-03-2024 10:00")
+        reply = self._post("r1", "20-08-2024 09:00", parent="root")
+        newest = self._post("other", "22-08-2024 12:00")
+
+        marked = self._mark([root, reply, newest])
+        assert post_key(reply) in marked, "基准用了当前时间，历史数据一条都标不出来"
+
+    def test_window_size_changes_what_is_marked(self):
+        from app.services.post_tree import post_key
+
+        root = self._post("root", "06-06-2026 10:00")
+        r_recent = self._post("r1", "15-08-2026 09:00", parent="root")   # 距基准 4 天
+        r_older = self._post("r2", "07-08-2026 09:00", parent="root")    # 距基准 12 天
+        newest = self._post("other", "19-08-2026 12:00")
+        posts = [root, r_recent, r_older, newest]
+
+        assert post_key(r_recent) in self._mark(posts, 7)
+        assert post_key(r_older) not in self._mark(posts, 7)
+        assert post_key(r_older) in self._mark(posts, 14)
+
+    def test_all_timestamps_missing_yields_nothing(self):
+        """没有任何可用时间时不该抛异常，也不该标出东西来"""
+        posts = [self._post("root", ""), self._post("r1", "", parent="root")]
+        assert self._mark(posts) == {}
+
+    def test_real_data_matches_the_measured_counts(self):
+        """拿真实库跑一遍，钉住实测数字。
+
+        这批数据是这个需求的由来：7 天窗口下 4 条，其中一条隔了 69 天。
+        """
+        import sqlite3
+        from app.services.post_tree import post_key
+
+        db = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "data", "hyxi.db")
+        if not os.path.isfile(db):
+            import pytest
+            pytest.skip("本机没有真实库")
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        posts = [dict(r) for r in conn.execute(
+            "SELECT source_id AS source, fingerprint, parent_fingerprint, username, "
+            "timestamp, content FROM posts ORDER BY seq")]
+        conn.close()
+        if len(posts) < 100:
+            import pytest
+            pytest.skip("真实库里数据太少，钉不住数字")
+
+        assert len(self._mark(posts, 7)) >= 1, "真实数据里一条老帖新回复都没找到"
+        # 窗口越大命中越多，绝不会反过来
+        assert len(self._mark(posts, 3)) <= len(self._mark(posts, 7)) <= len(self._mark(posts, 14))
+
+
+class TestFreshReplyExportEndToEnd:
+    """「老帖新回复」在导出报告里的呈现：明细列 + 高亮 + 独立工作表 + 双向跳转。
+
+    真 openpyxl 输出、真 load_workbook 回读。
+    """
+
+    def _rows(self):
+        """一份已按 order_by_thread 排好的明细：两个主贴，第二个带一条新回复"""
+        def row(i, level, user, ts, fresh="", gap=-1, **kw):
+            base = {
+                "index": i, "source": "Facebook", "level": level, "username": user,
+                "timestamp": ts, "fresh": fresh, "fresh_gap": gap,
+                "content": f"{user} 的原文", "translation": f"{user} 的译文",
+                "image_desc": "", "images": [], "sentiment": "中立", "intensity": 3,
+                "reason": "", "dimensions": "",
+            }
+            base.update(kw)
+            return base
+
+        return [
+            row(1, 0, "新主贴作者", "2026-08-18 10:00"),
+            row(2, 1, "新主贴的回复", "2026-08-19 09:00"),
+            row(3, 0, "老主贴作者", "2026-06-06 19:57"),
+            row(4, 1, "老回复", "2026-06-07 10:00"),
+            row(5, 1, "新回复作者", "2026-08-15 15:50", fresh="🔥 新回复（主贴 69 天前）", gap=69),
+        ]
+
+    def _meta(self, **kw):
+        base = {
+            "description": "d", "sources": "Facebook", "exported_at": "2026-08-19 10:00",
+            "total": 5, "replies": 3, "analyzed": 5, "time_start": "", "time_end": "",
+            "summary": {}, "top_users": [],
+            "fresh_days": 7, "fresh_count": 1, "fresh_baseline": "2026-08-19 04:35",
+        }
+        base.update(kw)
+        return base
+
+    def _book(self, rows=None, meta=None):
+        from openpyxl import load_workbook
+        from app.services.excel_service import ExcelService, EXPORT_COLUMNS
+
+        blob = ExcelService.build_export(rows or self._rows(), meta or self._meta(),
+                                         EXPORT_COLUMNS)
+        return load_workbook(BytesIO(blob))
+
+    def test_detail_sheet_has_the_reminder_column(self):
+        from app.services.excel_service import EXPORT_COLUMNS, DETAIL_SHEET
+
+        ws = self._book()[DETAIL_SHEET]
+        labels = [c.value for c in ws[1]]
+        assert "更新提醒" in labels, labels
+        col = labels.index("更新提醒") + 1
+        # 第 5 行数据 = 表里第 6 行
+        assert "69 天前" in str(ws.cell(row=6, column=col).value), ws.cell(row=6, column=col).value
+        assert not ws.cell(row=2, column=col).value, "普通行不该有提醒"
+
+    def test_fresh_row_is_highlighted_and_wins_over_the_reply_fill(self):
+        """命中行整行暖色。两个底色叠在一起就都看不出来了 —— 命中时只上暖色"""
+        from app.services.excel_service import DETAIL_SHEET, FRESH_FILL, REPLY_FILL
+
+        ws = self._book()[DETAIL_SHEET]
+        fresh_cell = ws.cell(row=6, column=1)   # 新回复那行
+        plain_reply = ws.cell(row=5, column=1)  # 老回复那行
+        assert fresh_cell.fill.start_color.rgb[-6:] == FRESH_FILL.start_color.rgb[-6:]
+        assert plain_reply.fill.start_color.rgb[-6:] == REPLY_FILL.start_color.rgb[-6:]
+
+    def test_focus_sheet_exists_and_sits_right_after_the_overview(self):
+        """工作簿默认停在第一张，第二张最容易被看到 —— 这正是要第一时间关注的东西"""
+        from app.services.excel_service import FRESH_SHEET, DETAIL_SHEET
+
+        names = self._book().sheetnames
+        assert names[0] == "概览"
+        assert names[1] == FRESH_SHEET, names
+        assert names.index(FRESH_SHEET) < names.index(DETAIL_SHEET)
+
+    def test_focus_sheet_brings_the_root_post_along(self):
+        """脱离主贴，一条「你能通过 HA 控制它吗」根本读不懂在说什么。
+
+        用户不该为了看懂一条新回复再去别处翻主贴 —— 这是这张表存在的理由。
+        """
+        from app.services.excel_service import FRESH_SHEET
+
+        ws = self._book()[FRESH_SHEET]
+        text = "\n".join(str(c.value or "") for row in ws.iter_rows() for c in row)
+        assert "老主贴作者" in text, "主贴作者没带进来"
+        assert "老主贴作者 的原文" in text, "主贴原文没带进来"
+        assert "老主贴作者 的译文" in text, "主贴译文没带进来"
+        assert "新回复作者" in text and "主贴 69 天前" in text
+        # 不相干的那个新主贴串不该混进来
+        assert "新主贴作者" not in text, "整串都是新的，不该进聚焦区"
+
+    def test_focus_sheet_does_not_drag_in_the_older_replies(self):
+        """热帖有十几条旧回复，全搬过来就长得没法一口气读完 —— 给跳转就够了"""
+        from app.services.excel_service import FRESH_SHEET, DETAIL_SHEET
+
+        ws = self._book()[FRESH_SHEET]
+        text = "\n".join(str(c.value or "") for row in ws.iter_rows() for c in row)
+        assert "老回复 的原文" not in text, "旧回复被搬进聚焦区了"
+        assert "另有 1 条较早回复" in text, text[:400]
+        assert DETAIL_SHEET in text
+
+    def test_links_between_the_two_sheets_use_location_not_target(self):
+        """内部链接必须走 location。给 target 会被当成外部关系，Excel 打开报「需要修复」"""
+        from app.services.excel_service import FRESH_SHEET, DETAIL_SHEET
+
+        wb = self._book()
+        fresh = wb[FRESH_SHEET]
+        links = [c.hyperlink for row in fresh.iter_rows() for c in row if c.hyperlink]
+        assert links, "聚焦表里一个跳转都没有"
+        for link in links:
+            assert link.location and DETAIL_SHEET in link.location, link.location
+            assert not link.target, "用了 target，Excel 会报需要修复"
+
+        # 明细表那一侧也要能跳回来
+        detail = wb[DETAIL_SHEET]
+        back = [c.hyperlink for row in detail.iter_rows() for c in row
+                if c.hyperlink and FRESH_SHEET in (c.hyperlink.location or "")]
+        assert back, "明细表的更新提醒没有跳回聚焦表的链接"
+
+    def test_detail_link_points_at_the_thread_block_not_the_reply_row(self):
+        """跳到回复自己那一行没有意义 —— 那一段的价值就在于主贴也在场"""
+        from app.services.excel_service import FRESH_SHEET, DETAIL_SHEET
+
+        wb = self._book()
+        detail, fresh = wb[DETAIL_SHEET], wb[FRESH_SHEET]
+        target = None
+        for row in detail.iter_rows():
+            for c in row:
+                if c.hyperlink and FRESH_SHEET in (c.hyperlink.location or ""):
+                    target = int(c.hyperlink.location.split("!A")[1])
+        assert target, "没找到指向聚焦表的链接"
+        assert "主贴" in str(fresh.cell(row=target, column=1).value), \
+            fresh.cell(row=target, column=1).value
+
+    def test_no_fresh_reply_means_no_focus_sheet(self):
+        """留一张只有标题的空表比没有更费解（同「配图」表的既有做法）"""
+        from app.services.excel_service import FRESH_SHEET
+
+        rows = [r for r in self._rows() if not r["fresh"]]
+        names = self._book(rows, self._meta(fresh_count=0)).sheetnames
+        assert FRESH_SHEET not in names, names
+
+    def test_overview_records_the_window_and_the_baseline(self):
+        """不写的话「这次和上次为什么不一样」无从解释"""
+        ws = self._book()["概览"]
+        text = "\n".join(str(c.value or "") for row in ws.iter_rows() for c in row)
+        assert "近 7 天老帖新回复" in text, text[:500]
+        assert "2026-08-19 04:35" in text, "基准时间没写进报告"
+
+
+class TestResultsViewRevealsFreshRepliesEndToEnd:
+    """结果页默认只展开每个主贴的前 3 条回复。
+
+    「老帖新回复」正是因为排序被埋才做的功能，结果又被这条预览规则截掉的话，
+    卡片上一个橙色标记都看不到 —— 用户还得先猜到要点展开。搜索命中早就为同一个
+    问题开了豁免，这里必须一样。
+    """
+
+    def _visible(self, replies):
+        """把 ResultsView.vue 里的 visibleReplies 抠出来用真 Node 跑一遍。
+
+        不抄一份实现进测试 —— 那样测的是抄件，源文件改了这里照样绿。
+        """
+        import json
+        import re
+        import subprocess
+
+        vue = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "frontend", "src", "views", "ResultsView.vue")
+        src = open(vue, encoding="utf-8").read()
+        body = re.search(
+            r"function visibleReplies\(t: \{[^}]*\}\): PostData\[\] \{(.*?)\n\}",
+            src, re.S)
+        assert body, "visibleReplies 没找到，函数签名改了就要同步这里"
+        js = body.group(1)
+        # 去掉 TS 标注与外部依赖，只保留判据本身
+        js = js.replace("openThreads.value.has(threadKey(t.root))", "false")
+        script = (
+            "const REPLY_PREVIEW = 3;\n"
+            "function visibleReplies(t) {" + js + "\n}\n"
+            "const t = { root: {}, replies: " + json.dumps(replies) + " };\n"
+            "console.log(JSON.stringify(visibleReplies(t).length));"
+        )
+        out = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        assert out.returncode == 0, out.stderr
+        return json.loads(out.stdout.strip())
+
+    def _replies(self, n, fresh_at=None, matched_at=None):
+        return [{"matched": i == matched_at, "fresh_reply": i == fresh_at} for i in range(n)]
+
+    def test_long_thread_is_truncated_by_default(self):
+        if not _HAS_NODE:
+            import pytest
+            pytest.skip("未安装 node")
+        assert self._visible(self._replies(10)) == 3
+
+    def test_a_fresh_reply_beyond_the_preview_still_shows(self):
+        """第 9 条才是新回复时，默认状态下也必须露出来"""
+        if not _HAS_NODE:
+            import pytest
+            pytest.skip("未安装 node")
+        assert self._visible(self._replies(10, fresh_at=8)) == 10
+
+    def test_search_hit_exemption_still_works(self):
+        if not _HAS_NODE:
+            import pytest
+            pytest.skip("未安装 node")
+        assert self._visible(self._replies(10, matched_at=8)) == 10

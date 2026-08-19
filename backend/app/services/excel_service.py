@@ -54,6 +54,10 @@ EXPORT_HEADER_FONT = Font(name=FONT_NAME, size=11, bold=True, color="FFFFFF")
 EXPORT_LABEL_FONT = Font(name=FONT_NAME, size=10, bold=True)
 EXPORT_BODY_FONT = Font(name=FONT_NAME, size=10)
 REPLY_FILL = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+# 「老主贴上的新回复」整行上暖色。**优先级高于 REPLY_FILL** —— 两个底色叠在一起
+# 就都看不出来了，命中时只上这一个
+FRESH_FILL = PatternFill(start_color="FFF3E0", end_color="FFF3E0", fill_type="solid")
+FRESH_FONT = Font(name=FONT_NAME, size=10, bold=True, color="B45309")
 
 # 浅底深字。前端那三个饱和色（#10B981 等）在 Excel 里是整格上色，打印和浅色主题下都刺眼
 SENTIMENT_STYLE = {
@@ -63,7 +67,7 @@ SENTIMENT_STYLE = {
 }
 
 EXPORT_WIDTHS = {
-    "index": 6, "source": 16, "level": 6, "username": 14, "timestamp": 17,
+    "index": 6, "source": 16, "level": 6, "username": 14, "timestamp": 17, "fresh": 22,
     "content": 50, "translation": 50, "image_desc": 34, "images": 24,
     "sentiment": 8, "intensity": 11, "reason": 40, "dimensions": 24,
 }
@@ -76,6 +80,10 @@ EXPORT_CENTERED = {"index", "level", "timestamp", "sentiment", "intensity"}
 EXPORT_COLUMNS = [
     ("index", "序号"), ("source", "来源"), ("level", "层级"),
     ("username", "用户名"), ("timestamp", "发布时间"),
+    # 「老主贴上的新回复」的提醒。排序按主贴时间从新到旧，这类回复因此被排到了
+    # 很后面（真实数据里 163 行的报告，4 条命中落在 #68/#133/#134/#147），
+    # 这一列是用户在明细表里唯一能扫到它们的东西
+    ("fresh", "更新提醒"),
     ("content", "原文"), ("translation", "中文翻译"),
     ("image_desc", "图片描述"), ("images", "配图"),
     ("sentiment", "情感"), ("intensity", "强度"),
@@ -88,6 +96,7 @@ EXPORT_COLUMNS = [
 # Excel 打开时弹「需要修复」，比报错还难查
 DETAIL_SHEET = "帖子明细"
 IMAGE_SHEET = "配图"
+FRESH_SHEET = "近期新回复"
 THUMB_MAX_PX = 150   # 明细行里的缩略图，长边上限
 LARGE_MAX_PX = 700   # 配图表里的大图，长边上限
 PX_TO_POINT = 0.75   # Excel 行高单位是磅，96 DPI 下 1px = 0.75pt
@@ -298,10 +307,21 @@ class ExcelService:
         """
         wb = Workbook()
         ExcelService._write_overview(wb.active, rows, meta)
+        resolved = ExcelService._resolve_images(rows) if PILImage else {}
+
+        # 「近期新回复」排在概览之后、明细之前：工作簿默认停在第一张，第二张最容易被
+        # 看到，而这正是「要第一时间关注」的东西。没有命中就不建这张表 ——
+        # 留一张只有标题的空表比没有更费解（同 _write_image_sheet 的既有做法）
+        threads = ExcelService._fresh_threads(rows)
+        fresh_anchors = {}
+        if threads:
+            fresh_anchors = ExcelService._write_fresh_sheet(
+                wb.create_sheet(FRESH_SHEET), rows, threads, meta, resolved
+            )
+
         details = wb.create_sheet(DETAIL_SHEET)
         # 配图表要先排好版，明细表的超链接得指向具体行号；但工作表顺序必须是
-        # 概览 → 明细 → 配图，所以先建明细的空表、再建配图表
-        resolved = ExcelService._resolve_images(rows) if PILImage else {}
+        # 概览 → 近期新回复 → 明细 → 配图，所以先建明细的空表、再建配图表
         anchors = {}
         if resolved:
             sheet = wb.create_sheet(IMAGE_SHEET)
@@ -309,7 +329,7 @@ class ExcelService:
             if not anchors:
                 # 文件都在、但一张都读不出来（图坏了）。留一张只有标题的空表更费解
                 wb.remove(sheet)
-        ExcelService._write_details(details, rows, columns, resolved, anchors)
+        ExcelService._write_details(details, rows, columns, resolved, anchors, fresh_anchors)
         buf = BytesIO()
         wb.save(buf)
         return buf.getvalue()
@@ -417,6 +437,139 @@ class ExcelService:
             row += 1
         return anchors
 
+    # ===== 近期新回复：老主贴上的新动静，单独成表 =====
+    #
+    # 出口按「主贴发表时间从新到旧」排、评论跟着自己的主贴走，于是今天发在两个月前
+    # 主贴上的回复会被排到两个月前的位置去。真实数据里 163 行的报告，4 条命中落在
+    # #68 / #133 / #134 / #147 —— 三条都在报告底部，用户几乎不可能翻到。
+    #
+    # **不改明细表的排序**（那条规则两个出口共用，破了迟早分家），改成新增一个入口。
+
+    @staticmethod
+    def _fresh_threads(rows: List[dict]) -> dict:
+        """{主贴行下标: [新回复行下标...]}，按明细表里的出现顺序。
+
+        rows 已按 order_by_thread 排成「主贴 → 它的评论 → 下一主贴」，所以一条回复的
+        主贴就是它前面最近的那个 level == 0 —— 不必再把树传进来算一遍。
+        """
+        threads = {}
+        root_idx = None
+        for i, item in enumerate(rows):
+            if item["level"] == 0:
+                root_idx = i
+            elif item.get("fresh") and root_idx is not None:
+                threads.setdefault(root_idx, []).append(i)
+        return threads
+
+    @staticmethod
+    def _write_fresh_sheet(ws, rows: List[dict], threads: dict, meta: dict,
+                           resolved: dict) -> dict:
+        """一个讨论串一块：主贴（完整）+ 本次的新回复 + 跳回明细表。返回 {主贴行下标: 段首行号}
+
+        **主贴必须完整带上**：一条「Dat zou fijn zijn...」这样的回复，脱离主贴根本读不懂
+        在说什么，用户还得自己去别处找主贴。
+
+        **该主贴的其他旧回复不带**，末尾给一条跳转 —— 热帖有十几条旧回复，全搬过来
+        这张表就长得没法一口气读完，与「打开就看见」的初衷冲突。
+        """
+        ws.column_dimensions["A"].width = 96
+        ws.column_dimensions["B"].width = 22
+        ws.cell(row=1, column=1, value=f"{FRESH_SHEET}（老主贴上的新回复，容易被时间倒序埋掉）"
+                ).font = EXPORT_TITLE_FONT
+        sub = ws.cell(
+            row=2, column=1,
+            value=f"窗口：近 {meta.get('fresh_days', '')} 天　|　"
+                  f"基准：{meta.get('fresh_baseline') or '-'}（数据集内最新帖子）　|　"
+                  f"共 {sum(len(v) for v in threads.values())} 条新回复，"
+                  f"分布在 {len(threads)} 个讨论串上",
+        )
+        sub.font = EXPORT_BODY_FONT
+
+        anchors = {}
+        row = 4
+        for root_idx in sorted(threads):
+            root = rows[root_idx]
+            fresh_idxs = threads[root_idx]
+            anchors[root_idx] = row
+
+            head = ws.cell(row=row, column=1,
+                           value=f"主贴  @{root['username']}  {root['timestamp']}"
+                                 f"　　{root['sentiment']} {ExcelService._stars(root['intensity'])}")
+            head.font = EXPORT_SECTION_FONT
+            ExcelService._link(ws.cell(row=row, column=2),
+                               f"'{DETAIL_SHEET}'!A{root_idx + 2}", f"← 到{DETAIL_SHEET}看全串")
+            row += 1
+            row = ExcelService._write_body(ws, row, root)
+
+            if root_idx in resolved:
+                thumb = ExcelService._thumbnail(resolved[root_idx][0])
+                if thumb is not None:
+                    ws.add_image(thumb, f"A{row}")
+                    row += -(-thumb.height // DEFAULT_ROW_PX) + 1
+
+            for i in fresh_idxs:
+                item = rows[i]
+                # 天数直接取 fresh_gap，别去剥「更新提醒」那句的前缀 —— 那句改一个字，
+                # 这里就会剥出半截话来
+                cell = ws.cell(row=row, column=1,
+                               value=f"    🔥 新回复  @{item['username']}  {item['timestamp']}"
+                                     f"　（主贴 {item.get('fresh_gap', 0)} 天前）")
+                cell.font = FRESH_FONT
+                cell.fill = FRESH_FILL
+                ExcelService._link(ws.cell(row=row, column=2),
+                                   f"'{DETAIL_SHEET}'!A{i + 2}", "→ 明细表这一行")
+                row += 1
+                row = ExcelService._write_body(ws, row, item, indent="    ")
+                verdict = f"    情感：{item['sentiment']} {ExcelService._stars(item['intensity'])}"
+                if item.get("dimensions"):
+                    verdict += f"　维度：{item['dimensions']}"
+                if item.get("reason"):
+                    verdict += f"　理由：{item['reason']}"
+                c = ws.cell(row=row, column=1, value=verdict)
+                c.font = EXPORT_BODY_FONT
+                c.alignment = CONTENT_ALIGN
+                row += 1
+
+            older = ExcelService._older_reply_count(rows, root_idx, set(fresh_idxs))
+            if older:
+                ExcelService._link(
+                    ws.cell(row=row, column=1), f"'{DETAIL_SHEET}'!A{root_idx + 2}",
+                    f"    该主贴另有 {older} 条较早回复 → 到{DETAIL_SHEET}查看",
+                )
+                row += 1
+            row += 1
+        return anchors
+
+    @staticmethod
+    def _write_body(ws, row: int, item: dict, indent: str = "") -> int:
+        """原文 + 译文各一行（空的那行不占位）"""
+        for key in ("content", "translation"):
+            text = (item.get(key) or "").strip()
+            if not text:
+                continue
+            cell = ws.cell(row=row, column=1, value=indent + text)
+            cell.font = EXPORT_BODY_FONT
+            cell.alignment = CONTENT_ALIGN
+            ws.row_dimensions[row].height = min(120, max(15, (len(text) // 60 + 1) * 15))
+            row += 1
+        return row
+
+    @staticmethod
+    def _older_reply_count(rows: List[dict], root_idx: int, fresh_idxs: set) -> int:
+        """这个主贴名下、不在本次新回复里的回复条数"""
+        count = 0
+        for i in range(root_idx + 1, len(rows)):
+            if rows[i]["level"] == 0:
+                break
+            if i not in fresh_idxs:
+                count += 1
+        return count
+
+    @staticmethod
+    def _stars(intensity) -> str:
+        n = _star_level(intensity)
+        return "★" * n + "☆" * (5 - n) if n else ""
+
     @staticmethod
     def _section(ws, row: int, title: str) -> int:
         ws.cell(row=row, column=1, value=title).font = EXPORT_SECTION_FONT
@@ -465,6 +618,12 @@ class ExcelService:
             ("已完成舆情分析", f"{meta.get('analyzed', 0)} / {total}"),
             ("最早发布时间", meta.get("time_start") or "-"),
             ("最晚发布时间", meta.get("time_end") or "-"),
+            # 窗口和基准**必须写进报告**：不写的话「这次和上次为什么不一样」无从解释。
+            # 基准是数据集内最新的帖子时间，不是导出时刻 —— 报告因此自洽、可复现
+            (f"近 {meta.get('fresh_days', '')} 天老帖新回复",
+             f"{meta.get('fresh_count', 0)} 条"
+             + (f"（基准 {meta['fresh_baseline']}，见「{FRESH_SHEET}」表）"
+                if meta.get("fresh_baseline") else "")),
         ):
             ws.cell(row=row, column=1, value=label).font = EXPORT_LABEL_FONT
             ws.cell(row=row, column=2, value=str(value)).font = EXPORT_BODY_FONT
@@ -526,9 +685,18 @@ class ExcelService:
 
     @staticmethod
     def _write_details(ws, rows: List[dict], columns: List[tuple],
-                       resolved: dict = None, anchors: dict = None) -> None:
+                       resolved: dict = None, anchors: dict = None,
+                       fresh_anchors: dict = None) -> None:
         resolved = resolved or {}
         anchors = anchors or {}
+        # {主贴行下标: 近期新回复表的段首行号}。命中的回复行要跳到**它主贴所在**的
+        # 那一段去 —— 跳到回复自己那一行没有意义，那一段的价值就在于主贴也在场
+        fresh_anchors = fresh_anchors or {}
+        fresh_target = {
+            i: fresh_anchors[root]
+            for root, kids in ExcelService._fresh_threads(rows).items()
+            if root in fresh_anchors for i in kids
+        }
         keys = [key for key, _ in columns]
         for col, (key, label) in enumerate(columns, 1):
             cell = ws.cell(row=1, column=col, value=label)
@@ -558,9 +726,19 @@ class ExcelService:
                 cell.font = EXPORT_BODY_FONT
                 cell.alignment = CENTER_ALIGN if key in EXPORT_CENTERED else CONTENT_ALIGN
                 # 只有评论行上底色。再叠一层隔行斑马纹，两种底色互相掩盖，
-                # 反而看不出哪行是评论
-                if level:
+                # 反而看不出哪行是评论。
+                # 「老帖新回复」优先：它就是要在一屏评论里跳出来的那一行
+                if item.get("fresh"):
+                    cell.fill = FRESH_FILL
+                elif level:
                     cell.fill = REPLY_FILL
+                if key == "fresh" and value:
+                    cell.font = FRESH_FONT
+                    if offset in fresh_target:
+                        ExcelService._link(
+                            cell, f"'{FRESH_SHEET}'!A{fresh_target[offset]}",
+                            f"{value} →",
+                        )
                 if key == "image_desc" and offset in anchors:
                     extra = len(resolved[offset])
                     ExcelService._link(

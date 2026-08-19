@@ -497,6 +497,12 @@ Excel 本身也没有「点图放大」的原生行为。所以跳转入口放�
   `collector_runner.py` 那句依赖自检一行都不用改
 - **node 可执行文件走 `config.resolve_node_executable()`**：显式配置 → 包内
   `node\node.exe` → PATH 上的 `node`。目标机器不会装 Node
+- **启动器 `启动 HYXi.bat` 必须是纯 ASCII，且不能带 BOM** —— 与 `start.ps1`
+  「必须存成 UTF-8 带 BOM」正好相反，别混。`cmd.exe` 按**读取时生效的代码页**逐行解析
+  批处理文件，`chcp 65001` 之后再遇到中文，多字节序列会被按 GBK 拆断、整行碎成不存在的
+  命令。用户实测双击后报 `'锛夎蛋涓嶅埌杩欓噷銆傝蛋鍒颁簡灏辨槸鍚姩澶辫触锛?REM' 不是内部或外部命令`。
+  中文一律由 `hyxi.exe` 输出（它写 UTF-8，而控制台此时已被启动器切到 65001），
+  连「服务已停止」这句收尾也在 `run_server.py` 里。`build.ps1` 的自检会拦住任何非 ASCII 字节
 
 ### 采集脚本只能压缩，不能编成字节码（实测结论，别再试）
 
@@ -522,7 +528,7 @@ Excel 本身也没有「点图放大」的原生行为。所以跳转入口放�
 
 ## 测试
 
-**305 个测试，必须全部 PASSED**（本机实测 `305 passed in 341s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**306 个测试，必须全部 PASSED**（本机实测 `306 passed in 454s`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v

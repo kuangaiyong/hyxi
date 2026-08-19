@@ -4385,10 +4385,39 @@ class TestPortablePackagePathsEndToEnd:
         from app import paths
 
         self._freeze_at(self.tmpdir)
+        real = os.path.realpath(self.tmpdir)
         assert paths.is_frozen()
-        assert paths.project_root() == self.tmpdir
+        assert paths.project_root() == real
         # 便携包里没有 backend/ 这一层
-        assert paths.data_dir() == os.path.join(self.tmpdir, "data")
+        assert paths.data_dir() == os.path.join(real, "data")
+
+    def test_frozen_root_is_expanded_from_8_3_short_paths(self):
+        """sys.executable 可能是 8.3 短路径 —— 实测双击启动器拿到的是
+        C:\\HYXI-B~1\\HYXI-1~1.1-W。它指的目录没错，但会原样印在「程序目录」那行上，
+        而用户正要照着它去资源管理器里找 data 文件夹，短路径既看不懂也不好粘。
+        """
+        from app import paths
+
+        # 用 GetShortPathName 拿到真的短路径，不是自己编一个
+        import ctypes
+        buf = ctypes.create_unicode_buffer(512)
+        n = ctypes.windll.kernel32.GetShortPathNameW(self.tmpdir, buf, 512)
+        if not n:
+            import pytest
+            pytest.skip("这个卷没有开启 8.3 短名")
+        short = buf.value
+        if short == self.tmpdir:
+            import pytest
+            pytest.skip("这个卷没有开启 8.3 短名")
+
+        app_dir = os.path.join(short, "app")
+        os.makedirs(app_dir, exist_ok=True)
+        self._sys.frozen = True
+        self._sys.executable = os.path.join(app_dir, "hyxi.exe")
+
+        root = paths.project_root()
+        assert "~" not in root, f"短路径没有被还原: {root}"
+        assert root == os.path.realpath(self.tmpdir)
 
     def test_bundled_node_beats_whatever_is_on_path(self):
         """目标机器不会装 Node，PATH 上没有 node —— 必须用包里自带的那个"""

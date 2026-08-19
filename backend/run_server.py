@@ -15,9 +15,15 @@ import shutil
 import socket
 import sys
 import threading
+import warnings
 import webbrowser
 
-from app.paths import project_root
+# pydantic 会为 model_name 这个字段名警告两次「conflict with protected namespace」。
+# 对开发者是噪音，对使用者是吓人的东西 —— 一个双击启动的人看到满屏 UserWarning
+# 会以为程序坏了。这只在打包态的启动路径上屏蔽，源码态照常暴露出来
+warnings.filterwarnings("ignore", message=".*protected namespace.*")
+
+from app.paths import project_root  # noqa: E402
 
 
 def _line(text: str = "") -> None:
@@ -183,6 +189,13 @@ def main() -> int:
     from main import app
 
     uvicorn.run(app, host=settings.host, port=settings.port, log_level="info")
+
+    # 收尾的话也得由这里说。启动器是**纯 ASCII** 的 —— cmd.exe 按读取时生效的代码页
+    # 解析 .bat，chcp 之后再遇到中文会把多字节序列拆断、整行碎成不存在的命令
+    # （实测报出 "'锛夎蛋涓嶅埌杩欓噷銆?REM' 不是内部或外部命令"）。中文一律从这里出，
+    # 控制台此时已被启动器切到 65001，UTF-8 显示正常
+    _line()
+    _line("服务已停止。数据都保存在程序目录的 data 文件夹里。")
     return 0
 
 

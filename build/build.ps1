@@ -127,6 +127,14 @@ foreach ($f in Get-ChildItem (Join-Path $stage 'collectors') -Filter *.js -File)
 }
 if (Test-Path (Join-Path $stage 'collectors\lib')) { $problems += 'collectors\lib 源码目录被拷进来了' }
 
+# 启动器必须是纯 ASCII。cmd.exe 按**读取时生效的代码页**解析 .bat，chcp 之后再遇到
+# 中文会把多字节序列拆断、整行碎成不存在的命令（实测报
+# "'锛夎蛋涓嶅埌杩欓噷銆?REM' 不是内部或外部命令"）。中文一律由 hyxi.exe 输出
+$batBytes = [System.IO.File]::ReadAllBytes((Join-Path $stage '启动 HYXi.bat'))
+if ($batBytes | Where-Object { $_ -gt 127 }) {
+    $problems += '启动 HYXi.bat 含非 ASCII 字节 —— cmd.exe 会把那些行解析碎'
+}
+
 # 构建期依赖不该跟着分发
 foreach ($dev in @('esbuild', '@esbuild')) {
     if (Test-Path (Join-Path $stage "node_modules\$dev")) { $problems += "构建期依赖 $dev 混进了包里" }

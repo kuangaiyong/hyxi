@@ -1,14 +1,14 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-title HYXi 舆情分析平台
+title HYXi
 
 app\hyxi.exe
 
-REM 正常关闭（Ctrl+C / 关窗口）走不到这里。走到了就是启动失败，
-REM 窗口必须停住 —— 双击启动的人看不到一闪而过的报错
+REM Keep this file ASCII-only. cmd.exe parses a .bat using the codepage in effect
+REM while reading, so Chinese written here gets split mid-sequence after chcp and
+REM the line breaks apart into bogus commands. All user-facing text comes from
+REM hyxi.exe instead, which writes UTF-8 to the console chcp already switched.
+
 echo.
-echo ============================================
-echo  服务已停止。上面若有 [失败] 字样即是原因。
-echo ============================================
 pause

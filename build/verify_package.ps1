@@ -40,32 +40,30 @@ $cleanPath = "$env:SystemRoot\system32;$env:SystemRoot;$env:SystemRoot\system32\
 $exe = Join-Path $pkg 'app\hyxi.exe'
 if (-not (Test-Path $exe)) { Write-Fail "找不到 $exe"; exit 1 }
 
-$psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = $exe
-$psi.WorkingDirectory = $pkg
-$psi.UseShellExecute = $false
-$psi.EnvironmentVariables['PATH'] = $cleanPath
-# 别让它把浏览器弹到操作者脸上
-$psi.EnvironmentVariables['HYXI_NO_BROWSER'] = '1'
-$psi.RedirectStandardOutput = $true
-$psi.RedirectStandardError = $true
-# 程序输出是 UTF-8（真实使用路径里由 .bat 的 chcp 65001 兜住）。这里不显式指定的话
-# .NET 会按系统 ANSI 代码页（本机 936）解码，中文全是乱码，日志断言也就跟着失灵
-$psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
-$psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
-$proc = [System.Diagnostics.Process]::Start($psi)
+# **两个流都要接住**。uvicorn 的日志走 stderr，只接 stdout 的话 stderr 管道缓冲区
+# （几 KB）填满后子进程会卡死在写日志上，表现成「服务起来了但不响应」。
+# 直接落文件而不是用 Register-ObjectEvent：那条路要两个处理器往同一个非线程安全的
+# StringBuilder 写，订阅又不会自己注销，实测 PowerShell 收尾时就不肯退出了
+$outFile = Join-Path $destDir 'stdout.log'
+$errFile = Join-Path $destDir 'stderr.log'
 
-# **两个流都必须读**。uvicorn 的日志走 stderr，只读 stdout 的话 stderr 管道缓冲区
-# （几 KB）填满后子进程会直接卡死在写日志上，表现为「服务起来了但不响应」
-$stdout = New-Object System.Text.StringBuilder
-$null = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -Action {
-    $null = $Event.MessageData.AppendLine($EventArgs.Data)
-} -MessageData $stdout
-$null = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -Action {
-    $null = $Event.MessageData.AppendLine($EventArgs.Data)
-} -MessageData $stdout
-$proc.BeginOutputReadLine()
-$proc.BeginErrorReadLine()
+$savedPath = $env:PATH
+$env:PATH = $cleanPath
+$env:HYXI_NO_BROWSER = '1'   # 别让它把浏览器弹到操作者脸上
+try {
+    $proc = Start-Process -FilePath $exe -WorkingDirectory $pkg -PassThru -NoNewWindow `
+                          -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+} finally {
+    $env:PATH = $savedPath
+}
+
+function Get-Log {
+    # 程序写的是 UTF-8。不显式指定的话 PS 5.1 按系统 ANSI 代码页（本机 936）读，
+    # 中文全是乱码，下面那条 node 路径断言也就跟着失灵
+    $a = if (Test-Path $outFile) { Get-Content $outFile -Raw -Encoding UTF8 } else { '' }
+    $b = if (Test-Path $errFile) { Get-Content $errFile -Raw -Encoding UTF8 } else { '' }
+    return "$a`n$b"
+}
 
 $ready = $false
 for ($i = 0; $i -lt 60; $i++) {
@@ -78,7 +76,7 @@ for ($i = 0; $i -lt 60; $i++) {
 
 if (-not $ready) {
     Write-Fail '服务没起来'
-    Write-Host $stdout.ToString() -ForegroundColor DarkGray
+    Write-Host (Get-Log) -ForegroundColor DarkGray
     if (-not $proc.HasExited) { $proc.Kill() }
     exit 1
 }
@@ -116,22 +114,25 @@ try {
     if (-not (Test-Path (Join-Path $pkg 'data\hyxi.db'))) { Write-Fail '数据库没建起来'; exit 1 }
     Write-Ok 'data\hyxi.db 已创建'
 
-    $log = $stdout.ToString()
-    if ($log -notmatch [regex]::Escape('node\node.exe')) {
-        Write-Fail '自检没报出包内的 node，可能用的是别处的'
-        Write-Host $log -ForegroundColor DarkGray
-        exit 1
-    }
-    Write-Ok '采集用的是包内自带的 node\node.exe'
-
-    Write-Host "`n启动日志：" -ForegroundColor DarkGray
-    Write-Host $log -ForegroundColor DarkGray
 }
 finally {
-    if (-not $proc.HasExited) {
-        Start-Process taskkill -ArgumentList '/PID', $proc.Id, '/T', '/F' -NoNewWindow -Wait
-    }
+    # **先停子进程再读日志**：它把 stdout 重定向到文件后 Python 会块缓冲，
+    # 而且文件一直被独占打开着 —— 进程还活着时去读只能读到零星几行。
+    # 进程一退出，文件就写全并关闭了
+    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    $proc.WaitForExit(10000) | Out-Null
 }
+
+$log = Get-Log
+if ($log -notmatch [regex]::Escape('node\node.exe')) {
+    Write-Fail '自检没报出包内的 node，可能用的是别处的'
+    Write-Host $log -ForegroundColor DarkGray
+    exit 1
+}
+Write-Ok '采集用的是包内自带的 node\node.exe'
+
+Write-Host "`n启动日志：" -ForegroundColor DarkGray
+Write-Host $log -ForegroundColor DarkGray
 
 Write-Step '结果'
 Write-Host "    便携包验收通过：$pkg" -ForegroundColor Green

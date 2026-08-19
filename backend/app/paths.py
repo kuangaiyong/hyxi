@@ -22,9 +22,15 @@ def is_frozen() -> bool:
 
 
 def project_root() -> str:
-    """源码态是仓库根，打包态是便携包根目录（`app\\hyxi.exe` 的上一级）。"""
+    """源码态是仓库根，打包态是便携包根目录（`app\\hyxi.exe` 的上一级）。
+
+    冻结态要过一遍 `realpath`：`sys.executable` 可能是 8.3 短路径，实测双击启动器
+    拿到的是 `C:\\HYXI-B~1\\HYXI-1~1.1-W`。它指向的目录是对的，但会原样显示在
+    「程序目录」那行上，而用户正要照着它去资源管理器里找 data 文件夹 —— 短路径
+    既看不懂也不好粘。
+    """
     if is_frozen():
-        return str(Path(sys.executable).parent.parent)
+        return os.path.realpath(str(Path(sys.executable).parent.parent))
     return str(Path(__file__).parent.parent.parent)
 
 

@@ -3532,6 +3532,7 @@ class TestTweakersCollectorGoldenEndToEnd:
 
     def setup_method(self):
         self.tmpdir = tempfile.mkdtemp()
+        self.media = os.path.join(self.tmpdir, "media")
         # 帖子进库之后脚本的产出是个用完即删的交接文件，不再落项目根目录
         self.storage, self._restore_db = _use_temp_db(self.tmpdir)
 
@@ -3539,7 +3540,7 @@ class TestTweakersCollectorGoldenEndToEnd:
         self._restore_db()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def test_extraction_matches_golden_baseline(self):
+    def _skip_unless_ready(self):
         import pytest
         from app.config import settings
 
@@ -3550,35 +3551,42 @@ class TestTweakersCollectorGoldenEndToEnd:
         ):
             pytest.skip("项目根目录未安装 playwright")
 
-        sys.path.insert(0, _FIXTURES_DIR)
-        from fixture_site import FixtureSite
-
+    def _run(self, base_url, progress=None):
         import asyncio
         from app.collectors import get_collector
         from app.services.collector_runner import CollectorRunner
         from app.services.progress_manager import ProgressManager
 
         collector = get_collector("tweakers")
+        source = {
+            "id": "fixture_tweakers",
+            "params": {
+                "thread_id": FIXTURE_THREAD_ID,
+                "headless": True,
+                "incremental": False,
+            },
+            "base_url": base_url,
+            "state_file": os.path.join(self.tmpdir, "state.json"),
+            # 不给的话正文图会落进真实的 backend/data/media（settings.data_dir 那份）
+            "media_dir": self.media,
+            "pacing": {"delay_min": 200, "delay_max": 400},
+        }
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(
+                CollectorRunner.execute("golden", collector, source,
+                                        progress or ProgressManager())
+            )
+        finally:
+            loop.close()
+
+    def test_extraction_matches_golden_baseline(self):
+        self._skip_unless_ready()
+        sys.path.insert(0, _FIXTURES_DIR)
+        from fixture_site import FixtureSite
 
         with FixtureSite() as base_url:
-            source = {
-                "id": "fixture_tweakers",
-                "params": {
-                    "thread_id": FIXTURE_THREAD_ID,
-                    "headless": True,
-                    "incremental": False,
-                },
-                "base_url": base_url,
-                "state_file": os.path.join(self.tmpdir, "state.json"),
-                "pacing": {"delay_min": 200, "delay_max": 400},
-            }
-            loop = asyncio.new_event_loop()
-            try:
-                data = loop.run_until_complete(
-                    CollectorRunner.execute("golden", collector, source, ProgressManager())
-                )
-            finally:
-                loop.close()
+            data = self._run(base_url)
 
         with open(GOLDEN_FILE, "r", encoding="utf-8") as f:
             golden = json.load(f)
@@ -3590,6 +3598,54 @@ class TestTweakersCollectorGoldenEndToEnd:
         fields = ("username", "timestamp", "content", "page_number", "message_id", "fingerprint")
         for got, want in zip(data["posts"], golden["posts"]):
             assert {k: got.get(k) for k in fields} == {k: want.get(k) for k in fields}
+
+
+    def test_body_images_are_downloaded_and_quoted_ones_ignored(self):
+        """Tweakers 的正文图要抓回本地，引用块里的图和表情都不能算进来。
+
+        这条能力以前根本不存在 —— 三个采集器里只有 facebook_group.js 有图片代码，
+        Tweakers 侧只是把正文里的 [Afbeelding] 替换成「[图片]」四个字，用户因此
+        一张图都拿不到。
+
+        两个坑一并钉住：
+          · **引用块里的图不算引用者的**。正文提取为剥引用做了一次 cloneNode，
+            但尺寸必须在**原始元素**上量 —— 游离于文档之外的 clone，
+            getBoundingClientRect() 一律返回 0，照着 clone 取会把每张图都过滤掉。
+          · **表情按渲染尺寸挡掉**。这里不设 host 白名单：Facebook 那边能写死
+            scontent 是因为对真站核实过，Tweakers 的真实 DOM 本机访问不到。
+        """
+        self._skip_unless_ready()
+        sys.path.insert(0, _FIXTURES_DIR)
+        from fixture_site import FixtureSite
+
+        progress = _RecordingProgress()
+        with FixtureSite() as base_url:
+            data = self._run(base_url, progress=progress)
+
+        by_id = {p["message_id"]: p for p in data["posts"]}
+
+        # Havelaar 那条：一张 400x300 的正文图 + 一个 20x20 的表情
+        with_image = by_id["80000002"]
+        images = with_image.get("images") or []
+        assert len(images) == 1, f"表情混进来了或者正文图没抓到: {images}"
+        assert images[0].startswith("fixture_tweakers/"), f"没按 source 分目录: {images[0]}"
+        assert not os.path.isabs(images[0]), "存了绝对路径，落盘文件就搬不了机器了"
+        assert os.path.getsize(os.path.join(self.media, images[0])) > 0
+
+        # Dorpjes 那条引用了 Havelaar，引用块里也有一张 400x300 的图 —— 不是他的
+        assert not by_id["80000001"].get("images"), "把引用块里的图算到引用者头上了"
+
+        # 第 2 页那条帖子配的是与第 1 页同一个 URL 的图，两页各报一次候选
+        assert (by_id["80000006"].get("images") or []), "第 2 页复用同一 URL 的图没抓到"
+
+        joined = chr(10).join(progress.messages)
+        assert "排除(尺寸)" in joined, f"没报出表情是因为尺寸被挡的: {joined}"
+        # **汇总按 URL 去重**：逐页累加的话同一张图会被算两次，汇总行显示成
+        # 「候选 4 张 · 保存 2 张」，看着像丢了一半，而实际一张没丢。信息流那边更狠 ——
+        # 每一批都会把上一批的帖子重新提取一遍，10 批下来能虚报出 82% 的假丢失率
+        assert "图片汇总：候选图片地址 3 个 · 通过筛选 1 个 · 落盘 2 张" in joined, (
+            f"汇总行把同一个 URL 重复计数了: {joined}"
+        )
 
 
 class TestGroupFeedCollectorEndToEnd:
@@ -3745,6 +3801,28 @@ class TestGroupFeedCollectorEndToEnd:
         assert self.storage.count_posts("fixture_group") == 10
 
 
+def _RecordingProgress():
+    """在真实的 pub/sub 上顺手留一份日志副本，不替换任何被测组件。
+
+    采集脚本的 stdout 只走 SSE、不落进 task["logs"]，要断言它就得在流上收。
+    ProgressManager 在这个文件里一律局部 import（import 顺序有讲究，见文件头），
+    所以这里也惰性构造，不在模块级引它。
+    """
+    from app.services.progress_manager import ProgressManager
+
+    class _Recording(ProgressManager):
+        def __init__(self):
+            super().__init__()
+            self.messages = []
+
+        async def emit(self, task_id, event_type, data):
+            if event_type == "log":
+                self.messages.append(data.get("message") or "")
+            await super().emit(task_id, event_type, data)
+
+    return _Recording()
+
+
 class TestFacebookLoginEndToEnd:
     """登录 / 会话复用 / 两步验证退出路径 —— 真 Chrome 打真带登录门的本地站点。
 
@@ -3779,7 +3857,7 @@ class TestFacebookLoginEndToEnd:
     def _posts(self):
         return self.storage.load_posts(["fixture_fb"])
 
-    def _run(self, base_url, username, password, incremental=False):
+    def _run(self, base_url, username, password, incremental=False, progress=None):
         import asyncio
         from app.collectors import get_collector
         from app.services.collector_runner import CollectorRunner
@@ -3808,7 +3886,8 @@ class TestFacebookLoginEndToEnd:
             loop = asyncio.new_event_loop()
             try:
                 return loop.run_until_complete(
-                    CollectorRunner.execute("fb-e2e", collector, source, ProgressManager())
+                    CollectorRunner.execute("fb-e2e", collector, source,
+                                            progress or ProgressManager())
                 )
             finally:
                 loop.close()
@@ -3958,6 +4037,60 @@ class TestFacebookLoginEndToEnd:
         # 没图的帖子不该凭空多出一个 images 字段
         folded = [p for p in data["posts"] if p["username"] == "TechNerd_NL"][0]
         assert not folded.get("images")
+
+    def test_images_survive_when_only_the_browser_can_fetch_them(self):
+        """浏览器能下的图，脚本必须也能存下来 —— 哪怕脚本自己那条网络栈根本不通。
+
+        图片字节曾经靠 `context.request.get()` 二次回源，而那是 **Playwright 在 Node
+        进程里自带的 HTTP 客户端，不是 Chrome**：实测它连 Sec-Fetch-Dest / Referer /
+        sec-ch-ua 都不带，更不读系统代理（playwright-core 整个包里 HTTPS_PROXY 出现
+        0 次，browser.js 也从没传过 proxy）。于是「Chrome 走系统代理把图显示出来了、
+        脚本直连回源却连不上」是一个完全可能的状态 —— 用户实测到的正是这个：
+        帖子抓得到，图一张都没有。
+
+        本地 fixture 打的是 127.0.0.1、代理不生效，所以旧实现在测试里永远是绿的。
+        这里让 fixture 服务器按**真实请求头**区分两个客户端：不带浏览器特征的图片
+        请求一律 502。真服务器、真 Chrome、真子进程，没有任何 mock。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+        progress = _RecordingProgress()
+
+        with site.LoginSite(browser_only_media=True) as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD,
+                             progress=progress)
+
+        root = [p for p in data["posts"] if p["message_id"] == "9001"][0]
+        images = root.get("images") or []
+        assert len(images) == 1, (
+            f"回源那条路被掐断后图就没了，说明字节还是靠二次请求拿的: {images}"
+        )
+        saved = os.path.join(self.media, images[0])
+        assert os.path.getsize(saved) > 0, "文件落盘了但是空的"
+
+        # 必须是从浏览器响应里取的。若这里显示 0 张走缓存，说明 502 那条路
+        # 其实没被触发，这个用例就什么都没测到
+        line = [m for m in progress.messages if "取自浏览器缓存" in m]
+        assert line and "1 张取自浏览器缓存" in line[0], progress.messages
+
+    def test_image_stage_is_never_silent(self):
+        """提取和下载两个阶段都必须报数，否则远端出问题只能靠猜。
+
+        「页面上就没有图」「选择器没选中」「被尺寸门限挡了」「下载失败」四种情况
+        以前在日志上长得一模一样：什么都不显示 —— 这正是这个问题拖到用户那边才
+        暴露出来的原因。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+        progress = _RecordingProgress()
+
+        with site.LoginSite() as base_url:
+            self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, progress=progress)
+
+        joined = chr(10).join(progress.messages)
+        assert "张候选" in joined, f"提取阶段一声不吭: {joined}"
+        assert "排除(" in joined, f"没报出被排除的图是因为什么: {joined}"
+        assert "图片：保存" in joined, f"下载阶段一声不吭: {joined}"
 
     def test_session_is_reused_without_password(self):
         """(c) 保留会话重跑：密码给成错的也应该照样成功，证明这一轮根本没走登录"""

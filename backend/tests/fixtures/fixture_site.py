@@ -4,6 +4,7 @@
 真 HTTP、真子进程、真 DOM 提取，只是被抓的站点换成本地的，不涉及任何 mock。
 """
 
+import base64
 import os
 import re
 import threading
@@ -17,9 +18,23 @@ _PATH_RE = re.compile(r"^/forum/list_messages/\d+/(\d+)/?$")
 # 第二个站点：结构与论坛完全不同（主贴 + 嵌套评论，按批次翻页）
 _GROUP_RE = re.compile(r"^/groups/\d+/batch/(\d+)/?$")
 
+# 1x1 PNG。正文图必须真的返回 —— 404 的话浏览器按 alt 文本渲染，
+# 尺寸过滤和「图落到盘上了没有」就都测不成了
+_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQ"
+    "AAAABJRU5ErkJggg=="
+)
+
 
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path.startswith("/i/"):
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(_PNG)))
+            self.end_headers()
+            self.wfile.write(_PNG)
+            return
         match = _PATH_RE.match(self.path)
         group_match = _GROUP_RE.match(self.path)
         if match:

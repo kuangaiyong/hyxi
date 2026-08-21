@@ -9,6 +9,8 @@ const { readJob, log, progress, writeOutput } = require('./lib/job');
 const { sleep, randInt, humanDelay, humanRead } = require('./lib/human');
 const { gotoPage } = require('./lib/http');
 const { launchBrowser, newContext, saveStorageState } = require('./lib/browser');
+const { attachImageCapture, saveImages, logImageScan, newImageTally, logImageTally }
+    = require('./lib/media');
 const { makeFingerprint } = require('./lib/fingerprint');
 
 const job = readJob(process.argv.slice(2));
@@ -28,6 +30,13 @@ const CONFIG = {
     baseUrl: (job.base_url || 'https://gathering.tweakers.net').replace(/\/+$/, ''),
     outputFile: job.output_path,
     stateFile: job.state_file,
+    // 图片落盘根目录，由 job 指定（与 output_path 同理，文件位置只有一个来源）。
+    // 没配就不抓图，老 job 文件照样能跑
+    mediaDir: job.media_dir || '',
+    sourceId: job.source_id || 'tweakers',
+    // 正文图的渲染尺寸下限。比 Facebook 那边（100）松一档：那个数字是对真站核实过的，
+    // 而 Tweakers 的真实页面本机访问不到，宁可多收几张让日志报出来，也不要静默漏掉
+    imageMinSize: 80,
 };
 
 // URL格式: /0 = 显示第1页, /1 = 显示第2页
@@ -57,7 +66,9 @@ async function handleConsent(page) {
 
 // ===== 提取帖子 =====
 async function extractPosts(page, displayPage) {
-    const posts = await page.evaluate((displayPage) => {
+    const { posts, scan } = await page.evaluate(({ displayPage, minSize }) => {
+        const QUOTE_SEL = '.quote, .bb_quote, blockquote, [class*="quote"], .quotetext, .cite';
+        const scan = { candidates: [], accepted: [], rejected: [] };
         const results = [];
         const msgBlocks = document.querySelectorAll('.message[data-message-id]');
 
@@ -83,10 +94,11 @@ async function extractPosts(page, displayPage) {
                 if (contentEl) {
                     // 克隆以移除引用块
                     const clone = contentEl.cloneNode(true);
-                    clone.querySelectorAll('.quote, .bb_quote, blockquote, [class*="quote"], .quotetext, .cite').forEach(el => el.remove());
+                    clone.querySelectorAll(QUOTE_SEL).forEach(el => el.remove());
                     clone.querySelectorAll('script, style, .signature, .message_actions').forEach(el => el.remove());
                     content = clone.textContent.trim();
                 }
+
                 if (!content) {
                     // fallback: .post div
                     const postDiv = block.querySelector('.post');
@@ -97,6 +109,33 @@ async function extractPosts(page, displayPage) {
                     }
                 }
 
+                // 正文图。**必须在原始元素上量尺寸**：上面那个 clone 游离于文档之外，
+                // getBoundingClientRect() 会一律返回 0，照着 clone 取等于把每张图都
+                // 过滤掉。引用块里的图不算这条帖子的 —— 与 clone 删掉引用块同一个意思。
+                // **不设 host 白名单**：Facebook 那边能写死 scontent 是因为对真站核实过，
+                // Tweakers 的真实 DOM 本机访问不到，写死 host 等于赌。这里只按
+                // 「在正文容器内」+「非 data: URI」+「渲染尺寸」筛，其余交给日志。
+                // 取图的容器要跟着正文走：没有 .messagecontent 时正文来自 .post，
+                // 图自然也在那里 —— 盯死 contentEl 会让这条路上的帖子静默丢图。
+                const imageUrls = [];
+                const imgRoot = contentEl || block.querySelector('.post');
+                if (imgRoot) {
+                    imgRoot.querySelectorAll('img').forEach(im => {
+                        const url = im.currentSrc || im.src || '';
+                        if (!url || url.startsWith('data:')) return;   // 界面图标，不算候选
+                        scan.candidates.push(url);
+                        const r = im.getBoundingClientRect();
+                        const rej = (why) => scan.rejected.push({
+                            why, url, w: Math.round(r.width), h: Math.round(r.height),
+                        });
+                        // 引用块也要记账：QUOTE_SEL 里的 [class*="quote"] 相当宽，
+                        // 真站上万一误伤了正文图，不报出来就完全看不见
+                        if (im.closest(QUOTE_SEL)) return rej('引用块');
+                        if (r.width < minSize || r.height < minSize) return rej('尺寸');
+                        scan.accepted.push(url);
+                        imageUrls.push(url);
+                    });
+                }
                 // 清理
                 content = content
                     .replace(/\s+/g, ' ')
@@ -116,14 +155,35 @@ async function extractPosts(page, displayPage) {
                         content: content,
                         page_number: displayPage,
                         message_id: messageId,
+                        // 临时字段：saveImages() 落盘后就删，换成本地路径的 images。
+                        // 指纹只吃 username|timestamp|content[:100]，多挂一个不影响它
+                        _imageUrls: imageUrls,
                     });
                 }
             } catch (e) { /* skip */ }
         });
 
-        return results;
-    }, displayPage);
+        return { posts: results, scan };
+    }, { displayPage, minSize: CONFIG.imageMinSize });
 
+    return { posts, scan };
+}
+
+/**
+ * 提取一页 + 把这页的正文图落盘。
+ *
+ * 指纹在这里就先算出来 —— 图片文件名要用它，而正式那轮指纹循环在浏览器关掉之后才跑。
+ * makeFingerprint 是纯函数，那一轮重算得到的是同一个值。
+ * 逐页落盘而不是攒到最后：响应缓存不会越堆越大，中途限流退出（退出码 2）时
+ * 已抓到的那些页也保住了自己的图。
+ */
+async function grabPage(page, context, capture, tally, displayPage) {
+    const { posts, scan } = await extractPosts(page, displayPage);
+    logImageScan(scan, tally);
+    posts.forEach(p => { p.fingerprint = makeFingerprint(p); });
+    await saveImages(context, capture, posts, {
+        mediaDir: CONFIG.mediaDir, sourceId: CONFIG.sourceId, tally,
+    });
     return posts;
 }
 
@@ -216,6 +276,8 @@ async function main() {
     let lastConfirmedPage = CONFIG.startPage;
     let incomplete = false;
     let stopReason = null;
+    let capture = null;
+    const tally = newImageTally();
     // 建 context 也可能抛错，必须一起罩进 try —— 漏掉 browser.close() 会留下常驻的 Chrome 进程
     let context = null;
 
@@ -224,6 +286,7 @@ async function main() {
 
         const page = await context.newPage();
         page.setDefaultTimeout(CONFIG.timeout);
+        if (CONFIG.mediaDir) capture = attachImageCapture(page);
 
         log(`📄 访问: ${threadUrl(CONFIG.startPage)}`);
         await gotoPage(page, threadUrl(CONFIG.startPage), 30000);
@@ -234,7 +297,7 @@ async function main() {
 
         // 提取第一页
         log('🔍 提取帖子...');
-        let posts = await extractPosts(page, CONFIG.startPage);
+        let posts = await grabPage(page, context, capture, tally, CONFIG.startPage);
         allPosts.push(...posts);
         log(`  ✅ 第 ${CONFIG.startPage} 页: ${posts.length} 条帖子`);
 
@@ -276,7 +339,7 @@ async function main() {
                 await handleConsent(page);
 
                 if (page.url().includes('/forum/')) {
-                    const testPosts = await extractPosts(page, nextPage);
+                    const testPosts = await grabPage(page, context, capture, tally, nextPage);
                     if (testPosts.length > 0) {
                         allPosts.push(...testPosts);
                         lastConfirmedPage = nextPage;
@@ -322,7 +385,7 @@ async function main() {
 
                 await humanRead(page);
 
-                const newPosts = await extractPosts(page, dp);
+                const newPosts = await grabPage(page, context, capture, tally, dp);
                 if (newPosts.length === 0) {
                     if (dp < detectedTotalPages) {
                         log(`  ⚠️ 第 ${dp} 页无帖子，但站点声明共 ${detectedTotalPages} 页，抓取中断`);
@@ -360,6 +423,7 @@ async function main() {
         incomplete = true;
         stopReason = stopReason || `抓取过程异常: ${e.message}`;
     } finally {
+        logImageTally(tally);
         if (context) await saveStorageState(context, CONFIG.stateFile);
         await browser.close();
         log('🔒 浏览器已关闭');

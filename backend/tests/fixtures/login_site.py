@@ -185,6 +185,17 @@ class _Handler(BaseHTTPRequestHandler):
         # 图片放在 _record_lang() 之前：浏览器取子资源时不发 Accept-Language，
         # 记进去会让「界面语言是中文」那条断言看到一堆空串
         if self.path.startswith("/media/"):
+            # browser_only_media：只放行浏览器发出的子资源请求。
+            # 实测（2026-08-21）Chrome 取 <img> 会带 Sec-Fetch-Dest: image + Referer +
+            # sec-ch-ua，而 Playwright 的 Node 侧客户端（context.request）一个都不带 ——
+            # 它压根就是另一个 HTTP 客户端，自然也不读系统代理。用这个真实差异复刻
+            # 「浏览器能把图显示出来、脚本回源却拿不到」那台机器上的状态。
+            browser_only = getattr(self.server, "browser_only_media", False)
+            if browser_only and self.headers.get("Sec-Fetch-Dest") != "image":
+                self.send_response(502)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             self.send_response(200)
             self.send_header("Content-Type", "image/png")
             self.send_header("Content-Length", str(len(_PNG)))
@@ -247,13 +258,17 @@ class LoginSite:
 
     landing="reg" 时未登录访问小组页改跳注册页，用来验证脚本会不会提示走错页面；
     landing="churn" 时改跳一个不停自我导航的页面，用来验证轮询撞上导航不会把脚本搞挂。
+    browser_only_media=True 时，不带浏览器特征的图片请求一律 502 —— 复刻「Chrome 走
+    系统代理能下图、脚本那条独立网络栈下不了」的真实机器状态（见 _Handler.do_GET）。
     request_languages 收下每个请求的 Accept-Language，是「浏览器界面语言」这件事
     唯一不依赖真站的观测点。
     """
 
-    def __init__(self, port: int = 0, landing: str = "login"):
+    def __init__(self, port: int = 0, landing: str = "login",
+                 browser_only_media: bool = False):
         self._port = port
         self._landing = landing
+        self._browser_only_media = browser_only_media
         self._server = None
         self._thread = None
         self.request_languages = []
@@ -261,6 +276,7 @@ class LoginSite:
     def __enter__(self) -> str:
         self._server = ThreadingHTTPServer(("127.0.0.1", self._port), _Handler)
         self._server.landing = self._landing
+        self._server.browser_only_media = self._browser_only_media
         self._server.request_languages = self.request_languages
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()

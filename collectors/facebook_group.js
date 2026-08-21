@@ -9,14 +9,14 @@
  *    不要复用任何有价值的账号。
  */
 
-const fs = require('fs');
-const path = require('path');
 const { readJob, log, progress, writeOutput } = require('./lib/job');
 const { makeFingerprint } = require('./lib/fingerprint');
 const { launchBrowser, newContext, saveStorageState } = require('./lib/browser');
 const { gotoPage } = require('./lib/http');
 const { humanDelay, humanRead } = require('./lib/human');
 const { ensureLogin, waitForManualLogin, needManualAuth } = require('./lib/auth');
+const { attachImageCapture, saveImages, logImageScan, newImageTally, logImageTally }
+    = require('./lib/media');
 
 const job = readJob(process.argv.slice(2));
 const params = job.params || {};
@@ -95,9 +95,6 @@ const SELECTORS = {
     imageHost: 'scontent',
     imageMinSize: 100,
 };
-
-// 单张图上限。超过就跳过 —— 图片是附加信息，不值得为一张大图拖慢整轮抓取
-const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
 // 时间链接的标记属性 + 按标记缓存的 tooltip 文本。信息流是往下追加，上一批的帖子
 // 每一批都会被重新提取一次，不缓存就要把同一条帖子 hover 十遍。
@@ -197,7 +194,8 @@ async function expandBodies(page) {
 
 async function extractBatch(page) {
     await expandBodies(page);
-    const raw = await page.evaluate((sel) => {
+    const { posts: raw, scan } = await page.evaluate((sel) => {
+        const scan = { candidates: [], accepted: [], rejected: [] };
         const text = (el) => (el ? el.textContent.replace(/\s+/g, ' ').trim() : '');
         // 正文要额外剥掉末尾的展开/收起按钮文字，用户名等字段不需要
         const stripTrail = (s) => s.replace(new RegExp(sel.bodyTrail), '');
@@ -215,15 +213,28 @@ async function extractBatch(page) {
         // 作者：取第一个**有文字**的个人主页链接，前面那几个是同一个人的头像链接
         const nameOf = (root, scoped) => text([...root.querySelectorAll(sel.author)].find(
             (el) => (!scoped || el.closest(sel.post) === root) && el.textContent.trim()));
-        // 正文图 URL。层级限定同 own()：评论的图不能算到主贴头上
-        const imagesOf = (root) => [...root.querySelectorAll(sel.image)]
-            .filter((im) => im.closest(sel.post) === root)
-            .filter((im) => (im.currentSrc || im.src || '').includes(sel.imageHost))
-            .filter((im) => {
+        // 正文图 URL。层级限定同 own()：评论的图不能算到主贴头上。
+        // **每一步排除都要记账**：候选数和排除原因不报出来，「页面上就没有图」
+        // 「host 对不上」「被尺寸门限挡了」在日志上完全没有区别，远端只能靠猜
+        const imagesOf = (root) => {
+            const urls = [];
+            [...root.querySelectorAll(sel.image)].forEach((im) => {
+                if (im.closest(sel.post) !== root) return;
+                const url = im.currentSrc || im.src || '';
+                // data: 是界面图标（实测 16~18px 的 svg），不算候选，免得刷屏
+                if (!url || url.startsWith('data:')) return;
                 const r = im.getBoundingClientRect();
-                return r.width >= sel.imageMinSize && r.height >= sel.imageMinSize;
-            })
-            .map((im) => im.currentSrc || im.src);
+                const rej = (why) => scan.rejected.push({
+                    why, url, w: Math.round(r.width), h: Math.round(r.height),
+                });
+                scan.candidates.push(url);
+                if (!url.includes(sel.imageHost)) return rej('host');
+                if (r.width < sel.imageMinSize || r.height < sel.imageMinSize) return rej('尺寸');
+                scan.accepted.push(url);
+                urls.push(url);
+            });
+            return urls;
+        };
         const idOf = (link, kind) => {
             const href = link ? link.getAttribute('href') : '';
             const m = href && (kind === 'comment'
@@ -270,7 +281,7 @@ async function extractBatch(page) {
                     comments,
                 });
             });
-        return out;
+        return { posts: out, scan };
     }, SELECTORS);
 
     const items = raw.flatMap((p) => [p, ...p.comments]);
@@ -280,7 +291,7 @@ async function extractBatch(page) {
         }
         item.rawTime = timeCache.get(item.timeKey) || '';
     }
-    return raw;
+    return { posts: raw, scan };
 }
 
 /**
@@ -310,7 +321,7 @@ function flatten(rawPosts, displayBatch) {
             reply_level: 0,
         };
         post.fingerprint = makeFingerprint(post);
-        // 临时字段：downloadImages() 下完就删，换成本地路径的 images。
+        // 临时字段：saveImages() 落盘后就删，换成本地路径的 images。
         // 指纹只吃 username|timestamp|content[:100]，多挂一个字段不影响它
         post._imageUrls = raw.imageUrls || [];
         flat.push(post);
@@ -330,59 +341,6 @@ function flatten(rawPosts, displayBatch) {
         });
     });
     return flat;
-}
-
-function extOf(contentType, url) {
-    const ct = (contentType || '').toLowerCase();
-    if (ct.includes('png')) return 'png';
-    if (ct.includes('webp')) return 'webp';
-    if (ct.includes('gif')) return 'gif';
-    const m = url.match(/\.(jpe?g|png|webp|gif)(\?|$)/i);
-    return m ? m[1].toLowerCase().replace('jpeg', 'jpg') : 'jpg';
-}
-
-/**
- * 把正文图下载到本地，`images` 存相对 media 根的路径。
- *
- * **不能只存 Facebook 的原始链接**：fbcdn URL 带签名和过期时间，几天后页面上就是
- * 一片裂图，而舆情报告本来就是要回溯的 —— 那时数据还在、图没了，比一开始就没有更糟。
- * 存相对路径而不是绝对路径，落盘文件才能跨机器搬。
- *
- * 用 context.request 而不是自己 fetch：它复用浏览器的会话与指纹，与页面发出的
- * 请求同源。单张失败只跳过这一张，帖子照常入库 —— 图片是附加信息，不该把整条拖失败。
- */
-async function downloadImages(context, posts) {
-    if (!CONFIG.mediaDir) return;
-    const dir = path.join(CONFIG.mediaDir, CONFIG.sourceId);
-    let saved = 0;
-    let failed = 0;
-    for (const post of posts) {
-        const urls = post._imageUrls || [];
-        delete post._imageUrls;
-        if (!urls.length) continue;
-        const rels = [];
-        for (let i = 0; i < urls.length; i++) {
-            try {
-                const resp = await context.request.get(urls[i], { timeout: 30000 });
-                if (!resp.ok()) { failed++; continue; }
-                const buf = await resp.body();
-                if (buf.length > MAX_IMAGE_BYTES) { failed++; continue; }
-                fs.mkdirSync(dir, { recursive: true });
-                const name = `${post.fingerprint}_${i}.${extOf(resp.headers()['content-type'], urls[i])}`;
-                fs.writeFileSync(path.join(dir, name), buf);
-                rels.push(`${CONFIG.sourceId}/${name}`);
-                saved++;
-            } catch (e) {
-                failed++;
-            }
-            // 串行 + 小间隔：页面已经加载过这些图，但集中回源仍是一次突发
-            await new Promise((r) => setTimeout(r, 300));
-        }
-        if (rels.length) post.images = rels;
-    }
-    if (saved || failed) {
-        log(`   图片：保存 ${saved} 张${failed ? `，失败 ${failed} 张` : ''}`);
-    }
 }
 
 /** 无限滚动：往下滚一屏并等新内容渲染，返回是否还有增长 */
@@ -412,6 +370,11 @@ async function main() {
     // 注意：登录之后 Facebook 按账号自己的语言设置渲染，与这里无关。
     const context = await newContext(browser, { stateFile: CONFIG.stateFile, locale: 'zh-CN' });
     const page = await context.newPage();
+    // 必须在任何导航之前挂上：图片字节取自浏览器自己的响应，晚一步第一屏的图就漏了。
+    // 人工授权模式不采数据，不需要它
+    const capture = (CONFIG.mode === 'login_only' || !CONFIG.mediaDir)
+        ? null : attachImageCapture(page);
+    const tally = newImageTally();
 
     // ===== 人工授权模式：开有头浏览器让人自己过验证，只落会话不采数据 =====
     if (CONFIG.mode === 'login_only') {
@@ -454,7 +417,9 @@ async function main() {
         await gotoPage(page, groupUrl(), CONFIG.timeout);
         for (batch = 1; batch <= CONFIG.maxBatches; batch++) {
             await humanRead(page);
-            const flat = flatten(await extractBatch(page), batch);
+            const extracted = await extractBatch(page);
+            logImageScan(extracted.scan, tally);
+            const flat = flatten(extracted.posts, batch);
 
             if (batch === 1 && flat.length === 0) {
                 throw new Error('第一批未提取到任何帖子，提取器可能已失效或页面被拦截');
@@ -469,7 +434,9 @@ async function main() {
                 }
             });
             // 只给新增的帖子下图：已见过的这一轮会被指纹去重，图早就下过了
-            await downloadImages(context, added);
+            await saveImages(context, capture, added, {
+                mediaDir: CONFIG.mediaDir, sourceId: CONFIG.sourceId, tally,
+            });
             log(`  批次 ${batch}：提取 ${flat.length} 条（含评论），新增 ${added.length} 条`);
             progress(batch, CONFIG.maxBatches, `批次 ${batch}/${CONFIG.maxBatches}`);
 
@@ -495,6 +462,7 @@ async function main() {
         }
     }
 
+    logImageTally(tally);
     await saveStorageState(context, CONFIG.stateFile);
     await browser.close();
 

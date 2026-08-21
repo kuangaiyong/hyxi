@@ -69,5 +69,9 @@ class TweakersCollector(Collector):
             # 请求节奏是反爬纪律，谁都不能改
             "base_url": (source.get("base_url") or params.get("base_url")
                          or DEFAULT_BASE_URL).rstrip("/"),
+            # 正文图落盘根目录。脚本在下面按 source_id 分子目录，images 字段存
+            # 相对这里的路径，供 /api/v1/media/{path} 回读。
+            # 允许 source 覆盖（同 state_file），否则测试会往真实 data 目录里写图
+            "media_dir": source.get("media_dir") or os.path.join(settings.data_dir, "media"),
             "pacing": source.get("pacing") or {"delay_min": 4000, "delay_max": 11000},
         }

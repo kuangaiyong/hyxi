@@ -52,6 +52,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     error_message TEXT,
     logs_json TEXT NOT NULL DEFAULT '[]',
     scheduled_by TEXT,
+    -- 「这次是全量重跑」：collect / translate / sentiment 三处的增量标记一并忽略。
+    -- 必须是真列 —— tasks 是固定列表，任务字典里的自定义键根本不会被持久化，
+    -- 服务重启或从库里读回时就丢了
+    force_full INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     started_at TEXT,
     completed_at TEXT
@@ -154,6 +158,7 @@ def init_db():
         _rekey_sentiment_results(conn)
         _drop_stored_summary(conn)
         _ensure_posts_image_desc(conn)
+        _ensure_tasks_force_full(conn)
         conn.close()
         logger.info("SQLite 数据库初始化完成: %s", DB_PATH)
     except Exception as e:
@@ -175,6 +180,19 @@ def _ensure_posts_image_desc(conn) -> None:
         logger.info("posts.image_desc 已补齐")
     except Exception as e:
         logger.error("补 posts.image_desc 列失败: %s", e)
+
+
+def _ensure_tasks_force_full(conn) -> None:
+    """给既有库补上 tasks.force_full 列。理由同 _ensure_posts_image_desc。"""
+    cols = [d[1] for d in conn.execute("PRAGMA table_info(tasks)")]
+    if "force_full" in cols:
+        return
+    try:
+        conn.execute("ALTER TABLE tasks ADD COLUMN force_full INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+        logger.info("tasks.force_full 已补齐")
+    except Exception as e:
+        logger.error("补 tasks.force_full 列失败: %s", e)
 
 
 def _drop_stored_summary(conn) -> None:
@@ -403,8 +421,8 @@ def save_task(task: dict):
             """INSERT OR REPLACE INTO tasks
                (id, status, description, plan_json, progress, current_step,
                 result_json, error_message, logs_json, scheduled_by,
-                created_at, started_at, completed_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                created_at, started_at, completed_at, force_full)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 task.get("id", ""),
                 task.get("status", "pending"),
@@ -419,6 +437,7 @@ def save_task(task: dict):
                 _to_iso(task.get("created_at")),
                 _to_iso(task.get("started_at")),
                 _to_iso(task.get("completed_at")),
+                1 if task.get("force_full") else 0,
             ),
         )
         conn.commit()
@@ -870,16 +889,27 @@ def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True) -> 
                 # seq 保持不变 —— 它是全链路的顺序锚点，动一下所有历史结论就错位了。
                 # translation / translated / sentiment_at / image_desc 也一律不在这条
                 # UPDATE 里：它们都是花钱换来的结果，重新采集不得把它们冲回空值
+                #
+                # **images 同理，但只在本轮真抓到图时才覆盖**。写死成「采集到什么就是
+                # 什么」的话，全量重跑撞上一次网络抖动就会把 images_json 写成 []，
+                # 而图片文件还好端端躺在 media 目录里 —— 页面上整批消失且毫无提示。
+                # 代价是帖子里的图真被作者删掉时库里会留着已失效的路径，渲染侧本来
+                # 就要处理取不到图的情况。
+                images = post.get("images") or []
+                if images:
+                    conn.execute(
+                        "UPDATE posts SET images_json=? WHERE source_id=? AND fingerprint=?",
+                        (json.dumps(images, ensure_ascii=False), source_id, fp),
+                    )
                 conn.execute(
                     """UPDATE posts SET username=?, timestamp=?, content=?, page_number=?,
-                       message_id=?, parent_fingerprint=?, reply_level=?, images_json=?
+                       message_id=?, parent_fingerprint=?, reply_level=?
                        WHERE source_id=? AND fingerprint=?""",
                     (
                         post.get("username", ""), post.get("timestamp", ""),
                         post.get("content", ""), int(post.get("page_number", 1) or 1),
                         post.get("message_id", ""), post.get("parent_fingerprint"),
                         int(post.get("reply_level", 0) or 0),
-                        json.dumps(post.get("images") or [], ensure_ascii=False),
                         source_id, fp,
                     ),
                 )
@@ -1226,6 +1256,7 @@ def _row_to_task(row) -> dict:
         "error_message": row["error_message"],
         "logs": json.loads(row["logs_json"] or "[]"),
         "scheduled_by": row["scheduled_by"],
+        "force_full": bool(row["force_full"]),
         "created_at": _from_iso(row["created_at"]),
         "started_at": _from_iso(row["started_at"]) if row["started_at"] else None,
         "completed_at": _from_iso(row["completed_at"]) if row["completed_at"] else None,

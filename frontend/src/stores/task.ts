@@ -98,9 +98,9 @@ export const useTaskStore = defineStore('task', () => {
     }
   }
 
-  async function retryTask(taskId: string) {
+  async function retryTask(taskId: string, full = false) {
     try {
-      const newTask = await taskApi.retryTask(taskId)
+      const newTask = await taskApi.retryTask(taskId, full)
       currentTaskId.value = newTask.id
       currentTask.value = newTask
       timeline.value = []
@@ -126,12 +126,12 @@ export const useTaskStore = defineStore('task', () => {
     isConnected.value = val
   }
 
-  async function fetchResults(search = '', page = 1) {
+  async function fetchResults(search = '', page = 1, freshDays?: number, onlyFresh = false) {
     if (!currentTaskId.value) return
     resultsError.value = ''
     // allSettled 而非 all：/stats 失败不该把已经取到的帖子一起丢掉
     const [postsRes, statsRes] = await Promise.allSettled([
-      resultApi.fetchPosts(currentTaskId.value, page, pageSize.value, search),
+      resultApi.fetchPosts(currentTaskId.value, page, pageSize.value, search, freshDays, onlyFresh),
       resultApi.fetchStats(currentTaskId.value),
     ])
     if (postsRes.status === 'fulfilled') {

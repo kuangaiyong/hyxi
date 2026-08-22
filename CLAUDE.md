@@ -271,10 +271,10 @@ POST   /api/v1/tasks                  创建任务（后台异步执行）
 GET    /api/v1/tasks                  任务列表
 GET    /api/v1/tasks/{id}             任务详情
 DELETE /api/v1/tasks/{id}             取消运行中 / force=true 删除已结束
-POST   /api/v1/tasks/{id}/retry       重试终态任务（复用原描述创建新任务，返回新 id）
+POST   /api/v1/tasks/{id}/retry       重跑终态任务（复用原描述创建新任务，返回新 id）；?full=true 全量重跑
 GET    /api/v1/tasks/{id}/events      SSE 实时进度流
 
-GET    /api/v1/tasks/{id}/posts        帖子查询（**按主贴分页**，评论在 replies 里，**主贴按时间倒序**；?fresh_days=3|7|14 标出老帖新回复）
+GET    /api/v1/tasks/{id}/posts        帖子查询（**按主贴分页**，评论在 replies 里，**主贴按时间倒序**；?fresh_days=3|7|14 标出老帖新回复，?only_fresh=true 只留有新回复的串）
 GET    /api/v1/tasks/{id}/posts/{idx}  单条帖子详情（0-based）
 GET    /api/v1/tasks/{id}/stats        任务统计
 GET    /api/v1/tasks/{id}/export       **唯一的导出口**（?format=xlsx|csv&fresh_days=3|7|14）
@@ -520,6 +520,43 @@ Excel 本身也没有「点图放大」的原生行为。所以跳转入口放�
 路径解析复用 `vision_service.media_path()`（含 realpath 包含性校验）—— `images` 来自采集脚本，
 而 media 目录之外就是数据库和明文密钥。
 
+## 全量重跑（`force_full`）
+
+`POST /tasks/{id}/retry?full=true` 复用原描述建一个新任务，并把 `tasks.force_full`
+置位。执行时 `execute_task()` 一次性放开**三处**增量判据：
+
+| 步骤 | 平时的增量判据 | force_full 时 |
+|---|---|---|
+| collect | `params.incremental`（默认 True） | 置 False |
+| translate | `_processed.translated` | 全部当待翻译 |
+| sentiment | `_processed.sentiment_at` | 全部当待分析 |
+| 图片理解 | `posts.image_desc` 非空即跳过 | 内存里清空，全部重新理解 |
+
+- **`force_full` 必须是 tasks 表的真列**：那张表是固定列表，任务字典里的自定义键
+  根本不会被持久化，服务重启或从库里读回时就丢了。补列走 `PRAGMA table_info` +
+  `ALTER TABLE ADD COLUMN`（同 `_ensure_posts_image_desc`）
+- **关掉增量时必须一并清空 `known_fingerprints` 和 `max_page_number`**
+  （落在 `CollectorRunner`）。`facebook_group.js` 的 `seen` 集合是**无条件**用
+  `known_fingerprints` 建的（只有水位线提前退出那句看 `incremental`），照旧下发的话
+  每条帖子都被判成「见过」→ 不进 `fresh` → **配图也不会重下**，于是 `incremental=False`
+  对它完全无效。回归测试见 `TestFullRerunDropsIncrementalAnchorsEndToEnd`
+- **`image_desc` 也必须一并放开**（清在 orchestrator 的 sentiment 分支）。它平时与
+  `translation` / `sentiment_at` 同规矩「绝不重算」，而 `sentiment_service` 跳过的判据
+  正是「已经有 image_desc」—— 不清掉的话，用户为「按当前口径重算一遍」付了钱，图片
+  描述却仍是旧模型的产物，而**换了多模态模型正是有人点这个按钮的主要原因**，界面弹窗
+  也白纸黑字承诺了「带图的还会再调一次多模态模型」。只清内存那一份：`save_image_descs()`
+  不写空串，所以多模态没配 / 这一张没描述出来时，库里旧描述仍在，下一轮照常读回。
+  回归测试见 `test_full_rerun_also_re_describes_the_images`（含「普通重跑不得重复付费」的对照组）
+- **新建任务和定时任务一律走增量**，只有那个按钮给 True —— 否则每一轮定时都在重复
+  付翻译和舆情的钱
+- 界面上必须二次确认（`TaskManagementView` 的弹窗），并在任务行挂「全量」徽标：
+  两条描述一样的任务摆在一起，没有它就分不出哪条重译过
+
+**连带的一条存储规矩**：`upsert_posts()` 的 UPDATE 分支**只在本轮真抓到图时才覆盖
+`images_json`**。写死成「采集到什么就是什么」的话，全量重跑撞上一次网络抖动就会把它
+写成 `[]`，而图片文件还好端端躺在 media 目录里 —— 页面上整批消失且毫无提示。
+与旁边 `translation` / `image_desc` 「绝不被采集冲回空值」是同一套道理。
+
 ## 老帖新回复（避免被时间倒序埋掉）
 
 出口一律「主贴按发表时间从新到旧、评论跟着自己的主贴走」（见上一节），副作用是
@@ -527,7 +564,17 @@ Excel 本身也没有「点图放大」的原生行为。所以跳转入口放�
 报告里，4 条这样的回复落在 #68 / #133 / #134 / #147，三条都在报告底部。
 
 判据只有一份，在 `post_tree.mark_fresh_replies()`，理由同 `order_by_thread()` ——
-导出、结果页、舆情页三个出口共用一条规则，各写各的迟早分家。
+导出和结果页共用一条规则，各写各的迟早分家。
+
+**页面上的展示只在「任务结果页」**（`ResultsView.vue`）：一个「🔥 只看新回复」开关
+加 3/7/14 窗口选择。舆情页那套面板与开关已整体拆除，只留了一个窗口选择器紧贴导出按钮 ——
+它决定**报告**里「近期新回复」工作表和「更新提醒」列用哪个窗口，而导出入口全站只有那一个。
+
+- **筛选必须在服务端做**（`/posts?only_fresh=true`）。一页只有 50 个主贴，而新回复恰恰
+  因为主贴按时间倒序被压在后面几页 —— 那正是这个功能要解决的问题，在前端筛只能筛出
+  当前页里的，等于什么都没做。舆情页那版能在前端筛，是因为它把帖子全量拉下来了，
+  结果页是服务端分页，搬不过来
+- `only_fresh` 与 `search` 是 **AND**；`total` 在过滤之后算，否则分页器会显示出翻不到的页码
 
 - **基准是数据集里最新的帖子时间**（`baseline_time()`），不是 `datetime.now()`。
   按 now 算的话，隔一阵子没采集、或翻看几个月前的历史报告时**一条都不会亮**，
@@ -597,7 +644,7 @@ Excel 本身也没有「点图放大」的原生行为。所以跳转入口放�
 
 ## 测试
 
-**332 个测试，必须全部 PASSED**（本机实测 `332 passed in 421s`）。修改任何核心逻辑后必须在仓库根目录运行：
+**344 个测试，必须全部 PASSED**（本机实测 `344 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v

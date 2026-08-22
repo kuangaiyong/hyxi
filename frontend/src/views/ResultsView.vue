@@ -15,6 +15,13 @@ const taskId = computed(() => route.params.id as string)
 const currentPage = ref(1)
 const pageSize = 50
 const searchText = ref('')
+// 「老帖新回复」：主贴按时间倒序排，今天发在两个月前主贴上的回复会被排到两个月前的
+// 位置去，用户根本翻不到。这个开关把它们挑出来。
+// **筛选在后端做**：一页只有 50 个主贴，在前端筛只能筛出当前页里的 —— 而它们恰恰
+// 就在后面几页，等于什么都没做。
+const FRESH_DAYS_CHOICES = [3, 7, 14]
+const freshDays = ref(7)
+const onlyFresh = ref(false)
 const isSearching = ref(false)
 
 /** 双语 / 只看译文 / 只看原文 */
@@ -100,7 +107,7 @@ function toggleThread(root: PostData) {
 
 onMounted(async () => {
   taskStore.currentTaskId = taskId.value
-  await taskStore.fetchResults()
+  await reload()
   await taskStore.fetchTask(taskId.value)
   // 舆情是附加信息，没分析过、正在分析、请求失败都只是不显示按钮，
   // 不能让它拖累帖子列表本身
@@ -112,10 +119,14 @@ onMounted(async () => {
   }
 })
 
+function reload(page = 1) {
+  return taskStore.fetchResults(searchText.value, page, freshDays.value, onlyFresh.value)
+}
+
 async function handleSearch() {
   isSearching.value = true
   try {
-    await taskStore.fetchResults(searchText.value, 1)
+    await reload()
   } finally {
     isSearching.value = false
   }
@@ -123,12 +134,24 @@ async function handleSearch() {
 
 function handleSearchClear() {
   searchText.value = ''
-  taskStore.fetchResults('', 1)
+  reload()
+}
+
+/** 开关和窗口都要回到第 1 页：过滤后 total 变了，停在第 5 页会落到空页上 */
+function toggleOnlyFresh() {
+  onlyFresh.value = !onlyFresh.value
+  reload()
+}
+
+function changeFreshDays(days: number) {
+  if (days === freshDays.value) return
+  freshDays.value = days
+  reload()
 }
 
 function goToPage(p: number) {
   if (p < 1 || p > totalPages.value) return
-  taskStore.fetchResults(searchText.value, p)
+  reload(p)
 }
 
 function getStatusText(): string {
@@ -179,7 +202,7 @@ function getStatusText(): string {
     <div v-if="taskStore.resultsError && !taskStore.posts.length" class="card text-center" style="padding: 32px;">
       <div style="font-size: 40px; margin-bottom: 12px;">⚠️</div>
       <p class="text-secondary mb-4">{{ taskStore.resultsError }}</p>
-      <button class="btn btn-primary" @click="taskStore.fetchResults(searchText, taskStore.currentPage)">重试</button>
+      <button class="btn btn-primary" @click="reload(taskStore.currentPage)">重试</button>
     </div>
 
     <!-- 统计 -->
@@ -248,6 +271,20 @@ function getStatusText(): string {
           >清除</button>
         </div>
         <div class="flex items-center gap-2">
+          <button
+            class="btn btn-sm fresh-toggle"
+            :class="{ on: onlyFresh }"
+            title="只看老主贴上的新回复 —— 它们因为主贴时间倒序被压在后面几页"
+            @click="toggleOnlyFresh"
+          >🔥 只看新回复</button>
+          <div v-if="onlyFresh" class="fresh-days">
+            <button
+              v-for="d in FRESH_DAYS_CHOICES"
+              :key="d"
+              :class="{ active: d === freshDays }"
+              @click="changeFreshDays(d)"
+            >近 {{ d }} 天</button>
+          </div>
           <div class="mode-switch">
             <button
               v-for="m in ([['bilingual', '双语'], ['zh', '只看译文'], ['orig', '只看原文']] as const)"
@@ -542,7 +579,26 @@ function getStatusText(): string {
 }
 
 /* ===== 老主贴上的新回复 =====
-   颜色与舆情页面板、Excel 那两处一致（#F59E0B / #B45309），三处是同一个视觉信号 */
+   页面上的展示只在这里（舆情页那套面板已整体拆除）。颜色与 Excel 报告里的暖色
+   一致（#F59E0B / #B45309），页面和报告看到的是同一个视觉信号 */
+.fresh-toggle {
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.fresh-toggle.on { background: #F59E0B; color: #fff; border-color: #F59E0B; }
+.fresh-days { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.fresh-days button {
+  padding: 4px 10px;
+  font-size: 12px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.fresh-days button.active { background: #F59E0B; color: #fff; font-weight: 600; }
+
 .fresh-count-badge {
   font-size: 12px;
   font-weight: 600;

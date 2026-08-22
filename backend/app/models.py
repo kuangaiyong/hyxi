@@ -128,6 +128,9 @@ class TaskResponse(BaseModel):
     current_step: Optional[str] = None
     result: Optional[dict] = None
     error_message: Optional[str] = None
+    # 这一轮是不是全量重跑。列表里据此挂个「全量」徽标 —— 否则两条描述一样的任务
+    # 摆在一起，没人看得出哪条重译过
+    force_full: bool = False
     created_at: datetime
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None

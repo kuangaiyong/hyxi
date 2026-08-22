@@ -89,6 +89,48 @@ class TestTaskLifecycleEndToEnd:
         assert orch.get_task("t3") is None
         assert orch.get_task("t4") is not None
 
+    def test_deleting_a_task_keeps_its_posts(self):
+        """删任务只删任务记录，帖子必须一条不少 —— 包括花钱换来的译文和舆情结论。
+
+        用户问过这件事。答案在 storage.delete_task()：它只发一句
+        `DELETE FROM tasks WHERE id = ?`。posts 表**没有 task_id 列**（帖子按
+        (source_id, fingerprint) 存），tasks 上也没有任何外键指向它 —— 全库唯一的
+        外键是 credentials.source_id → sources(id)。舆情结论同理按帖子身份存，
+        task_id 只是「哪个任务触发的」这条附注。
+
+        行为本身早就是对的，但一直没有测试守着：哪天有人给 tasks 挂个
+        ON DELETE CASCADE，或者在 delete_task 里顺手清一把「这个任务的帖子」，
+        用户的历史数据就没了，而且不会有任何报错。
+        """
+        orch = self._create_orchestrator()
+        import app.services.storage as storage
+
+        posts = [
+            {"username": "Dorpjes", "timestamp": "22-05-2026 17:06", "content": "原文",
+             "translation": "译文", "page_number": 1, "fingerprint": "keep1",
+             "source": "src_x", "parent_fingerprint": None, "reply_level": 0,
+             "images": ["src_x/pic_0.png"],
+             "_processed": {"translated": True, "sentiment_at": "2026-07-28T20:27:00"}},
+        ]
+        storage.upsert_posts("src_x", posts)
+        storage.save_sentiment("t_del", {"results": [
+            {"sentiment": "negative", "intensity": 3, "reason_cn": "抱怨续航",
+             "dimensions": ["续航"]},
+        ]}, posts)
+
+        orch.create_task("t_del", "会被删掉的任务")
+        assert orch.delete_task("t_del") is True
+        assert orch.get_task("t_del") is None
+
+        kept = storage.load_posts(["src_x"])
+        assert len(kept) == 1, "删任务把帖子一起删了"
+        assert kept[0]["translation"] == "译文", "译文没了 —— 这是花钱换来的"
+        assert kept[0]["_processed"]["sentiment_at"] == "2026-07-28T20:27:00"
+        assert kept[0]["images"] == ["src_x/pic_0.png"]
+        # 结论按 (source_id, fingerprint) 存，跟哪个任务触发的无关，删任务不该带走它
+        again = storage.get_sentiment("t_del", kept)
+        assert (again or {}).get("results", [{}])[0].get("sentiment") == "negative"
+
     def test_deleted_task_does_not_reappear_after_restart(self):
         orch1 = self._create_orchestrator()
         orch1.create_task("t8", "删除后不应复活")
@@ -1222,7 +1264,11 @@ class TestPipelineSentimentStepEndToEnd:
         self.storage.DB_PATH = self._old_db
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def _run(self, description):
+    def _run(self, description, force_full=False):
+        task, server = self._run_full(description, force_full)
+        return task, server.seen
+
+    def _run_full(self, description, force_full=False):
         import asyncio
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures"))
         import llm_site
@@ -1234,11 +1280,11 @@ class TestPipelineSentimentStepEndToEnd:
                 "api_key": "sk-test", "base_url": base_url, "model_name": "test-model",
             })
             task_id = f"pipeline-{len(server.seen)}-{description[:4]}"
-            orchestrator.create_task(task_id, description)
+            orchestrator.create_task(task_id, description, force_full=force_full)
             asyncio.new_event_loop().run_until_complete(
                 orchestrator.execute_task(task_id)
             )
-        return orchestrator.get_task(task_id), server.seen
+        return orchestrator.get_task(task_id), server
 
     def _conclusions(self):
         posts = self.storage.load_posts(["src_p"])
@@ -1334,6 +1380,107 @@ class TestPipelineSentimentStepEndToEnd:
         assert [s for s in seen if s != "plan"] == [], f"没要舆情却调了分析: {seen}"
         _posts, analyzed = self._conclusions()
         assert not any(analyzed), analyzed
+
+    DESC_FULL = "重新翻译并分析舆情"
+
+    def test_a_normal_rerun_still_skips_what_is_already_done(self):
+        """对照组：两条帖子本来就带 translated 标记、跑完也有了结论，
+        普通重跑必须一次翻译调用都不发。
+
+        没有这个对照，实现里把增量整个拆掉也是绿的 —— 而那等于每一轮定时任务
+        都在重复付翻译和舆情的钱。
+        """
+        self._run(self.DESC_FULL)                      # 第一轮：把舆情结论补上
+        _task, server = self._run_full(self.DESC_FULL)  # 第二轮：什么都不该再做
+
+        assert server.translated == [], f"已翻译的帖子又被送去翻译了: {server.translated}"
+        assert [x for x in server.seen if x != "plan"] == [], (
+            f"已分析的帖子又被送去分析了: {server.seen}"
+        )
+
+    def test_full_rerun_also_re_describes_the_images(self):
+        """全量重跑必须连图片描述一起重算 —— 确认弹窗里就是这么承诺用户的。
+
+        image_desc 平时绝不重算（那是花钱换来的），可 sentiment_service 跳过的判据
+        正是「已经有 image_desc」。不清掉它，用户为「按当前口径重算一遍」付了钱，
+        图片描述却仍是旧模型、旧 prompt 的产物 —— 而换了多模态模型正是有人点这个
+        按钮的主要原因。
+        """
+        import asyncio
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures"))
+        import llm_site
+        import vision_site
+        from app.services.orchestrator import orchestrator
+
+        # 一张真图落在临时 media 目录里，帖子挂上它
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+            "AAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        )
+        media_dir = os.path.join(self.tmpdir, "media", "src_p")
+        os.makedirs(media_dir, exist_ok=True)
+        with open(os.path.join(media_dir, "pic_0.png"), "wb") as f:
+            f.write(png)
+        self.storage.upsert_posts("src_p", [{
+            "username": "用户3", "timestamp": "03-07-2026 10:00",
+            "content": "Zie foto.", "translation": "看图。",
+            "page_number": 1, "fingerprint": "fp3", "source": "src_p",
+            "parent_fingerprint": None, "reply_level": 0,
+            "images": ["src_p/pic_0.png"],
+            "_processed": {"translated": True},
+        }])
+
+        def run(tag, force_full):
+            llm = llm_site.LLMSite()
+            vision = vision_site.VisionSite()
+            with llm as llm_url, vision as vision_url:
+                self.storage.set_app_config("llm", {
+                    "api_key": "sk-test", "base_url": llm_url, "model_name": "text-model"})
+                self.storage.set_app_config("vision", {
+                    "api_key": "sk-v", "base_url": vision_url, "model_name": "vision-model"})
+                orchestrator.create_task(tag, self.DESC_FULL, force_full=force_full)
+                asyncio.new_event_loop().run_until_complete(orchestrator.execute_task(tag))
+            return orchestrator.get_task(tag), vision
+
+        first, vision1 = run("img-rerun-1", False)
+        assert first["status"] == "completed", first.get("error_message")
+        assert vision1.image_count == 1, f"第一轮就没理解图: {vision1.calls}"
+        stored = {p["fingerprint"]: p for p in self.storage.load_posts(["src_p"])}
+        assert stored["fp3"].get("image_desc") == vision_site.DESCRIPTION, "描述没落库"
+
+        # 对照组：普通重跑不该为同一张图再付一次钱
+        _second, vision2 = run("img-rerun-2", False)
+        assert vision2.image_count == 0, f"普通重跑又买了一次图片描述: {vision2.calls}"
+
+        # 全量重跑：必须重新调一次多模态
+        third, vision3 = run("img-rerun-3", True)
+        assert third["status"] == "completed", third.get("error_message")
+        assert vision3.image_count == 1, (
+            f"全量重跑没有重算图片描述，"
+            f"弹窗里那句「带图的还会再调一次多模态模型」就是假话: {vision3.calls}"
+        )
+
+    def test_full_rerun_ignores_every_incremental_marker(self):
+        """全量重跑：已翻译、已分析的帖子必须全部重新送给模型。
+
+        增量标记散在三处（collect 的 incremental、translate 的 _processed.translated、
+        sentiment 的 sentiment_at），少放开一处，用户点了「全量重跑」却发现某一步
+        照旧跳过 —— 而这个按钮本来就是花钱买「按当前口径重算一遍」的。
+        """
+        self._run(self.DESC_FULL)                       # 先把结论跑出来
+        task, server = self._run_full(self.DESC_FULL, force_full=True)
+
+        assert task["status"] == "completed", task.get("error_message")
+        assert task["force_full"] is True, "标志没随任务落库"
+        assert sum(server.translated) == 2, f"没有全部重译: {server.translated}"
+        # seen 里翻译请求记的是 0（它们的 prompt 里没有「帖子N [来源:」），
+        # 所以只判「非空」恒真 —— 必须找到一条真带帖子的分析请求
+        assert any(x != "plan" and x > 0 for x in server.seen), (
+            f"没有重新分析舆情（seen 里一条带帖子的请求都没有）: {server.seen}"
+        )
+        assert any("全量重跑" in (l.get("message") or "") for l in task["logs"]), (
+            "日志里没说这是全量重跑，用户事后无从分辨这一轮跟别的有什么不同"
+        )
 
 
 class TestTimestampNormalizationEndToEnd:
@@ -2019,6 +2166,29 @@ class TestPostsStorageEndToEnd:
                 "timestamp": "02-06-2026 09:00", "content": f"内容{fp}", "page_number": 1}
         post.update(over)
         return post
+
+    def test_images_survive_a_collect_that_found_none(self):
+        """重采时这一轮没抓到图，库里已有的图片路径不能被冲成空。
+
+        全量重跑撞上一次网络抖动就会走到这条路上：**图片文件还好端端躺在 media
+        目录里，页面上却整批消失**，而且没有任何提示。与旁边 translation /
+        image_desc 「绝不被采集冲回空值」是同一套道理。
+        """
+        self.storage.upsert_posts("src_x", [self._p("a", images=["src_x/a_0.png"])])
+        assert self.storage.load_posts(["src_x"])[0]["images"] == ["src_x/a_0.png"]
+
+        # 同一条帖子重新采回来，但这一轮一张图都没下到
+        self.storage.upsert_posts("src_x", [self._p("a", content="正文改了一下")])
+
+        kept = self.storage.load_posts(["src_x"])[0]
+        assert kept["images"] == ["src_x/a_0.png"], "已有的图被空结果冲掉了"
+        assert kept["content"] == "正文改了一下", "采集字段该更新的还是要更新"
+
+    def test_new_images_still_replace_the_old_ones(self):
+        """真抓到图时照旧覆盖 —— 不能为了上一条把这里变成只进不出"""
+        self.storage.upsert_posts("src_x", [self._p("a", images=["src_x/old.png"])])
+        self.storage.upsert_posts("src_x", [self._p("a", images=["src_x/new.png"])])
+        assert self.storage.load_posts(["src_x"])[0]["images"] == ["src_x/new.png"]
 
     def test_seq_is_stable_across_incremental_rounds(self):
         """已有帖子的 seq 一个都不能变，新帖只能追加在后面。
@@ -3646,6 +3816,51 @@ class TestTweakersCollectorGoldenEndToEnd:
         assert "图片汇总：候选图片地址 3 个 · 通过筛选 1 个 · 落盘 2 张" in joined, (
             f"汇总行把同一个 URL 重复计数了: {joined}"
         )
+
+
+class TestFullRerunDropsIncrementalAnchorsEndToEnd(_ScraperTmpRoot):
+    """全量重跑必须连「已知指纹」和「续抓页码」一起作废，真子进程收到的 job 说了算。
+
+    这不是锦上添花：`facebook_group.js` 里 `const seen = new Set(CONFIG.knownFingerprints)`
+    的过滤**不看 incremental**（只有水位线提前退出那句看）。照旧下发的话每条帖子都会
+    被判成「见过」→ 不进 fresh → **配图也不会重下**，于是 incremental=False 对它完全
+    无效。用户点了「全量重跑」，图却还是老样子。
+    """
+
+    script = JOB_ECHO_SCRIPT
+
+    def setup_method(self):
+        super().setup_method()
+        _fake_playwright_install(self.tmpdir)
+        import app.services.storage as storage
+        storage.upsert_posts("tweakers", [
+            {"username": "老用户", "timestamp": "22-05-2026 17:06", "content": "已经抓过的帖子",
+             "translation": "", "page_number": 7, "fingerprint": "old1",
+             "source": "tweakers", "parent_fingerprint": None, "reply_level": 0},
+        ])
+
+    def test_incremental_run_still_gets_the_anchors(self):
+        """对照组：默认增量时锚点照旧下发，否则每一轮都在重抓全部历史"""
+        if not _HAS_NODE:
+            import pytest
+            pytest.skip("未安装 node")
+
+        job = self._execute({"thread_id": 123})["job"]
+        assert job["known_fingerprints"] == ["old1"]
+        assert job["incremental"] is True
+        assert job["params"]["start_page"] == 8, "续抓页码没从 maxPage+1 算"
+
+    def test_full_rerun_sends_no_anchors_at_all(self):
+        if not _HAS_NODE:
+            import pytest
+            pytest.skip("未安装 node")
+
+        job = self._execute({"thread_id": 123, "incremental": False})["job"]
+        assert job["known_fingerprints"] == [], (
+            f"已知指纹还在下发，Facebook 侧会把每条帖子判成见过、图也不会重下: {job}"
+        )
+        assert job["incremental"] is False
+        assert job["params"]["start_page"] == 1, "全量重跑却从续抓页码开始，前面几页永远补不回来"
 
 
 class TestGroupFeedCollectorEndToEnd:

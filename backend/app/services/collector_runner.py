@@ -95,10 +95,20 @@ class CollectorRunner:
         source_id = source.get("id") or collector.id
         if source.get("mode") != "login_only":
             # 增量所需的信息由 Python 从库里算好下发。脚本以前是自己读旧落盘文件的，
-            # 那份文件现在不存在了
+            # 那份文件现在不存在了。
+            #
+            # **关掉增量时必须一起清空**：facebook_group.js 的 `seen` 集合是无条件
+            # 用 known_fingerprints 建的（只有水位线提前退出那句看 incremental），
+            # 照旧下发的话每条帖子都会被判成「见过」→ 不进 fresh → 图片也不会重下，
+            # 于是 incremental=False 对它完全无效。tweakers 那边的续抓页码同理。
             source = dict(source)
-            source["known_fingerprints"] = storage.known_fingerprints(source_id)
-            source["max_page_number"] = storage.max_page_number(source_id)
+            incremental = (source.get("params") or {}).get("incremental", True)
+            source["known_fingerprints"] = (
+                storage.known_fingerprints(source_id) if incremental else []
+            )
+            source["max_page_number"] = (
+                storage.max_page_number(source_id) if incremental else 0
+            )
 
         job = collector.build_job(source, output_path)
 

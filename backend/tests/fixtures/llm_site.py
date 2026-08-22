@@ -19,6 +19,9 @@ GOOD = ('{"sentiment": "negative", "intensity": 4, '
         '"reason_cn": "单条重试成功", "dimensions": ["固件更新"]}')
 SEPARATOR = "---SENTIMENT_SEPARATOR---"
 PLAN = '{"plan": [{"action": "generate_excel", "params": {"include_stats": true}}]}'
+PLAN_WITH_TRANSLATE = ('{"plan": [{"action": "translate", "params": {}}, '
+                       '{"action": "generate_excel", "params": {"include_stats": true}}, '
+                       '{"action": "sentiment", "params": {}}]}')
 PLAN_WITH_SENTIMENT = ('{"plan": [{"action": "generate_excel", "params": {"include_stats": true}}, '
                        '{"action": "sentiment", "params": {}}]}')
 
@@ -41,7 +44,19 @@ class _Handler(BaseHTTPRequestHandler):
         if "智能调度器" in system_msg:
             # 替身模型：描述里要了舆情就给带 sentiment 的计划。真模型靠 prompt
             # 里那几条规则自己判断，这里只需要可控
-            content = PLAN_WITH_SENTIMENT if "舆情" in user_msg else PLAN
+            # 触发词要窄：既有用例的描述里就有「翻译已有数据」，用「翻译」当判据
+            # 会把它们的计划一起改掉
+            if "重新翻译" in user_msg:
+                content = PLAN_WITH_TRANSLATE
+            else:
+                content = PLAN_WITH_SENTIMENT if "舆情" in user_msg else PLAN
+        elif "翻译成中文" in user_msg:
+            # 翻译批量请求：按 [1] [2] ... 的条数回同样多段，用译者那边的分隔符拼起来。
+            # 内容是什么不重要 —— 这个分支存在的意义是「翻译这一步到底有没有真的发出去」
+            n = len(re.findall(r"^\[\d+\]$", user_msg, re.M))
+            self.server.translated.append(n)
+            joiner = chr(10) + "---POST_SEPARATOR---" + chr(10)
+            content = joiner.join(f"译文{i + 1}" for i in range(max(n, 1)))
         elif n_posts > 1:
             # 批量：前 n-1 条正常，最后一条给一段解析不了的文本。
             # 分隔符数量仍然对得上，所以走的是 _parse_sentiment 失败那条路，
@@ -86,12 +101,16 @@ class LLMSite:
         self.seen = []
         self.prompts = []
         self.user_prompts = []
+        # 每次翻译请求里有几条 —— 「增量跳过」和「全量重译」的唯一分辨点。
+        # 必须是 list：int 是不可变的，赋到 server 上就成了两份各自增长的计数
+        self.translated = []
 
     def __enter__(self) -> str:
         self._server = ThreadingHTTPServer(("127.0.0.1", self._port), _Handler)
         self._server.seen = self.seen
         self._server.prompts = self.prompts
         self._server.user_prompts = self.user_prompts
+        self._server.translated = self.translated
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         return "http://127.0.0.1:{}".format(self._server.server_address[1])

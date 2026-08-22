@@ -128,12 +128,18 @@ class TaskOrchestrator:
         except Exception as e:
             logger.error("持久化任务列表失败: %s", str(e))
 
-    def create_task(self, task_id: str, description: str):
-        """注册新任务"""
+    def create_task(self, task_id: str, description: str, force_full: bool = False):
+        """注册新任务。
+
+        force_full=True 时这一轮忽略全部增量标记：重新采集、重新翻译、重新分析舆情，
+        配图也重新下载。只有「全量重跑」那个按钮会给 True —— 新建任务和定时任务
+        一律走增量，否则每一轮定时都在重复付翻译和舆情的钱。
+        """
         self.tasks[task_id] = {
             "id": task_id,
             "status": TaskStatus.PENDING,
             "description": description,
+            "force_full": bool(force_full),
             "plan": [],
             "progress": 0.0,
             "current_step": None,
@@ -188,6 +194,14 @@ class TaskOrchestrator:
         task["status"] = TaskStatus.PARSING
         task["started_at"] = datetime.now()
         self._persist()
+
+        # 「全量重跑」：下面 collect / translate / sentiment 三处的增量判据一并放开
+        force_full = bool(task.get("force_full"))
+        if force_full:
+            await self._task_log(
+                task_id, "warning",
+                "全量重跑：忽略全部增量标记，将重新采集、重新翻译、重新下载配图并重新分析舆情",
+            )
 
         llm_service = None
         try:
@@ -257,7 +271,10 @@ class TaskOrchestrator:
                             raise Exception(f"数据源已被删除: {step.params['source_id']}")
                         collector = get_collector(source["collector_id"])
                         source["params"] = dict(source.get("params") or {})
-                        source["params"].setdefault("incremental", True)
+                        # 全量重跑：连同续抓页码和已知指纹一起作废（见 CollectorRunner），
+                        # 否则 Facebook 侧的 seen 集合会把每条帖子都判成「见过」，
+                        # 图片也就不会重下
+                        source["params"]["incremental"] = not force_full
                         ignored_start = _resolve_start_page(task, source["params"])
                         if ignored_start is not None:
                             await self._task_log(
@@ -312,9 +329,13 @@ class TaskOrchestrator:
                                 m["total_pages"] for m in loaded_meta.values()
                             )
 
-                        # 增量：过滤已翻译的帖子
-                        already = [p for p in posts if p.get("_processed", {}).get("translated") and p.get("translation")]
-                        pending = [p for p in posts if not p.get("_processed", {}).get("translated") or not p.get("translation")]
+                        # 增量：过滤已翻译的帖子。全量重跑时全部重译
+                        if force_full:
+                            already, pending = [], list(posts)
+                            await self._task_log(task_id, "info", f"全量重跑: {len(pending)} 条全部重新翻译")
+                        else:
+                            already = [p for p in posts if p.get("_processed", {}).get("translated") and p.get("translation")]
+                            pending = [p for p in posts if not p.get("_processed", {}).get("translated") or not p.get("translation")]
                         if already:
                             await self._task_log(task_id, "info", f"增量翻译: {len(already)} 条已翻译跳过, {len(pending)} 条待翻译")
                         if pending:
@@ -362,13 +383,27 @@ class TaskOrchestrator:
                         # 不会因为换个任务重跑就再花一次钱。既没正文又没配图的才是真的
                         # 分析不了，analyze() 内部还会再滤一次，这里只用来说人话
                         from app.services.sentiment_service import is_analyzable
-                        pending = [p for p in posts if not p.get("_processed", {}).get("sentiment_at")]
+                        if force_full:
+                            # image_desc 与 translation / sentiment_at 同属「花钱换来的
+                            # 结果」，平时绝不重算。但全量重跑正是为「换了模型、改了口径，
+                            # 按当前设置重来一遍」而存在的 —— 不清掉它，
+                            # sentiment_service 会跳过全部已有描述的帖子，确认弹窗里
+                            # 承诺的「带图的还会再调一次多模态模型」就是假话。
+                            # 只清内存这一份：save_image_descs() 不写空串，所以多模态
+                            # 没配 / 这一张没描述出来时，库里那份旧描述仍在，下一轮照常读回
+                            for p in posts:
+                                p["image_desc"] = ""
+                        pending = list(posts) if force_full else [
+                            p for p in posts if not p.get("_processed", {}).get("sentiment_at")
+                        ]
                         with_content = [p for p in pending if is_analyzable(p)]
                         if not with_content:
                             await self._task_log(task_id, "info", "所有可分析的帖子都已完成舆情分析，跳过")
                         else:
                             await self._task_log(
                                 task_id, "info",
+                                f"全量重跑: {len(with_content)} 条全部重新分析"
+                                if force_full else
                                 f"增量舆情分析: {len(posts) - len(pending)} 条已跳过, "
                                 f"{len(with_content)} 条待分析",
                             )

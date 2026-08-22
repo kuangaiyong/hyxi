@@ -24,7 +24,10 @@ export async function deleteTask(taskId: string): Promise<void> {
   await apiClient.delete(`/tasks/${taskId}?force=true`)
 }
 
-export async function retryTask(taskId: string): Promise<TaskResponse> {
-  const { data } = await apiClient.post(`/tasks/${taskId}/retry`)
+/** full=true 为全量重跑：忽略全部增量标记，会重新消耗大模型调用 */
+export async function retryTask(taskId: string, full = false): Promise<TaskResponse> {
+  const { data } = await apiClient.post(`/tasks/${taskId}/retry`, null, {
+    params: full ? { full: true } : {},
+  })
   return data
 }

@@ -23,6 +23,8 @@ export interface TaskResponse {
   current_step: string | null
   result: Record<string, any> | null
   error_message: string | null
+  /** 这一轮是不是全量重跑（忽略全部增量标记，重新采集/翻译/下图/分析） */
+  force_full: boolean
   created_at: string
   started_at: string | null
   completed_at: string | null

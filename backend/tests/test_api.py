@@ -754,6 +754,116 @@ class TestNestedPostsApiEndToEnd:
         assert stats["total_posts"] == 9
 
 
+class TestOnlyFreshFilterEndToEnd:
+    """结果页的「只看新回复」筛选：真实 HTTP 请求打到真实入库的帖子上。
+
+    **必须在服务端过滤**：一页只有 50 个主贴，而「老帖新回复」恰恰因为主贴按时间
+    倒序排而被压在后面几页 —— 那正是这个功能要解决的问题。在前端筛只能筛出当前
+    页里的，等于什么都没做。
+    """
+
+    @classmethod
+    def setup_class(cls):
+        import app.config as cfg
+
+        cls.cfg = cfg
+        cls._old_api_key = cfg.settings.api_key
+        cfg.settings.api_key = ""
+
+        from main import app
+        from app.services import storage
+
+        cls.tmpdir = tempfile.mkdtemp()
+        cls.storage = storage
+        cls._old_db_path = storage.DB_PATH
+        storage.DB_PATH = os.path.join(cls.tmpdir, "hyxi.db")
+        storage.init_db()
+        cls.client = TestClient(app)
+
+        # 基准是数据集里最新的帖子时间（20-08），不是 datetime.now() ——
+        # 所以这份数据永远自洽，不会跑着跑着就过期
+        def post(fp, when, text, parent=None):
+            return {"username": "u_" + fp, "timestamp": when, "content": text,
+                    "translation": "", "page_number": 1, "fingerprint": fp,
+                    "source": "src_f", "parent_fingerprint": parent,
+                    "reply_level": 1 if parent else 0}
+
+        posts = [
+            # A：老主贴 + 很新的回复 —— 3 天和 7 天窗口都该命中
+            post("ra", "01-06-2026 10:00", "老主贴A"),
+            post("ra1", "19-08-2026 10:00", "新回复A 独特词甲", "ra"),
+            # B：整串都旧 —— 任何窗口都不该命中
+            post("rb", "05-06-2026 10:00", "老主贴B"),
+            post("rb1", "06-06-2026 10:00", "旧回复B 独特词乙", "rb"),
+            # C：主贴本身就在窗口内 —— 整串都新，本来就排在最前面，不算「被埋」
+            post("rc", "18-08-2026 10:00", "新主贴C"),
+            post("rc1", "20-08-2026 10:00", "新回复C", "rc"),
+            # D：老主贴 + 5 天前的回复 —— 7 天窗口命中、3 天窗口不该命中
+            post("rd", "01-05-2026 10:00", "老主贴D"),
+            post("rd1", "15-08-2026 10:00", "新回复D 独特词丁", "rd"),
+        ]
+        storage.upsert_posts("src_f", posts)
+
+        cls.task_id = "only-fresh-e2e"
+        from app.services.orchestrator import orchestrator
+        orchestrator.tasks[cls.task_id] = {
+            "id": cls.task_id, "status": "completed", "description": "只看新回复",
+            "plan": [], "logs": [], "progress": 1.0, "current_step": None,
+            "result": {"total_posts": len(posts), "sources": [
+                {"id": "src_f", "name": "论坛", "collector_id": "tweakers",
+                 "post_count": len(posts)},
+            ]},
+        }
+        cls.orchestrator = orchestrator
+
+    @classmethod
+    def teardown_class(cls):
+        cls.cfg.settings.api_key = cls._old_api_key
+        cls.storage.DB_PATH = cls._old_db_path
+        cls.orchestrator.tasks.pop(cls.task_id, None)
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _posts(self, **params):
+        return self.client.get(f"/api/v1/tasks/{self.task_id}/posts", params=params).json()
+
+    def _roots(self, data):
+        return sorted(p["content"] for p in data["posts"])
+
+    def test_only_fresh_keeps_just_the_threads_with_new_replies(self):
+        """不开筛选是 4 串，开了只剩「老主贴 + 窗口内新回复」那两串"""
+        assert self._posts(page_size=200)["total"] == 4
+
+        data = self._posts(page_size=200, only_fresh=True, fresh_days=7)
+        assert data["total"] == 2, self._roots(data)
+        assert self._roots(data) == ["老主贴A", "老主贴D"]
+        # total 必须跟着过滤走，否则分页器会显示出翻不到的页码
+        assert len(data["posts"]) == 2
+
+    def test_the_window_actually_narrows_the_result(self):
+        """3 天窗口把 5 天前那条回复排除掉。
+
+        窗口只是个装饰的话，这条和上面那条会一模一样地绿。
+        """
+        data = self._posts(page_size=200, only_fresh=True, fresh_days=3)
+        assert self._roots(data) == ["老主贴A"], self._roots(data)
+
+    def test_only_fresh_and_search_are_combined_with_and(self):
+        """两个条件同时给就都生效 —— 搜到的那串不新，结果必须是空的"""
+        both = self._posts(page_size=200, only_fresh=True, fresh_days=7, search="独特词乙")
+        assert both["total"] == 0, self._roots(both)
+        # 对照：只搜不筛能搜到，证明上面那 0 不是因为搜索本身没命中
+        assert self._posts(page_size=200, search="独特词乙")["total"] == 1
+
+    def test_a_bad_window_is_still_rejected(self):
+        """新参数不能给非法窗口开后门 —— 静默回落会让用户以为自己换了窗口"""
+        resp = self.client.get(
+            f"/api/v1/tasks/{self.task_id}/posts",
+            params={"only_fresh": True, "fresh_days": 5},
+        )
+        assert resp.status_code == 400
+        assert "3/7/14" in resp.json()["detail"]
+
+
 class TestExportEndpointEndToEnd:
     """全站唯一的导出口 —— 真实 HTTP 打到真实落盘数据上"""
 

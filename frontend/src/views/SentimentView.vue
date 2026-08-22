@@ -32,8 +32,6 @@ const zoomUrl = ref('')
 const detailPost = ref<PostWithSentiment | null>(null)
 // 帖子原始数据（用于对照查看）
 const postsMap = ref<Map<number, PostData>>(new Map())
-/** 回复的扁平下标 → 它顶层主贴的扁平下标。父子关系只在 loadPosts 的递归里看得到 */
-const rootOf = ref<Map<number, number>>(new Map())
 const pendingCount = ref(0)
 // 实时进度
 const progressMsg = ref('')
@@ -47,12 +45,10 @@ const highlightIdx = ref<number | null>(null)
 const focused = ref(false)
 const filterDimension = ref('')
 const filterKeyword = ref('')
-/** 「老帖新回复」的时间窗口。后端只认 3/7/14，别的会 400 */
+/** 导出报告里「近期新回复」工作表用的时间窗口。后端只认 3/7/14，别的会 400。
+ *  页面上的新回复展示已经整体搬到任务结果页，这里只剩导出还要用它 */
 const FRESH_DAYS_CHOICES = [3, 7, 14]
 const freshDays = ref(7)
-/** 只看老帖新回复 */
-const filterFreshOnly = ref(false)
-const freshPanelOpen = ref(true)
 
 // 所有维度列表（从数据中提取）
 const allDimensions = computed(() => {
@@ -86,53 +82,13 @@ const filteredResults = computed(() => {
       x.result?.dimensions?.some(d => d.toLowerCase().includes(kw))
     )
   }
-  if (filterFreshOnly.value) {
-    rows = rows.filter(x => postsMap.value.get(x._idx)?.fresh_reply)
-  }
   return rows
 })
-
-/**
- * 老帖新回复按讨论串分组：{ root, replies[] }。
- *
- * postsMap 是「扁平下标 → 帖子」，但 fresh_reply_count 挂在主贴上、fresh_reply 挂在
- * 回复上，父子关系在 loadPosts() 的 walk 里才看得到 —— 所以那里顺便记下每条回复的
- * 主贴下标，这里直接用。
- */
-const freshThreads = computed(() => {
-  const groups = new Map<number, { root: PostData; replies: PostData[] }>()
-  for (const [idx, post] of postsMap.value) {
-    if (!post.fresh_reply) continue
-    const rootIdx = rootOf.value.get(idx)
-    if (rootIdx === undefined) continue
-    const root = postsMap.value.get(rootIdx)
-    if (!root) continue
-    if (!groups.has(rootIdx)) groups.set(rootIdx, { root, replies: [] })
-    groups.get(rootIdx)!.replies.push(post)
-  }
-  // 新回复最多的串排前面，同数按主贴时间从新到旧
-  return Array.from(groups.values()).sort(
-    (a, b) => b.replies.length - a.replies.length ||
-      (b.root.timestamp || '').localeCompare(a.root.timestamp || '')
-  )
-})
-
-const freshCount = computed(() =>
-  freshThreads.value.reduce((n, t) => n + t.replies.length, 0)
-)
 
 function clearFilters() {
   filterSentiment.value = ''
   filterDimension.value = ''
   filterKeyword.value = ''
-  filterFreshOnly.value = false
-}
-
-/** 切换窗口：标记由后端按窗口现算，必须重新拉一次 */
-async function changeFreshDays(days: number) {
-  if (days === freshDays.value) return
-  freshDays.value = days
-  await loadPosts()
 }
 
 const COLORS = {
@@ -309,25 +265,19 @@ async function loadPosts() {
     // 评论挂在主贴的 replies 里，只遍历顶层就把它们全漏了 —— 而舆情结果的下标
     // 来自扁平数组，评论也占位。实测 88 条里 42 条是评论，趋势图因此只画了一半
     // 每条回复归到它的**顶层主贴**：聚焦面板要把主贴一起显示出来，
-    // 而扁平的 postsMap 里看不到父子关系，只有这里的递归看得到
-    const roots = new Map<number, number>()
-    const walk = (p: PostData, rootIdx?: number) => {
-      const idx = p.index - 1   // index 是 1-based
-      map.set(idx, p)
-      const top = rootIdx ?? idx
-      if (top !== idx) roots.set(idx, top)
-      ;(p.replies || []).forEach(c => walk(c, top))
+    const walk = (p: PostData) => {
+      map.set(p.index - 1, p)   // index 是 1-based
+      ;(p.replies || []).forEach(walk)
     }
-    const first = await resultsApi.fetchPosts(taskId.value, 1, size, '', freshDays.value)
+    const first = await resultsApi.fetchPosts(taskId.value, 1, size)
     first.posts.forEach(p => walk(p))
     // 页数由首个响应的 total 定死，避免网络循环依赖后端的翻页终止条件
     const pages = Math.ceil(first.total / size)
     for (let page = 2; page <= pages; page++) {
-      const result = await resultsApi.fetchPosts(taskId.value, page, size, '', freshDays.value)
+      const result = await resultsApi.fetchPosts(taskId.value, page, size)
       result.posts.forEach(p => walk(p))
     }
     postsMap.value = map
-    rootOf.value = roots
   } catch (e) {
     // 非关键数据，静默失败
   }
@@ -682,21 +632,6 @@ async function focusFromQuery() {
   viewPost(idx)
 }
 
-/**
- * 从「近期新回复」面板点进表格里的那一行。
- *
- * 同 focusFromQuery：**必须先清掉筛选**，否则目标行很可能正被当前筛选挡在外面，
- * 跳过去是一片空白。参数是 1-based 的 index（扁平数组的绝对位置），不是行号。
- */
-async function focusRow(index: number) {
-  const idx = index - 1
-  if (!Number.isInteger(idx) || idx < 0) return
-  clearFilters()
-  highlightIdx.value = idx
-  await nextTick()
-  document.querySelector(`[data-row="${idx}"]`)
-    ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-}
 
 function viewPost(idx: number) {
   const r = data.value?.results?.[idx]
@@ -724,7 +659,18 @@ function mediaUrl(rel: string): string {
   <div>
     <div class="flex items-center justify-between mb-4">
       <h2 style="font-size: 18px; font-weight: 600;">📊 舆情分析</h2>
-      <div class="flex gap-2">
+      <div class="flex items-center gap-2">
+        <!-- 「老帖新回复」的展示已经整体搬到任务结果页，这里只剩这一个选择器：
+             它决定**导出报告**里「近期新回复」工作表和「更新提醒」列用哪个窗口。
+             不能删 —— 导出入口全站只有这一个，删了报告窗口就锁死在后端默认的 7 天 -->
+        <div class="fresh-days" title="只影响导出报告里的「近期新回复」工作表">
+          <button
+            v-for="d in FRESH_DAYS_CHOICES"
+            :key="d"
+            :class="{ active: d === freshDays }"
+            @click="freshDays = d"
+          >近 {{ d }} 天</button>
+        </div>
         <!-- 全站唯一的导出口。不挂 v-if="data" —— 只翻译没跑舆情的任务也得导得出来，
              那种情况下情感列是「未分析」 -->
         <div class="export-menu">
@@ -756,56 +702,6 @@ function mediaUrl(rel: string): string {
         <button class="btn btn-outline btn-sm" @click="router.push(`/tasks/${taskId}/results`)">
           ← 返回结果
         </button>
-      </div>
-    </div>
-
-    <!-- 近期新回复：老主贴上的新动静。
-         列表按主贴时间从新到旧排、评论跟着自己的主贴走，所以这类回复会被排到很后面
-         （真实数据里有一条今天的回复挂在两个月前的主贴上）。这个面板是它们唯一的
-         正门 —— 主贴一并显示，不必跳走就能读懂在说什么 -->
-    <div v-if="!loading && !analyzing && freshCount" class="card fresh-panel mb-4">
-      <div class="fresh-head" @click="freshPanelOpen = !freshPanelOpen">
-        <span class="fresh-title">
-          🔥 近期新回复 <span class="fresh-count">{{ freshCount }}</span>
-          <span class="text-sm text-secondary" style="font-weight: 400; margin-left: 8px;">
-            老主贴上的新回复，按发表时间排序会被埋在后面
-          </span>
-        </span>
-        <div class="flex items-center gap-2" @click.stop>
-          <div class="fresh-days">
-            <button
-              v-for="d in FRESH_DAYS_CHOICES"
-              :key="d"
-              :class="{ active: d === freshDays }"
-              @click="changeFreshDays(d)"
-            >近 {{ d }} 天</button>
-          </div>
-          <button class="btn btn-outline btn-sm" @click="freshPanelOpen = !freshPanelOpen">
-            {{ freshPanelOpen ? '收起' : '展开' }}
-          </button>
-        </div>
-      </div>
-
-      <div v-show="freshPanelOpen" class="fresh-body">
-        <div v-for="t in freshThreads" :key="t.root.index" class="fresh-thread">
-          <div class="fresh-root">
-            <div class="fresh-root-head">
-              <strong>{{ t.root.username || '匿名' }}</strong>
-              <span class="text-sm text-secondary">{{ t.root.timestamp || '时间未知' }}</span>
-              <span class="fresh-root-tag">主贴</span>
-            </div>
-            <div class="fresh-text">{{ t.root.translation || t.root.content || '（本帖正文为空或未能提取）' }}</div>
-          </div>
-          <div v-for="r in t.replies" :key="r.index" class="fresh-reply" @click="focusRow(r.index)">
-            <div class="fresh-reply-head">
-              <span class="fresh-badge">🔥 新回复</span>
-              <strong>{{ r.username || '匿名' }}</strong>
-              <span class="text-sm text-secondary">{{ r.timestamp }}</span>
-              <span class="fresh-gap">主贴 {{ r.days_since_root }} 天前</span>
-            </div>
-            <div class="fresh-text">{{ r.translation || r.content }}</div>
-          </div>
-        </div>
       </div>
     </div>
 
@@ -1061,14 +957,7 @@ function mediaUrl(rel: string): string {
               style="width: 120px; padding: 4px 8px; font-size: 12px;"
             />
             <button
-              v-if="freshCount"
-              class="btn btn-sm fresh-toggle"
-              :class="{ on: filterFreshOnly }"
-              :title="`只看老主贴上的新回复（近 ${freshDays} 天，共 ${freshCount} 条）`"
-              @click="filterFreshOnly = !filterFreshOnly"
-            >🔥 只看新回复</button>
-            <button
-              v-if="filterSentiment || filterDimension || filterKeyword || filterFreshOnly"
+              v-if="filterSentiment || filterDimension || filterKeyword"
               class="btn btn-outline btn-sm"
               @click="clearFilters"
             >清除</button>
@@ -1098,11 +987,6 @@ function mediaUrl(rel: string): string {
             >
               <td style="text-align: center; font-size: 12px; color: var(--text-light);">
                 {{ row._idx + 1 }}
-                <span
-                  v-if="postsMap.get(row._idx)?.fresh_reply"
-                  class="fresh-dot"
-                  :title="`老主贴上的新回复（主贴 ${postsMap.get(row._idx)?.days_since_root} 天前）`"
-                >🔥</span>
               </td>
               <td style="text-align: center;">
                 <span
@@ -1336,34 +1220,9 @@ function mediaUrl(rel: string): string {
   background: var(--border-light);
 }
 
-/* ===== 近期新回复 =====
-   老主贴上的新回复会被时间倒序埋到列表后面，这个面板是它们的正门。
+/* ===== 导出报告的时间窗口选择器 =====
+   页面上的新回复展示已搬到任务结果页，这里只剩它决定报告用哪个窗口。
    颜色沿用 Excel 那侧的暖色系（FFF3E0 / B45309），两处看到的是同一个视觉信号 */
-.fresh-panel {
-  border-left: 4px solid #F59E0B;
-  padding: 0;
-  overflow: hidden;
-}
-.fresh-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 14px 16px;
-  cursor: pointer;
-  background: var(--bg-hover, rgba(245, 158, 11, 0.06));
-}
-.fresh-title { font-size: 15px; font-weight: 600; }
-.fresh-count {
-  display: inline-block;
-  min-width: 22px;
-  padding: 1px 8px;
-  border-radius: 11px;
-  background: #F59E0B;
-  color: #fff;
-  font-size: 13px;
-  text-align: center;
-}
 .fresh-days { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
 .fresh-days button {
   padding: 3px 10px;
@@ -1374,61 +1233,5 @@ function mediaUrl(rel: string): string {
   cursor: pointer;
 }
 .fresh-days button.active { background: #F59E0B; color: #fff; font-weight: 600; }
-.fresh-body { padding: 4px 16px 16px; max-height: 420px; overflow-y: auto; }
-.fresh-thread {
-  border: 1px solid var(--border-light);
-  border-radius: 8px;
-  padding: 10px 12px;
-  margin-top: 10px;
-}
-.fresh-root-head, .fresh-reply-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-bottom: 4px;
-}
-.fresh-root-tag {
-  font-size: 11px;
-  padding: 1px 6px;
-  border-radius: 4px;
-  background: var(--border-light);
-  color: var(--text-secondary);
-}
-.fresh-root { padding-bottom: 8px; border-bottom: 1px dashed var(--border-light); }
-.fresh-reply {
-  margin-top: 8px;
-  padding: 8px 10px;
-  border-radius: 6px;
-  background: rgba(245, 158, 11, 0.08);
-  cursor: pointer;
-}
-.fresh-reply:hover { background: rgba(245, 158, 11, 0.16); }
-.fresh-badge { font-size: 12px; font-weight: 600; color: #B45309; }
-.fresh-gap {
-  font-size: 11px;
-  padding: 1px 6px;
-  border-radius: 4px;
-  background: #FDE68A;
-  color: #92400E;
-}
-/* 正文按变量取色，深色模式下才不会变成浅底浅字 */
-.fresh-text {
-  font-size: 13px;
-  line-height: 1.6;
-  color: var(--text);
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.fresh-dot { margin-left: 2px; font-size: 11px; }
-.fresh-toggle {
-  border: 1px solid #F59E0B;
-  background: transparent;
-  color: #B45309;
-}
-.fresh-toggle.on { background: #F59E0B; color: #fff; }
 
-@media (max-width: 640px) {
-  .fresh-head { flex-direction: column; align-items: flex-start; }
-}
 </style>

@@ -55,8 +55,12 @@ async def cancel_or_delete_task(task_id: str, force: bool = False):
 
 
 @router.post("/{task_id}/retry", response_model=TaskResponse, status_code=201)
-async def retry_task(task_id: str):
-    """重试失败/已完成的任务（复用原描述创建新任务）"""
+async def retry_task(task_id: str, full: bool = False):
+    """重跑失败/已完成的任务（复用原描述创建新任务）。
+
+    `full=true` 为**全量重跑**：忽略全部增量标记，重新采集、重新翻译、重新下载配图、
+    重新分析舆情。会重新消耗大模型调用，所以界面上必须二次确认后才走这条路。
+    """
     task = orchestrator.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -66,7 +70,7 @@ async def retry_task(task_id: str):
         raise HTTPException(status_code=400, detail="只能重试已完成、失败或取消的任务")
 
     new_id = str(uuid.uuid4())
-    orchestrator.create_task(new_id, task["description"])
+    orchestrator.create_task(new_id, task["description"], force_full=full)
     orchestrator.run_task_async(new_id)
     new_task = orchestrator.get_task(new_id)
     return TaskResponse(**new_task)

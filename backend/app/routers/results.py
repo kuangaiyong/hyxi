@@ -129,12 +129,17 @@ async def get_posts(
     page_size: int = Query(50, ge=1, le=200),
     search: str = Query("", description="搜索关键词（匹配用户名、原文、翻译）"),
     fresh_days: int = Query(FRESH_DAYS_DEFAULT, description="「老帖新回复」的时间窗口（天）"),
+    only_fresh: bool = Query(False, description="只保留串里有「老帖新回复」的主贴"),
 ):
-    """获取分页帖子结果，支持全文搜索。
+    """获取分页帖子结果，支持全文搜索与「只看新回复」。
 
     分页粒度是**主贴**，评论挂在 replies 里跟着父贴走 —— 按扁平条数分页会把一个
     主贴的评论切在两页之间。搜索命中评论时连整棵子树一起返回，命中项带 matched=true，
     否则吐出来的是一堆没有上下文的孤儿评论。
+
+    `only_fresh` **必须在服务端过滤**：一页只有 50 个主贴，在前端筛只能筛出当前页里的，
+    而新回复恰恰因为主贴时间倒序被压在后面几页 —— 那正是这个功能要解决的问题。
+    与 `search` 同时给出时两者是 AND。
     """
     task = _get_task_or_404(task_id)
 
@@ -145,6 +150,24 @@ async def get_posts(
 
     roots, children = build_tree(posts)
     hit_keys = set()
+    # 命中项所属的主贴：沿 children 反查。搜索和「只看新回复」都要用它上溯
+    parent_of = {
+        post_key(c): parent for parent, kids in children.items() for c in kids
+    }
+
+    def roots_of(keys) -> set:
+        found = set()
+        for key in keys:
+            cur = key
+            while cur in parent_of:
+                cur = parent_of[cur]
+            found.add(cur)
+        return found
+
+    # 标记基于**全量** posts 而不是本页 —— 基准是数据集里最新的帖子时间，
+    # 只拿本页算的话，翻到第 3 页时基准会变成那一页最新的帖子，标出来的东西
+    # 每页都不一样
+    fresh = mark_fresh_replies(posts, _validate_fresh_days(fresh_days))
 
     if search and search.strip():
         kw = search.strip().lower()
@@ -155,17 +178,13 @@ async def get_posts(
                     or kw in (p.get("translation", "") or "").lower())
 
         hit_keys = {post_key(p) for p in posts if is_hit(p)}
-        # 命中项所属的主贴：沿 children 反查，命中评论时保留整棵子树
-        parent_of = {
-            post_key(c): parent for parent, kids in children.items() for c in kids
-        }
-        kept_roots = set()
-        for key in hit_keys:
-            cur = key
-            while cur in parent_of:
-                cur = parent_of[cur]
-            kept_roots.add(cur)
+        # 命中评论时保留整棵子树
+        kept_roots = roots_of(hit_keys)
         roots = [r for r in roots if post_key(r) in kept_roots]
+
+    if only_fresh:
+        fresh_roots = roots_of(fresh.keys())
+        roots = [r for r in roots if post_key(r) in fresh_roots]
 
     # 主贴按发表时间从新到旧，规则同 order_by_thread（导出走那条路）。
     # **必须排在切片之前** —— 只排页内的话，一页 50 个主贴，后面更新的帖子永远
@@ -184,10 +203,6 @@ async def get_posts(
     index_of = {post_key(p): i + 1 for i, p in enumerate(posts)}
 
     names = _source_names(task)
-    # 标记基于**全量** posts 而不是本页 —— 基准是数据集里最新的帖子时间，
-    # 只拿本页算的话，翻到第 3 页时基准会变成那一页最新的帖子，标出来的东西
-    # 每页都不一样
-    fresh = mark_fresh_replies(posts, _validate_fresh_days(fresh_days))
 
     def build(post) -> PostData:
         item = _to_post_data(

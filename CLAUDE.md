@@ -656,6 +656,12 @@ Excel 本身也没有「点图放大」的原生行为。所以跳转入口放�
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
 ```
 
+**前端没有单元测试框架**（package.json 里无 vitest / jest / @vue/test-utils）。
+结果页筛选条件那条回归靠真浏览器守：`frontend/e2e/results_filters.js`
+（`cd frontend; npm run e2e`）—— 真 Chrome、真前后端、无 mock，**要求两个服务都起着**
+（先跑 `.\start.ps1`），所以它进不了 pytest。它自己从 `/tasks` 里挑任务、探出一个
+筛得空和一个筛得出的窗口，不写死任何 ID。密钥从项目根 `.env` 读。
+
 跑单个测试类：
 
 ```powershell

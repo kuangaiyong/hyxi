@@ -37,6 +37,13 @@ const totalPages = computed(() =>
   Math.ceil(taskStore.postsTotal / taskStore.pageSize)
 )
 
+/** 当前有没有生效的筛选条件。
+ *
+ *  筛出 0 条时**必须**照样把搜索栏渲染出来 —— 它自己就是关掉筛选的唯一入口。
+ *  整张卡片（搜索栏 + 列表 + 分页）本来一起挂在 posts.length 上，于是「只看新回复
+ *  + 近 3 天」一旦没命中，用户看到的是半页空白，连开关都找不回来，只能刷新。 */
+const hasFilter = computed(() => searchText.value.trim() !== '' || onlyFresh.value)
+
 const threadKey = (p: PostData) => `${p.source}:${p.index}`
 
 // 早期采集读不到 tooltip 的绝对时间，落盘就是空的（写相对时间会污染指纹）。
@@ -249,7 +256,7 @@ function getStatusText(): string {
     </div>
 
     <!-- 帖子表格 -->
-    <div v-if="taskStore.posts.length" class="card" style="padding: 0; overflow-x: auto;">
+    <div v-if="taskStore.posts.length || hasFilter" class="card" style="padding: 0; overflow-x: auto;">
       <!-- 搜索栏 -->
       <div class="flex items-center gap-2" style="padding: 12px 16px; border-bottom: 1px solid var(--border-light);">
         <div class="flex items-center gap-2" style="flex: 1; max-width: 400px;">
@@ -297,9 +304,22 @@ function getStatusText(): string {
         </div>
       </div>
 
+      <!-- 筛完一条不剩：说清楚是被什么条件筛掉的，别让用户以为数据没了 -->
+      <div v-if="!taskStore.posts.length" class="empty-filtered">
+        <div class="icon">🔍</div>
+        <p v-if="onlyFresh && searchText.trim()">
+          近 {{ freshDays }} 天内没有匹配「{{ searchText.trim() }}」的新回复
+        </p>
+        <p v-else-if="onlyFresh">近 {{ freshDays }} 天内没有老帖收到新回复</p>
+        <p v-else>没有匹配「{{ searchText.trim() }}」的帖子</p>
+        <p class="hint">
+          {{ onlyFresh ? '换个时间窗口，或关掉「只看新回复」看全部帖子' : '换个关键词，或点「清除」看全部帖子' }}
+        </p>
+      </div>
+
       <!-- 线程卡片：一个主贴一张卡，评论缩进挂在下面。
            分页粒度是主贴，所以一个主贴的评论不会被切在两页之间 -->
-      <div class="thread-list">
+      <div v-else class="thread-list">
         <article
           v-for="t in threads"
           :key="threadKey(t.root)"
@@ -380,8 +400,12 @@ function getStatusText(): string {
         </article>
       </div>
 
-      <!-- 分页控件 -->
-      <div class="flex items-center justify-between" style="padding: 12px 16px; border-top: 1px solid var(--border-light);">
+      <!-- 分页控件。一条都没有时不渲染，否则会显示成「第 1/0 页」 -->
+      <div
+        v-if="taskStore.posts.length"
+        class="flex items-center justify-between"
+        style="padding: 12px 16px; border-top: 1px solid var(--border-light);"
+      >
         <span class="text-sm text-secondary">
           第 {{ taskStore.currentPage }}/{{ totalPages }} 页，共 {{ taskStore.postsTotal }} 条
         </span>
@@ -581,6 +605,17 @@ function getStatusText(): string {
 /* ===== 老主贴上的新回复 =====
    页面上的展示只在这里（舆情页那套面板已整体拆除）。颜色与 Excel 报告里的暖色
    一致（#F59E0B / #B45309），页面和报告看到的是同一个视觉信号 */
+/* 筛完一条不剩时的占位。搜索栏在它上方照常渲染 ——
+   那是关掉筛选的唯一入口 */
+.empty-filtered {
+  text-align: center;
+  padding: 48px 24px;
+  color: var(--text-secondary);
+}
+.empty-filtered .icon { font-size: 40px; margin-bottom: 12px; opacity: 0.45; }
+.empty-filtered p { margin: 0; font-size: 14px; }
+.empty-filtered .hint { margin-top: 8px; font-size: 12px; opacity: 0.75; }
+
 .fresh-toggle {
   border: 1px solid var(--border);
   color: var(--text-secondary);

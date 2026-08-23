@@ -40,6 +40,16 @@ $cleanPath = "$env:SystemRoot\system32;$env:SystemRoot;$env:SystemRoot\system32\
 $exe = Join-Path $pkg 'app\hyxi.exe'
 if (-not (Test-Path $exe)) { Write-Fail "找不到 $exe"; exit 1 }
 
+# **端口必须先是空的**。被别的实例（比如开发后端）占着时，便携包的自检会因为
+# 「端口 8000 已被占用」直接退出，而下面那个健康检查会打到**那个实例**上并判定
+# 「服务已就绪」—— 后面每一条断言都在验错对象。实测踩过：开发后端没有 web/，
+# 于是报「首页不是前端页面」，看起来像打包坏了，其实包根本没起来
+if (Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue) {
+    Write-Fail '端口 8000 已被占用，先把它停掉再验收 —— 否则会验到别的实例上去'
+    Write-Host '    Get-NetTCPConnection -LocalPort 8000,5173 -State Listen | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }' -ForegroundColor DarkGray
+    exit 1
+}
+
 # **两个流都要接住**。uvicorn 的日志走 stderr，只接 stdout 的话 stderr 管道缓冲区
 # （几 KB）填满后子进程会卡死在写日志上，表现成「服务起来了但不响应」。
 # 直接落文件而不是用 Register-ObjectEvent：那条路要两个处理器往同一个非线程安全的
@@ -75,9 +85,20 @@ for ($i = 0; $i -lt 60; $i++) {
 }
 
 if (-not $ready) {
-    Write-Fail '服务没起来'
+    # PS 里 if 不是表达式，( ) 里只允许 pipeline —— 写成 Write-Fail (if ...) 会把 if
+    # 当成命令名，配上开头那句 $ErrorActionPreference = 'Stop' 就是整个脚本当场中止：
+    # 日志不打、$proc.Kill() 不执行，hyxi.exe 变成孤儿进程继续占着 8000 端口。
+    # 赋值右侧的 if 是合法的，所以先接一把
+    $failMsg = if ($proc.HasExited) { "进程已退出（退出码 $($proc.ExitCode)）" } else { '服务没起来' }
+    Write-Fail $failMsg
     Write-Host (Get-Log) -ForegroundColor DarkGray
     if (-not $proc.HasExited) { $proc.Kill() }
+    exit 1
+}
+# 进程活着才算数：它退出了而端口仍有应答，说明应答的是别人
+if ($proc.HasExited) {
+    Write-Fail "便携包进程已退出（退出码 $($proc.ExitCode)），刚才应答的是别的实例"
+    Write-Host (Get-Log) -ForegroundColor DarkGray
     exit 1
 }
 Write-Ok '服务已就绪（PATH 里没有 Python、没有 Node）'

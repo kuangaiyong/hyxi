@@ -4736,12 +4736,15 @@ class TestPortablePackagePathsEndToEnd:
         采集脚本和 playwright 四个位置"""
         from app import paths
 
-        self._freeze_at(self.tmpdir)
-        real = os.path.realpath(self.tmpdir)
+        pkg = os.path.join(self.tmpdir, "HYXi-9.9.9-win64")
+        self._freeze_at(pkg)
+        real = os.path.realpath(pkg)
         assert paths.is_frozen()
         assert paths.project_root() == real
-        # 便携包里没有 backend/ 这一层
-        assert paths.data_dir() == os.path.join(real, "data")
+        # 数据在包的**同级**：包目录带版本号，装包里的话每升一次级
+        # 就是一个全新的空目录，配置和历史数据全丢
+        assert paths.data_dir() == os.path.join(
+            os.path.realpath(self.tmpdir), paths.EXTERNAL_DATA_DIRNAME)
 
     def test_frozen_root_is_expanded_from_8_3_short_paths(self):
         """sys.executable 可能是 8.3 短路径 —— 实测双击启动器拿到的是
@@ -4817,9 +4820,9 @@ class TestPortablePackagePathsEndToEnd:
         from cryptography.fernet import Fernet
         import run_server
 
-        run_server.ensure_env_file(self.tmpdir)
-
         env = os.path.join(self.tmpdir, ".env")
+        run_server.ensure_env_file(env)
+
         assert os.path.isfile(env)
         line = [l for l in open(env, encoding="utf-8").read().splitlines()
                 if l.startswith("TWEAKERS_SECRET_KEY=")]
@@ -4837,7 +4840,7 @@ class TestPortablePackagePathsEndToEnd:
         with open(env, "w", encoding="utf-8") as f:
             f.write("TWEAKERS_SECRET_KEY=already-here\n")
 
-        run_server.ensure_env_file(self.tmpdir)
+        run_server.ensure_env_file(env)
         assert open(env, encoding="utf-8").read().count("TWEAKERS_SECRET_KEY=") == 1
         assert "already-here" in open(env, encoding="utf-8").read()
 
@@ -4849,7 +4852,7 @@ class TestPortablePackagePathsEndToEnd:
         with open(env, "w", encoding="utf-8") as f:
             f.write("TWEAKERS_API_KEY=mine\nTWEAKERS_TASK_TIMEOUT_MINUTES=60\n")
 
-        run_server.ensure_env_file(self.tmpdir)
+        run_server.ensure_env_file(env)
         text = open(env, encoding="utf-8").read()
         assert "TWEAKERS_API_KEY=mine" in text
         assert "TWEAKERS_TASK_TIMEOUT_MINUTES=60" in text
@@ -4860,9 +4863,9 @@ class TestPortablePackagePathsEndToEnd:
         自动生成一把反而要求用户先去前端粘贴一次才能用"""
         import run_server
 
-        run_server.ensure_env_file(self.tmpdir)
-        assert "TWEAKERS_API_KEY" not in open(
-            os.path.join(self.tmpdir, ".env"), encoding="utf-8").read()
+        env = os.path.join(self.tmpdir, ".env")
+        run_server.ensure_env_file(env)
+        assert "TWEAKERS_API_KEY" not in open(env, encoding="utf-8").read()
 
 
 class TestFreshReplyDetectionEndToEnd:
@@ -5230,3 +5233,249 @@ class TestResultsViewRevealsFreshRepliesEndToEnd:
             import pytest
             pytest.skip("未安装 node")
         assert self._visible(self._replies(10, matched_at=8)) == 10
+
+
+class TestPortableDataSurvivesUpgradeEndToEnd:
+    """便携包升级后，配置和数据必须还在 —— 真目录、真文件、真复制，不 mock。
+
+    包目录带版本号，升级就是解压出一个全新的空目录。数据以前放在包**里**，于是用户每升
+    一次级，LLM 配置、数据源、跑过的任务和舆情结论就全部要重来一遍（用户实测报过）。
+    现在数据挂在包的**同级**目录，并在第一次升上来时把旧包里的那份接过来。
+    """
+
+    def setup_method(self):
+        import app.paths as paths
+        self.paths = paths
+        # realpath：mkdtemp 在本机给的是 8.3 短路径（C:\Users\ADMINI~1\...），
+        # 而 project_root() 会把它展开成长路径 —— 不对齐的话比的是两种写法
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
+        self._old_frozen = getattr(sys, "frozen", None)
+        self._old_exe = sys.executable
+
+    def teardown_method(self):
+        if self._old_frozen is None:
+            if hasattr(sys, "frozen"):
+                del sys.frozen
+        else:
+            sys.frozen = self._old_frozen
+        sys.executable = self._old_exe
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _install(self, name, with_data=False, env_body=None):
+        """造一个便携包目录。with_data=True 就是「已经用过一阵子」的老布局安装。"""
+        root = os.path.join(self.tmp, name)
+        os.makedirs(os.path.join(root, "app"), exist_ok=True)
+        exe = os.path.join(root, "app", "hyxi.exe")
+        open(exe, "wb").close()
+        if with_data:
+            os.makedirs(os.path.join(root, "data", "media", "src_x"), exist_ok=True)
+            with open(os.path.join(root, "data", "hyxi.db"), "wb") as f:
+                f.write(b"SQLite format 3\x00" + name.encode())
+            with open(os.path.join(root, "data", "media", "src_x", "p.jpg"), "wb") as f:
+                f.write(b"\xff\xd8\xff")
+        if env_body is not None:
+            with open(os.path.join(root, ".env"), "w", encoding="utf-8") as f:
+                f.write(env_body)
+        return root, exe
+
+    def _become(self, exe):
+        """让 paths 认为「我就是这个包里的 hyxi.exe」—— 走的是 is_frozen() 真实的判据"""
+        sys.frozen = True
+        sys.executable = exe
+
+    # ---------- 路径解析 ----------
+
+    def test_fresh_install_puts_data_beside_the_package_not_inside(self):
+        """新装：数据落在包的同级目录。装包里的话，下一个版本就是一个空目录"""
+        root, exe = self._install("HYXi-1.8.2-win64")
+        self._become(exe)
+        assert self.paths.data_dir() == os.path.join(self.tmp, self.paths.EXTERNAL_DATA_DIRNAME)
+        assert self.paths.env_file() == os.path.join(
+            self.tmp, self.paths.EXTERNAL_DATA_DIRNAME, ".env"
+        ), ".env 必须跟着数据走 —— 密钥与库一分家，凭据密文就全部解不开"
+
+    def test_an_existing_install_keeps_using_the_data_inside_it(self):
+        """老布局向后兼容：包里已经有 data 就沿用。
+
+        升上来的用户只是重启一次，不能凭空变成空库。
+        """
+        root, exe = self._install("HYXi-1.8.1-win64", with_data=True, env_body="TWEAKERS_SECRET_KEY=old\n")
+        self._become(exe)
+        assert self.paths.data_dir() == os.path.join(root, "data")
+        assert self.paths.env_file() == os.path.join(root, ".env")
+
+    def test_source_checkout_is_untouched(self):
+        """源码态一个字都不该变 —— 开发机的 .env 在仓库根，数据在 backend/data"""
+        if hasattr(sys, "frozen"):
+            del sys.frozen
+        root = self.paths.project_root()
+        assert self.paths.data_dir() == os.path.join(root, "backend", "data")
+        assert self.paths.env_file() == os.path.join(root, ".env")
+
+    # ---------- 升级接管 ----------
+
+    def _adopt(self, root):
+        import run_server
+        run_server.adopt_previous_install(root)
+
+    def test_upgrade_adopts_the_previous_installs_data_and_key(self):
+        """核心用例：旧版本用过一阵子，新版本解压在旁边，启动即接上。
+
+        密钥必须一起搬 —— 只搬库的话数据源密码全部解不开，用户还得重新录入一遍。
+        """
+        old_root, _ = self._install(
+            "HYXi-1.8.1-win64", with_data=True, env_body="TWEAKERS_SECRET_KEY=the-old-key\n")
+        new_root, new_exe = self._install("HYXi-1.8.2-win64")
+        self._become(new_exe)
+
+        self._adopt(new_root)
+
+        target = os.path.join(self.tmp, self.paths.EXTERNAL_DATA_DIRNAME)
+        with open(os.path.join(target, "hyxi.db"), "rb") as f:
+            assert b"HYXi-1.8.1-win64" in f.read(), "接过来的不是旧版本那份库"
+        assert os.path.exists(os.path.join(target, "media", "src_x", "p.jpg")), "配图没跟过来"
+        with open(os.path.join(target, ".env"), encoding="utf-8") as f:
+            assert "the-old-key" in f.read(), "密钥没跟过来，库里的凭据密文就全废了"
+        # 复制而不是移动：旧包留在原地，用户确认没问题再自己删
+        assert os.path.exists(os.path.join(old_root, "data", "hyxi.db")), "旧包被搬空了，回退不了"
+
+    def test_the_new_version_generates_its_key_into_the_adopted_dir(self):
+        """接管之后再补密钥：旧 .env 已经在那儿，绝不能被一把新密钥顶掉"""
+        import run_server
+        self._install("HYXi-1.8.1-win64", with_data=True, env_body="TWEAKERS_SECRET_KEY=the-old-key\n")
+        new_root, new_exe = self._install("HYXi-1.8.2-win64")
+        self._become(new_exe)
+
+        run_server.adopt_previous_install(new_root)
+        run_server.ensure_env_file(self.paths.env_file())
+
+        with open(self.paths.env_file(), encoding="utf-8") as f:
+            body = f.read()
+        assert "the-old-key" in body, "旧密钥被新生成的顶掉了 —— 凭据全部解不开"
+        assert body.count("TWEAKERS_SECRET_KEY=") == 1, body
+
+    def test_the_busiest_previous_install_wins(self):
+        """旁边摆着好几个旧版本时，取最近用过的那个（按 hyxi.db 的改动时间）"""
+        stale, _ = self._install("HYXi-1.6.0-win64", with_data=True)
+        recent, _ = self._install("HYXi-1.8.1-win64", with_data=True)
+        os.utime(os.path.join(stale, "data", "hyxi.db"), (1_600_000_000, 1_600_000_000))
+        new_root, new_exe = self._install("HYXi-1.8.2-win64")
+        self._become(new_exe)
+
+        self._adopt(new_root)
+
+        with open(os.path.join(self.tmp, self.paths.EXTERNAL_DATA_DIRNAME, "hyxi.db"), "rb") as f:
+            assert b"HYXi-1.8.1-win64" in f.read(), "接的是那个早就不用的旧版本"
+
+    def test_existing_external_data_is_never_overwritten(self):
+        """第二次、第三次升级：外部数据已经在了，旁边的旧包一律不许覆盖它。
+
+        少了这条，每升一次级都会被某个还没删掉的旧文件夹把当前数据顶回去。
+        """
+        target = os.path.join(self.tmp, self.paths.EXTERNAL_DATA_DIRNAME)
+        os.makedirs(target)
+        with open(os.path.join(target, "hyxi.db"), "wb") as f:
+            f.write(b"SQLite format 3\x00CURRENT")
+        self._install("HYXi-1.8.1-win64", with_data=True)
+        new_root, new_exe = self._install("HYXi-1.8.3-win64")
+        self._become(new_exe)
+
+        self._adopt(new_root)
+
+        with open(os.path.join(target, "hyxi.db"), "rb") as f:
+            assert b"CURRENT" in f.read(), "当前数据被旧包顶掉了"
+
+    def test_a_lone_fresh_install_starts_empty_without_error(self):
+        """旁边什么都没有：安安静静地从空开始，不该抛异常"""
+        new_root, new_exe = self._install("HYXi-1.8.2-win64")
+        self._become(new_exe)
+        self._adopt(new_root)
+        assert not os.path.exists(os.path.join(self.tmp, self.paths.EXTERNAL_DATA_DIRNAME))
+
+    def test_old_layout_install_is_left_alone(self):
+        """包内已有 data 的老安装：原地用自己的，不往外搬、也不去接别人的"""
+        old_root, old_exe = self._install("HYXi-1.8.1-win64", with_data=True)
+        self._install("HYXi-1.7.0-win64", with_data=True)
+        self._become(old_exe)
+
+        self._adopt(old_root)
+
+        assert self.paths.data_dir() == os.path.join(old_root, "data")
+        assert not os.path.exists(os.path.join(self.tmp, self.paths.EXTERNAL_DATA_DIRNAME))
+
+    # ---------- 两个易错的边界 ----------
+
+    def test_a_hand_written_env_in_the_package_never_shadows_the_data_one(self):
+        """用户照《使用说明》在包根手写 .env 开局域网访问 —— 不能遮住数据目录那份。
+
+        遮住了的话，ensure_env_file() 会见它没有 SECRET_KEY 便补上一把**新**密钥，
+        而库里的凭据是用旧密钥加密的 —— 界面只会说「与保存时的密钥不一致」。
+        """
+        import run_server
+        root, exe = self._install("HYXi-1.9.0-win64")
+        self._become(exe)
+        external = os.path.join(self.tmp, self.paths.EXTERNAL_DATA_DIRNAME)
+        os.makedirs(external)
+        with open(os.path.join(external, ".env"), "w", encoding="utf-8") as f:
+            f.write("TWEAKERS_SECRET_KEY=the-real-key\n")
+        # 用户在包根另建了一份，里面只有局域网那几行
+        with open(os.path.join(root, ".env"), "w", encoding="utf-8") as f:
+            f.write("TWEAKERS_HOST=0.0.0.0\n")
+
+        assert self.paths.env_file() == os.path.join(external, ".env"), \
+            "包根那份把数据目录的 .env 遮住了"
+
+        run_server.ensure_env_file(self.paths.env_file())
+        with open(os.path.join(external, ".env"), encoding="utf-8") as f:
+            assert "the-real-key" in f.read(), "真正在用的密钥被动了"
+        with open(os.path.join(root, ".env"), encoding="utf-8") as f:
+            assert "SECRET_KEY" not in f.read(), "往包根那份里补了一把新密钥"
+
+    def test_a_failed_adoption_leaves_nothing_behind_so_it_retries(self):
+        """搬到一半出错：不能把半份数据留在目标位置。
+
+        留下半份是永久性的坏状态：.env 那一步没执行到，密钥会被当成缺失
+        重新生成；而下次启动 os.path.exists(target) 直接短路，再也不会重试。
+        """
+        import run_server
+        old_root, _ = self._install(
+            "HYXi-1.8.1-win64", with_data=True, env_body="TWEAKERS_SECRET_KEY=k\n")
+        new_root, new_exe = self._install("HYXi-1.9.0-win64")
+        self._become(new_exe)
+        target = os.path.join(self.tmp, self.paths.EXTERNAL_DATA_DIRNAME)
+
+        real_copytree = shutil.copytree
+
+        def boom(src, dst, *a, **kw):
+            real_copytree(src, dst, *a, **kw)      # 先真的把文件写出去
+            raise shutil.Error("[('x', 'y', 'PermissionError')]")   # 再像它那样收尾抛
+
+        shutil.copytree = boom
+        try:
+            run_server.adopt_previous_install(new_root)
+        finally:
+            shutil.copytree = real_copytree
+
+        assert not os.path.exists(target), "半份数据留在了目标位置，下次启动不会重试"
+        assert not os.path.exists(target + ".partial"), "暂存目录没清掉"
+        # 修好那个毛病后再启动一次，应该能正常接过来
+        run_server.adopt_previous_install(new_root)
+        with open(os.path.join(target, ".env"), encoding="utf-8") as f:
+            assert "TWEAKERS_SECRET_KEY=k" in f.read()
+
+    def test_source_checkout_never_adopts_a_neighbouring_project(self):
+        """源码态调到这里时不能去扫仓库的父目录 —— 那里躺着别的项目"""
+        import run_server
+        if hasattr(sys, "frozen"):
+            del sys.frozen
+        neighbour = os.path.join(self.tmp, "隔壁项目")
+        os.makedirs(os.path.join(neighbour, "data"))
+        with open(os.path.join(neighbour, "data", "hyxi.db"), "wb") as f:
+            f.write(b"SQLite format 3\x00NEIGHBOUR")
+        fake_repo = os.path.join(self.tmp, "仓库")
+        os.makedirs(fake_repo)
+
+        run_server.adopt_previous_install(fake_repo)   # 不报错，也什么都不该做
+
+        assert not os.path.exists(os.path.join(self.tmp, self.paths.EXTERNAL_DATA_DIRNAME))
+        assert not os.path.exists(os.path.join(fake_repo, "data"))

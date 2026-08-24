@@ -3,7 +3,11 @@
 import os
 from typing import List
 from pydantic_settings import BaseSettings
-from app.paths import data_dir as _resolve_data_dir, project_root as _resolve_project_root
+from app.paths import (
+    data_dir as _resolve_data_dir,
+    env_file as _resolve_env_file,
+    project_root as _resolve_project_root,
+)
 
 # 冻结后 __file__ 不再指向源码树，这两条路径错了会连锁带偏数据、密钥、采集脚本和
 # playwright 四个位置。算法只有 app/paths.py 那一份，别在这里另写
@@ -40,9 +44,11 @@ class Settings(BaseSettings):
     # 采集子进程用的 node 可执行文件，留空则按 resolve_node_executable() 自动找
     node_path: str = ""
 
-    # env_file 锚死在项目根：写相对路径时 pydantic-settings 按 cwd 找，而文档里的启动命令
-    # 先 cd 进 backend，根目录的 .env 会被整个跳过（密钥漏配却毫无提示）
-    model_config = {"env_prefix": "TWEAKERS_", "env_file": os.path.join(_ROOT, ".env")}
+    # env_file 写绝对路径：给相对路径时 pydantic-settings 按 cwd 找，而文档里的启动
+    # 命令先 cd 进 backend，根目录的 .env 会被整个跳过（密钥漏配却毫无提示）。
+    # 源码态是仓库根，便携包里跟着数据目录走 —— 密钥与 hyxi.db 一分家，
+    # 库里的凭据密文就再也解不开了（见 paths.env_file）
+    model_config = {"env_prefix": "TWEAKERS_", "env_file": _resolve_env_file()}
 
 
 settings = Settings()

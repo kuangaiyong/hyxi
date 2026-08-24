@@ -3,11 +3,13 @@
 源码开发态**不走这里**（那条路是 `start.ps1` 起 uvicorn + Vite 两个进程），所以这里
 只管打包态需要、而开发态天然成立的那些事：密钥自动生成、依赖自检、单进程起服务。
 
-四件事的顺序是锁死的，别调换：
-  1. 先算包根、生成 .env
-  2. 再 import app.config（`settings` 是 import 期实例化并当场读 .env 的）
-  3. 起飞前自检
-  4. uvicorn.run + 开浏览器
+五件事的顺序是锁死的，别调换：
+  1. 先算包根
+  2. 接管旧版本的数据（必须在生成 .env 之前 —— 否则先生成一把**新**密钥，
+     旧 .env 因为「已存在」不再被复制，数据搬过来了密码却全部解不开）
+  3. 生成 .env
+  4. 再 import app.config（`settings` 是 import 期实例化并当场读 .env 的）
+  5. 起飞前自检，然后 uvicorn.run + 开浏览器
 """
 
 import os
@@ -23,17 +25,91 @@ import webbrowser
 # 会以为程序坏了。这只在打包态的启动路径上屏蔽，源码态照常暴露出来
 warnings.filterwarnings("ignore", message=".*protected namespace.*")
 
-from app.paths import project_root  # noqa: E402
+from app.paths import data_dir, env_file, is_frozen, project_root  # noqa: E402
 
 
 def _line(text: str = "") -> None:
     print(text, flush=True)
 
 
+# ===== 0. 升级时把旧版本的数据接过来 =====
+
+def _previous_install(root: str):
+    """旁边那个装着数据的旧版本包。没有就返回 None。
+
+    包目录带版本号，升级就是解压出一个全新的空目录 —— 用户过去每升一次级，LLM 配置、
+    数据源、跑过的任务和舆情结论就全部要重来一遍。数据现在挂在包的同级目录，但**第一次**
+    升上来的时候它还在旧包肚子里，得去把它接出来。
+
+    判据是「同级目录里有 data/hyxi.db」，多个就取 hyxi.db 最近改过的那个 —— 那才是
+    用户真正在用的那份，按目录名比版本号会在改过名字的目录上判错。
+    """
+    parent = os.path.dirname(root)
+    found = []
+    try:
+        entries = os.listdir(parent)
+    except OSError:
+        return None
+    for name in entries:
+        candidate = os.path.join(parent, name)
+        if os.path.normcase(candidate) == os.path.normcase(root) or not os.path.isdir(candidate):
+            continue
+        db = os.path.join(candidate, "data", "hyxi.db")
+        if os.path.exists(db):
+            found.append((os.path.getmtime(db), candidate))
+    return max(found)[1] if found else None
+
+
+def adopt_previous_install(root: str) -> None:
+    """外部数据目录还不存在时，把旧版本包里的 data 和 .env 复制过来。
+
+    **复制而不是移动**：旧包留在原地照样能跑，用户想回退就回退，确认没问题再自己删。
+    数据量在几 MB 到几十 MB 这个量级（库 + 配图），一次性的开销可以接受，而且搬完之后
+    数据就在包外了，以后每次升级都不用再复制。
+
+    **先搬进暂存目录、齐了再整体改名**，不直接往 target 里写。`shutil.copytree` 是攒到
+    最后才抛 `shutil.Error` 的 —— 中途一个文件读不动（杀软锁着某张图、旧实例还开着某个
+    session 文件），半份数据就留在 target 上了，而那是个永久性的坏状态：`.env` 那一步在
+    同一个 try 里没执行到，密钥被当成缺失重新生成，库里的凭据全部解不开；下次启动
+    `os.path.exists(target)` 又直接短路，再也不会重试。
+
+    整段是尽力而为：接不过来只是回到「从头配一遍」，不该拦住启动。
+    """
+    if not is_frozen():
+        return                                  # 只服务便携包。源码态跑到这里会去扫仓库
+    target = data_dir()                         # 的父目录，把隔壁项目的 data 拷进来
+    if os.path.exists(target):
+        return                                  # 已经有数据了，别覆盖
+    old = _previous_install(root)
+    if not old:
+        return
+    staging = target + ".partial"
+    try:
+        shutil.rmtree(staging, ignore_errors=True)
+        shutil.copytree(os.path.join(old, "data"), staging)
+        old_env = os.path.join(old, ".env")
+        if os.path.exists(old_env) and not os.path.exists(os.path.join(staging, ".env")):
+            # 密钥必须一起搬，否则库里的数据源密码全部解不开
+            shutil.copy2(old_env, os.path.join(staging, ".env"))
+        os.rename(staging, target)              # 到这一步才对外可见
+        _line(f"  检测到旧版本 {os.path.basename(old)}，已接管它的配置与数据")
+        _line("  确认新版本一切正常后，旧文件夹就可以删了")
+    except Exception as e:
+        # 留下半份比什么都没有更糟：下次启动会以为搬完了，再也不重试
+        shutil.rmtree(staging, ignore_errors=True)
+        _line(f"  [警告] 旧版本数据没能接过来: {e}")
+        _line("         本次按全新安装启动；下次启动会再试一次")
+        _line(f"         也可自己把 {os.path.join(old, 'data')} 整个复制成 {target}")
+
+
 # ===== 1. 密钥 =====
 
-def ensure_env_file(root: str) -> None:
+def ensure_env_file(env_path: str) -> None:
     """没有 .env 就生成一份，只写加密密钥。
+
+    收的是 **.env 的完整路径**（调用方给 `paths.env_file()`）而不是包根 ——
+    写成内部现算的话，传进来的目录就成了一个不起作用的形参，
+    而它真实写入的位置靠全局状态决定（实测踩过：测试传临时目录，它去动了仓库根的 .env）。
 
     **不生成 API_KEY**：便携包绑 127.0.0.1，按项目既定姿态「未设 API_KEY 时不鉴权」正合适；
     自动生成一把反而要求用户先去前端粘贴一次才能用，凭空多一道坎。想开局域网访问的
@@ -46,7 +122,8 @@ def ensure_env_file(root: str) -> None:
     """
     from cryptography.fernet import Fernet
 
-    env_path = os.path.join(root, ".env")
+    # .env 现在住在数据目录里，那个目录首次启动时还不存在
+    os.makedirs(os.path.dirname(env_path), exist_ok=True)
     existing = ""
     if os.path.exists(env_path):
         with open(env_path, "r", encoding="utf-8") as f:
@@ -150,12 +227,18 @@ def main() -> int:
     _line()
 
     _line("==> 准备配置")
+    # 顺序锁死：先接管旧版本的数据，再补密钥 —— 反过来会先生成一把**新**密钥，
+    # 旧 .env 因为「已存在」不再被复制，于是数据搬过来了、密码却全部解不开
+    adopt_previous_install(root)
+    env_path = env_file()
     try:
-        ensure_env_file(root)
+        ensure_env_file(env_path)
     except Exception as e:
         _line(f"  [失败] 生成 .env 失败: {e}")
-        _line("         程序目录可能是只读的，请把整个文件夹解压到有写权限的位置")
+        _line(f"         写不进 {os.path.dirname(env_path)}")
+        _line("         该位置可能是只读的，请把整个文件夹解压到有写权限的地方")
         return 1
+    _line(f"  数据目录: {data_dir()}")
 
     # .env 必须在这一行之前就位
     from app.config import settings
@@ -177,7 +260,7 @@ def main() -> int:
     _line(f"    地址: {url}")
     if local_host != settings.host:
         _line(f"    （监听 {settings.host}，同一局域网内可用本机 IP 访问）")
-    _line("    关闭这个窗口即停止服务。数据都在程序目录的 data 文件夹里。")
+    _line(f"    关闭这个窗口即停止服务。数据都在 {data_dir()}")
     _line()
 
     # 浏览器要等服务真的能应答再开，否则用户看到的是一张连接失败页。
@@ -195,7 +278,7 @@ def main() -> int:
     # （实测报出 "'锛夎蛋涓嶅埌杩欓噷銆?REM' 不是内部或外部命令"）。中文一律从这里出，
     # 控制台此时已被启动器切到 65001，UTF-8 显示正常
     _line()
-    _line("服务已停止。数据都保存在程序目录的 data 文件夹里。")
+    _line(f"服务已停止。数据都保存在 {data_dir()}，升级不会丢。")
     return 0
 
 

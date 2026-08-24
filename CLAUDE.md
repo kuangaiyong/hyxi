@@ -610,10 +610,38 @@ Excel 本身也没有「点图放大」的原生行为。所以跳转入口放�
   调用方报的是「JSON 解析失败」，跟真实原因毫无关系。`web/` 不存在就整段跳过，
   开发态（Vite 5173 代理 `/api`）不受影响
 - **冻结态路径**：`app/paths.py` 是唯一一份算法。冻结时 `project_root` 取
-  `sys.executable` 的上两级（`app\hyxi.exe` → 包根），`data_dir` 取包根下的 `data/`
-  （便携包里没有 `backend/` 这一层）。**它单独成模块是因为 `run_server.py` 必须先算出
-  包根、生成 `.env`，才能 import `app.config`** —— `settings` 是 import 期实例化并当场
-  读 `.env` 的，顺序反了就读不到刚生成的密钥，用户会卡在「数据源」页存不了凭据
+  `sys.executable` 的上两级（`app\hyxi.exe` → 包根）。**它单独成模块是因为
+  `run_server.py` 必须先算出包根、生成 `.env`，才能 import `app.config`** —— `settings`
+  是 import 期实例化并当场读 `.env` 的，顺序反了就读不到刚生成的密钥，用户会卡在
+  「数据源」页存不了凭据
+
+### 数据目录在包的**同级**，不在包里
+
+包目录带版本号，升级就是解压出一个全新的空目录 —— 数据装在包里的话，用户
+每升一次级，LLM 配置、数据源、跑过的任务和舆情结论全部要重来（用户实测报过）。
+
+```
+C:\HYXi├── HYXi-1.8.1-win64\     ← 旧版本，升级后可直接删
+├── HYXi-1.8.2-win64\     ← 新版本，启动即接上数据
+└── HYXi-数据\           ← hyxi.db / .env / media / sessions / logs
+```
+
+- **不放 `%LOCALAPPDATA%`**：那样一来「免安装、整个目录拷走就能换机器、删目录即卸载」
+  三条同时不成立。同级目录把三条都保住了 —— 拷走父目录即搬家，删父目录即卸载
+- **`.env` 必须跟着数据走**（`paths.env_file()`）。里面的 `TWEAKERS_SECRET_KEY` 是数据源
+  密码的加密密钥，它和 `hyxi.db` 一分家，库里的密文就再也解不开，界面只会说
+  「与保存时的密钥不一致，请重新录入凭据」
+- **包内已有 `data/` 时一律沿用它**（`data_dir()` 的 legacy 分支，`env_file()` 同理）。
+  老版本的数据就在那儿，升上来的用户重启一次不能凭空变成空库。**新解压的包里
+  没有这个目录**（ZIP 不含 `data/`，已核实），所以这条只对既有安装生效
+- **首次升上来时从旁边的旧包接数据**（`run_server.adopt_previous_install()`）：同级目录里
+  找带 `data/hyxi.db` 的，多个就取 `hyxi.db` 最近改过的那个（按目录名比版本号会在改过名的
+  目录上判错）。**复制而不是移动** —— 旧包留在原地照样能跑，用户想回退就回退
+- **接管必须排在 `ensure_env_file()` 之前**。反过来会先生成一把**新**密钥，旧 `.env`
+  因为「已存在」不再被复制，于是数据搬过来了、密码却全部解不开
+- **外部数据目录已存在时绝不覆盖**：否则每升一次级都会被某个还没删掉的旧文件夹
+  把当前数据顶回去。回归测试见 `TestPortableDataSurvivesUpgradeEndToEnd`，
+  `verify_package.ps1` 另有一段把同一个包换个版本号解到旁边、当成一次升级真跑一遍
 - **`node_modules` 必须放在包根**：Node 的 `require` 从请求文件所在目录逐级向上找，
   `collectors/` 的上一级正好是包根。挪进 `app\` 就解析不到 playwright。保持这个布局，
   `collector_runner.py` 那句依赖自检一行都不用改
@@ -650,7 +678,7 @@ Excel 本身也没有「点图放大」的原生行为。所以跳转入口放�
 
 ## 测试
 
-**344 个测试，必须全部 PASSED**（本机实测 `344 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
+**356 个测试，必须全部 PASSED**（本机实测 `356 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v

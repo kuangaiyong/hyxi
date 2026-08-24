@@ -1,4 +1,4 @@
-﻿# 便携包验收 —— 在「干净环境」里真跑一遍
+﻿﻿# 便携包验收 —— 在「干净环境」里真跑一遍
 #
 # 用法：.\build\verify_package.ps1 [解压目标目录]
 #
@@ -240,8 +240,8 @@ try {
     Write-Ok '加密密钥没变，已录入的凭据仍能解开'
 } finally { Stop-Pkg $h2 }
 
-# ---- 5b. 从旧布局接管：1.8.1 及以前的数据还在旧包肊子里 ----
-# _previous_install() 只认「同级目录里有 data\hyxi.db」，不必搬一个完整的包过来
+# ---- 5b. 从旧布局接管：1.8.1 及以前的数据还在旧包肚子里 ----
+# _previous_install() 只认「同级目录里有装着用户数据的 data\」，不必搬一个完整的包过来
 Write-Step '从旧版本包里接数据'
 $legacy = Join-Path $destDir 'HYXi-1.8.1-win64'
 New-Item -ItemType Directory -Force -Path $legacy | Out-Null
@@ -265,7 +265,42 @@ try {
     Write-Ok '旧包原封不动，想回退就回退'
 } finally { Stop-Pkg $h3 }
 
+# ---- 5c. 先试了一下新版本，之后才回旧版本把东西配好（用户实测报过这条）----
+# 「下载新版本 → 先双击试试 → 发现要重配 → 回去接着用旧的 → 再来试新的」是最自然的
+# 升级姿势。第一次试跑就把外部数据目录建出来了，接管若只看目录存不存在就此永久短路。
+# 造时序不需要额外依赖：把旧包的 data 先藏起来 = 那会儿旧版本还没配过东西。
+Write-Step '先试跑新版本，之后才回旧版本配东西'
+Remove-Item $dataDir -Recurse -Force -ErrorAction SilentlyContinue
+Rename-Item (Join-Path $legacy 'data') 'data_hidden'
+
+$h4 = Start-Pkg $next 'first-try'
+try {
+    if (-not (Test-Path $dataDir)) { Write-Fail '首次试跑没建出数据目录，这条路测不到'; exit 1 }
+    $cfg = Invoke-RestMethod -Uri 'http://127.0.0.1:8000/api/v1/config'
+    if ($cfg.model_name -eq $probe) { Write-Fail '试跑时不该有配置，场景没造对'; exit 1 }
+    Write-Ok '第一次试跑：建出空的数据目录（用户此时会发现要重配）'
+} finally { Stop-Pkg $h4 }
+
+Rename-Item (Join-Path $legacy 'data_hidden') 'data'     # 用户回旧版本，把东西配好了
+$h5 = Start-Pkg $next 'adopt-later'
+try {
+    $cfg = Invoke-RestMethod -Uri 'http://127.0.0.1:8000/api/v1/config'
+    if ($cfg.model_name -ne $probe) {
+        Write-Fail "试跑过之后就再也接不上了（读到 '$($cfg.model_name)'，应为 '$probe'）"; exit 1
+    }
+    Write-Ok '再启新版本：旧版本配的东西接过来了'
+    $keyAfter = Get-SecretKey (Join-Path $dataDir '.env')
+    if ($keyAfter -ne $keyBefore) { Write-Fail '接管时密钥没跟过来'; exit 1 }
+    Write-Ok '密钥换回了旧包那把，凭据仍能解开'
+    # 用 Where-Object 而不是 -Filter：后者把模式交给文件系统 API 去匹配，
+    # 中文对不上时**一条都选不出来**，这条断言就永远是绿的，等于没测
+    $leftover = Get-ChildItem $destDir -Directory |
+        Where-Object { $_.Name -like 'HYXi-数据*' -and $_.Name -ne 'HYXi-数据' }
+    if ($leftover) { Write-Fail "数据目录旁边留下了 $($leftover.Name)"; exit 1 }
+    Write-Ok '顶掉的空壳没留在旁边'
+} finally { Stop-Pkg $h5 }
+
 Write-Step '结果'
 Write-Host "    便携包验收通过：$pkg" -ForegroundColor Green
-Write-Host "    升级验证通过：常规升级 + 从旧包接管，两条路的数据与密钥都在" -ForegroundColor Green
+Write-Host "    升级验证通过：常规升级 + 从旧包接管 + 试跑后再接管，三条路的数据与密钥都在" -ForegroundColor Green
 exit 0

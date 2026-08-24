@@ -52,7 +52,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="HYXi 舆情分析 API",
     description="HYXi 舆情分析平台 — 论坛帖子抓取、翻译与情感分析服务",
-    version="1.9.0",
+    version="1.9.1",
     lifespan=lifespan,
     docs_url="/docs" if settings.enable_docs else None,
     redoc_url="/redoc" if settings.enable_docs else None,
@@ -113,7 +113,7 @@ async def health():
 async def version():
     return {
         "service": "HYXi 舆情分析 API",
-        "version": "1.9.0",
+        "version": "1.9.1",
         "docs": "/docs",
     }
 
@@ -164,6 +164,6 @@ if not mount_frontend(app, os.path.join(settings.project_root, "web")):
     async def root():
         return {
             "service": "HYXi 舆情分析 API",
-            "version": "1.9.0",
+            "version": "1.9.1",
             "docs": "/docs",
         }

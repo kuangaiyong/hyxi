@@ -5283,6 +5283,39 @@ class TestPortableDataSurvivesUpgradeEndToEnd:
         sys.frozen = True
         sys.executable = exe
 
+    def _real_db(self, data_path, model=None):
+        """在 data_path 里建一个**真**库：表结构走 storage.init_db()，不是手搓的假表。
+
+        `seed_default_sources()` 是照着 main.py 的 lifespan 来的 —— 刚建出来的空目录
+        也会有一条 sources 记录。判据里 sources 的门槛因此是 1 而不是 0，给 0 的话
+        每个全新目录看起来都是有数据的，接管永远不会发生。
+        """
+        import app.services.storage as storage
+        from app.services import source_service
+        os.makedirs(data_path, exist_ok=True)
+        old = storage.DB_PATH
+        storage.DB_PATH = os.path.join(data_path, "hyxi.db")
+        try:
+            storage.init_db()
+            source_service.seed_default_sources()
+            if model:
+                storage.set_app_config("llm", {
+                    "api_key": "sk-probe", "base_url": "https://api.deepseek.com",
+                    "model_name": model,
+                })
+        finally:
+            storage.DB_PATH = old
+
+    def _model_name(self, data_path):
+        """从真库里读回 LLM 模型名 —— 用户就是靠这一格发现数据没带过来的"""
+        import app.services.storage as storage
+        old = storage.DB_PATH
+        storage.DB_PATH = os.path.join(data_path, "hyxi.db")
+        try:
+            return storage.get_app_config("llm").get("model_name")
+        finally:
+            storage.DB_PATH = old
+
     # ---------- 路径解析 ----------
 
     def test_fresh_install_puts_data_beside_the_package_not_inside(self):
@@ -5384,6 +5417,151 @@ class TestPortableDataSurvivesUpgradeEndToEnd:
 
         with open(os.path.join(target, "hyxi.db"), "rb") as f:
             assert b"CURRENT" in f.read(), "当前数据被旧包顶掉了"
+
+    # ---------- 「先试了一下新版本」这条路（用户实测报过） ----------
+
+    def test_a_version_opened_before_the_data_existed_still_adopts_it_later(self):
+        """用户实测报的：新版本先双击试了一下，那会儿旧版本还没配东西；之后回旧版本
+        配好 LLM（模型名 deepseek-chat123），再启新版本 —— 一条都没带过来。
+
+        「先试试新版本 → 发现要重配 → 回去接着用旧的 → 再来试新的」正是最自然的
+        升级姿势，而第一次试跑就把外部数据目录建出来了。接管原先只看这个目录
+        存不存在，于是此后**永远**短路，用户还看不到任何原因。
+        判据必须是「里面有没有用户自己的东西」。
+        """
+        old_root, _ = self._install(
+            "HYXi-1.8.1-win64", env_body="TWEAKERS_SECRET_KEY=the-old-key\n")
+        self._real_db(os.path.join(old_root, "data"), model="deepseek-chat123")
+        new_root, new_exe = self._install("HYXi-1.9.0-win64")
+        self._become(new_exe)
+        # 新版本被打开过一次：目录、空库、新密钥都建出来了，但用户什么都还没做
+        target = os.path.join(self.tmp, self.paths.EXTERNAL_DATA_DIRNAME)
+        self._real_db(target)
+        with open(os.path.join(target, ".env"), "w", encoding="utf-8") as f:
+            f.write("TWEAKERS_SECRET_KEY=a-brand-new-key\n")
+
+        self._adopt(new_root)
+
+        assert self._model_name(target) == "deepseek-chat123", "旧版本配的模型没带过来"
+        with open(os.path.join(target, ".env"), encoding="utf-8") as f:
+            assert "the-old-key" in f.read(), "密钥没跟着搬 —— 库里的凭据密文就全废了"
+
+    def test_a_data_dir_the_user_has_actually_used_is_never_replaced(self):
+        """对照组：外部目录里已经有用户自己配的东西，旁边的旧包一律不许顶掉它。
+
+        只测上一条的话，把接管改成「无条件覆盖」也是绿的 —— 而那会让每一次
+        启动都被某个还没删掉的旧文件夹把当前数据冲回去。
+        """
+        old_root, _ = self._install("HYXi-1.8.1-win64", env_body="TWEAKERS_SECRET_KEY=old\n")
+        self._real_db(os.path.join(old_root, "data"), model="deepseek-chat123")
+        new_root, new_exe = self._install("HYXi-1.9.1-win64")
+        self._become(new_exe)
+        target = os.path.join(self.tmp, self.paths.EXTERNAL_DATA_DIRNAME)
+        self._real_db(target, model="用户在新版本里自己配的")
+
+        self._adopt(new_root)
+
+        assert self._model_name(target) == "用户在新版本里自己配的", "正在用的配置被旧包顶掉了"
+
+    def test_a_data_dir_where_only_a_source_was_added_is_still_protected(self):
+        """只加了数据源、还没来得及配 LLM 的目录，也不许被旧包顶掉。
+
+        判据里 sources 的门槛是 1（首启会自动补一条 Tweakers 源）——「大于 0」会让
+        每个空目录都算有数据，而「不看 sources」则会把用户刚加的源静默冲掉。
+        """
+        old_root, _ = self._install("HYXi-1.8.1-win64", env_body="TWEAKERS_SECRET_KEY=old\n")
+        self._real_db(os.path.join(old_root, "data"), model="deepseek-chat123")
+        new_root, new_exe = self._install("HYXi-1.9.1-win64")
+        self._become(new_exe)
+        target = os.path.join(self.tmp, self.paths.EXTERNAL_DATA_DIRNAME)
+        self._real_db(target)
+        import app.services.storage as storage
+        old_db = storage.DB_PATH
+        storage.DB_PATH = os.path.join(target, "hyxi.db")
+        try:
+            storage.save_source({"id": "src_mine", "name": "我自己加的",
+                                 "collector_id": "tweakers", "params": {}, "enabled": True})
+        finally:
+            storage.DB_PATH = old_db
+
+        self._adopt(new_root)
+
+        storage.DB_PATH = os.path.join(target, "hyxi.db")
+        try:
+            assert any(s["id"] == "src_mine" for s in storage.load_sources()), \
+                "用户刚加的数据源被旧包冲掉了"
+        finally:
+            storage.DB_PATH = old_db
+
+    def test_an_empty_previous_install_is_not_adopted_over_and_over(self):
+        """旁边摆着一个从没用过的旧包：不接管，也别打「已接管」的假日志。
+
+        接管一个空库之后 target 仍然是空的，下次启动会照做一遍 —— 每启动一次
+        复制一次，日志上却说数据接过来了。
+        """
+        old_root, _ = self._install("HYXi-1.8.1-win64", env_body="TWEAKERS_SECRET_KEY=old\n")
+        self._real_db(os.path.join(old_root, "data"))       # 装过、但什么都没配
+        new_root, new_exe = self._install("HYXi-1.9.1-win64")
+        self._become(new_exe)
+
+        self._adopt(new_root)
+
+        assert not os.path.exists(os.path.join(self.tmp, self.paths.EXTERNAL_DATA_DIRNAME)), \
+            "把一个空库接管过来了"
+
+    def test_replacing_an_unused_data_dir_leaves_no_leftovers(self):
+        """顶掉的那个空壳目录不能留在数据目录旁边 —— 多一个看不懂的文件夹，
+        用户下次就不知道该备份哪个了。
+        """
+        old_root, _ = self._install("HYXi-1.8.1-win64", env_body="TWEAKERS_SECRET_KEY=k\n")
+        self._real_db(os.path.join(old_root, "data"), model="deepseek-chat123")
+        new_root, new_exe = self._install("HYXi-1.9.0-win64")
+        self._become(new_exe)
+        target = os.path.join(self.tmp, self.paths.EXTERNAL_DATA_DIRNAME)
+        self._real_db(target)
+
+        self._adopt(new_root)
+
+        leftovers = [n for n in os.listdir(self.tmp)
+                     if n.startswith(self.paths.EXTERNAL_DATA_DIRNAME)
+                     and n != self.paths.EXTERNAL_DATA_DIRNAME]
+        assert not leftovers, f"数据目录旁边留下了 {leftovers}"
+
+    def test_a_failed_replacement_puts_the_unused_dir_back(self):
+        """让路之后才失败：必须把它挪回来。
+
+        不挪回来的话，用户连那个（虽然是空的）数据目录都没了 —— 里面的 .env
+        跟着消失，下次启动重新生成一把密钥，而旧包里的凭据是用别的密钥加密的。
+        """
+        old_root, _ = self._install("HYXi-1.8.1-win64", env_body="TWEAKERS_SECRET_KEY=k\n")
+        self._real_db(os.path.join(old_root, "data"), model="deepseek-chat123")
+        new_root, new_exe = self._install("HYXi-1.9.0-win64")
+        self._become(new_exe)
+        target = os.path.join(self.tmp, self.paths.EXTERNAL_DATA_DIRNAME)
+        self._real_db(target)
+        with open(os.path.join(target, ".env"), "w", encoding="utf-8") as f:
+            f.write("TWEAKERS_SECRET_KEY=still-mine\n")
+
+        real_rename = os.rename
+        blown = []
+
+        def flaky(src, dst, *a, **kw):
+            # 只炸第一次 —— 杀软锁一下就放开，还原那一步该能走通
+            if os.path.normcase(str(dst)) == os.path.normcase(target) and not blown:
+                blown.append(1)
+                raise OSError("目标目录被杀软锁着")   # 扶正 staging 那一步炸
+            return real_rename(src, dst, *a, **kw)
+
+        os.rename = flaky
+        try:
+            self._adopt(new_root)
+        finally:
+            os.rename = real_rename
+
+        assert os.path.isdir(target), "让路的那份没挪回来，用户的数据目录凭空消失了"
+        with open(os.path.join(target, ".env"), encoding="utf-8") as f:
+            assert "still-mine" in f.read(), "挪回来的不是原来那份"
+        assert not os.path.exists(target + ".partial"), "暂存目录没清掉"
 
     def test_a_lone_fresh_install_starts_empty_without_error(self):
         """旁边什么都没有：安安静静地从空开始，不该抛异常"""

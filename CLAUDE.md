@@ -771,7 +771,7 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 - **本地 fixture 站点是唯一能跑通的验证手段**：Tweakers 出口 IP 被封，`backend/tests/fixtures/fixture_site.py` 同时挂论坛（`/forum/list_messages/...`）和小组（`/groups/{id}/batch/{n}`）两个站点。跑的仍是真 Chrome、真 HTTP、真子进程、真 DOM 提取，只是被抓的站点换成本地的。要把数据源指过去就在数据源页填 `base_url`
 - **增量抓取从 `maxPage + 1` 开始**（Tweakers）：已抓过的最后一页后来新增的回帖会被永久漏掉，fingerprint 去重救不了（那一页不会再访问）。要补全就把 job 里的 `incremental` 置 false 跑全量
 - **采集脚本必须「读旧 + 合并」再落盘，绝不能只写这一轮抓到的**：落盘文件同时承载 `translation` 和 `_processed` 标记，整体覆盖等于把已翻译的帖子重新变成新帖，下一轮再付一次翻译钱、舆情也重算一遍。`group_feed.js` 曾漏掉这段（信息流没有页码可续，很容易写成「全量重扫 + 覆盖」），已修并有回归测试 `TestGroupFeedCollectorEndToEnd::test_incremental_rerun_keeps_translations`
-- **正文图只存相对路径，`<img>` 靠 `?api_key=` 过鉴权**：`/api/v1/media/{path}` 不能用 `StaticFiles` 挂载 —— `<img>` 没法自定义请求头，只能复用 `require_api_key` 为 SSE 开的 query 参数口子。**路径穿越必须挡**：`data/config.json` 里是明文 LLM API Key。裸的 `../` 通常在客户端就被规范化掉，但 `%2e%2e%2f` 会被框架解码后原样送进 `rel_path` —— 实测确认过，拿裸 `../` 当测试用例等于什么都没测（把校验整段禁用，那版照样绿）
+- **正文图只存相对路径，`<img>` 靠 `?api_key=` 过鉴权**：`/api/v1/media/{path}` 不能用 `StaticFiles` 挂载 —— `<img>` 没法自定义请求头，只能复用 `require_api_key` 为 SSE 开的 query 参数口子。**路径穿越必须挡**：media 目录之外就是 `hyxi.db` 和 `.env` 里的明文加密密钥。裸的 `../` 通常在客户端就被规范化掉，但 `%2e%2e%2f` 会被框架解码后原样送进 `rel_path` —— 实测确认过，拿裸 `../` 当测试用例等于什么都没测（把校验整段禁用，那版照样绿）
 - **存储顺序不是时间顺序，求时间区间必须排序取极值**：信息流按时间倒序渲染，增量又往后追加，落盘数组的首尾和最早/最晚毫无关系。`/stats` 曾直接取 `timestamps[0]` / `[-1]`，实测显示成「开始 2026-07-28、结束 2026-07-10」——开始比结束晚 18 天，还把跨 5～8 月的数据缩成 7 月里的 18 天。排序也**必须先 `_normalize_timestamp()` 转 ISO**：落盘的 `dd-mm-yyyy` 按字符串排是按「日」排先，`01-07` 会排到 `28-06` 前面
 - **`/posts` 的响应里评论挂在主贴的 `replies` 下，按 index 建索引时必须递归展开**：`SentimentView.loadPosts()` 曾只遍历顶层 `posts`，把全部评论漏在外面 —— 实测 88 条里 42 条是评论，情感趋势图只画了 35 条（该 73 条），详情弹窗点评论行也取不到帖子。舆情结果的下标来自扁平数组，评论一样占位
 - **舆情结果贴回帖子必须「先按 key 建映射、再排序」**：`sentiment_*.json` 的 `results[i]` 对齐的是**扁平数组**第 i 条（下标来自 `enumerate(all_posts)`），而导出明细按 `order_by_thread()` 排成「主贴 → 它的评论 → 下一主贴」。排完再按行号取，每条帖子都会配上别人的情感结论 —— 实测 88 条里 72 条位置会变，而导出的表**表面上完全看不出异常**。回归测试见 `TestExportEndpointEndToEnd::test_sentiment_follows_the_post_not_the_row_number`（把实现改成按行号取，它会立刻报出「评论A1 拿到了主贴B 的结论」）
@@ -780,8 +780,5 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 - **删数据源不能让历史任务结果变空白**：`task["result"]["sources"]` 里存了当时的 `output_path`，来源从注册表消失后 `results.py` 照原路读文件兜底
 - **爬虫必须通过 `node` 子进程调用**，不能 import
 - **日志有两套命名空间**：`logging_config.get_logger()` 用全局 `_logger` 缓存，**第一个调用者的 name 定死了整个 logger**（实际是 orchestrator 的 `app.services.orchestrator`）；其余 service 用 `logging.getLogger("hyxi.xxx")`，拿不到那些 handler。加日志时注意实际输出去向
-- **Excel 列名 `chr(64 + col)` 仅支持 26 列以内**
-- **`config.json` 含真实 API Key**，已 gitignore，不要提交
 - **`TaskInputView.vue` 是死代码**（未注册路由，全项目零引用，功能已并入 `TaskManagementView`）
-- **`frontend/tsconfig.tsbuildinfo` 未被 gitignore**，`npm run build` 跑过之后会出现在工作树里
 - **`Bash` 工具不保持 CWD**，每条命令都要自己 `cd` 到正确目录

@@ -692,7 +692,7 @@ C:\HYXi├── HYXi-1.8.1-win64\     ← 旧版本，升级后可直接删
 
 ## 测试
 
-**362 个测试，必须全部 PASSED**（本机实测 `362 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
+**368 个测试，必须全部 PASSED**（本机实测 `368 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
@@ -731,7 +731,7 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 - **绝不按下标跨任务顶替舆情结果**：曾经查不到就 fallback 到最新一条，而那份结果是按别的任务的帖子列表编号的，取来与当前帖子完全对不上；更糟的是增量分析会把它当作 `existing_results` 合并后持久化，直接污染目标任务。**按帖子身份取则相反 —— 必须跨任务共享**，见「持久化」一节
 - **导出只有一个口**：`GET /export?format=xlsx|csv` 出一份含原文 + 译文 + 舆情结论的文件，界面入口只在舆情页。**报告每次下载现算、不落盘**（`ExcelService.build_export` 返回字节流）——落盘既会在 `exports/` 堆垃圾，两个人同时下载还会撞成一个在写另一个在读。流水线的 `generate_excel` 步骤照旧生成它自己那份，但那份不再被任何人下载
 - **导出与页面读同一份结论**（`results.py::_task_sentiment()`）：按帖子身份取，取到什么就写什么，所以报告里的「未分析」条数与舆情页显示的完全一致。它不再有「本任务 / 别的任务」之分 —— 那个区分只在按下标取整数组的年代才有意义
-- **LLM 重试分两层，别混为一谈**：`_retry_with_backoff` 是**传输层**指数退避（3 次，1s/2s/4s），只管 429/5xx；**解析失败是另一回事**——批量输出靠分隔符切分，LLM 偶尔在某一段吐出非 JSON，那一条会被记成 `{"sentiment": null, "reason_cn": "解析失败"}`。翻译和舆情都在批量之后补一轮**单条重试**（单条不必切分隔符，解析可靠得多），实测真实任务里 88 条中的 2 条因此救回。单条重试必须复用批量那份 prompt 片段（`_post_block`），来源标签和父贴上文少给一样就成了另一道题
+- **LLM 重试分两层，别混为一谈**：`_retry_with_backoff` 是**传输层**指数退避（3 次，1s/2s/4s），只管 429/5xx；**解析失败是另一回事**——批量输出靠分隔符切分，LLM 偶尔在某一段吐出非 JSON，那一条会被记成 `{"sentiment": null, "reason_cn": "解析失败"}`。翻译和舆情都在批量之后补一轮**单条重试**（单条不必切分隔符，解析可靠得多），实测真实任务里 88 条中的 2 条因此救回。单条重试必须复用批量那份 prompt 片段（`_post_block`），来源标签和父贴上文少给一样就成了另一道题。**兜底占位一律记 `sentiment: null`，绝不能填一个具体情感值** —— 「模型整批没给分隔符」那条分支曾记成 `neutral`，于是它绕过了上面这轮单条重试（判据就是 sentiment 为不为空）、还被写上 `sentiment_at` 永久定死，最后以「中性 + 解析失败 + 空维度」进报告和情感分布。真实库里捞出 10 条，其中一条正文是明确抱怨固件的「Deze update werkt niet...」却算成中性。`storage.purge_fake_parse_failures()` 清存量（结论行 + `sentiment_at` **两处都要清**，只清一处等于把那几条永久钉在「已分析」上）。它**不在 `init_db()` 的补丁链里**，而由 `TaskOrchestrator.__init__` 在 `_migrate_sentiment()` **之后**调用 —— 旧 JSON blob 里那批假 neutral 正是那一步才写进 `sentiment_results` 的，放进 `init_db()` 会让老库升上来的第一次启动恰好空转，而那正是它唯一该生效的一次。判据里的 `sentiment IS NOT NULL` 同样不能省：新代码写下的占位 sentiment 为空、`reason_cn` 一样是「解析失败」，那是给用户看的原因且本来就没有 `sentiment_at`，连它一起删会让这个一次性迁移永远变不成 no-op。回归测试见 `TestSentimentRetryEndToEnd::test_missing_segments_are_retried_not_faked_as_neutral` 与 `TestFakeNeutralPurgeEndToEnd`
 - **翻译用 LLM 而非 Google Translate**：5 条/批 + `---POST_SEPARATOR---` 切分，解析失败的条目再单条重译。源文本可能是荷兰语或英语且批内混杂，**「译文与原文一字不差且原文非中文」判为漏译**，走同一条单条重译队列
 - **舆情维度是封闭集合**：`DEFAULT_DIMENSIONS` 那 14 个。`_normalize_dimensions()` 把 LLM 返回的标签对齐回去（实测它会把 `认证/合规(如Synergrid)` 简写成 `认证/合规`，于是同一维度在 `top_dimensions` 和 `cross_source` 里各占一行），对不上的直接丢弃。维度表的全部价值就在于它封闭，一碎成近义标签跨来源对比就废了
 - **原子写入**：JSON 先写 `.tmp` 再 `os.replace()`（仅 tasks.json 回退路径有此保护，其他 JSON 是直接覆写）

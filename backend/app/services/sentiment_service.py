@@ -369,23 +369,21 @@ class SentimentService:
                     parts = result_text.split("---SENTIMENT_SEPARATOR---")
 
                     for j, (orig_idx, _p) in enumerate(batch):
-                        if j < len(parts):
-                            parsed = SentimentService._parse_sentiment(parts[j])
-                            if parsed:
-                                results[orig_idx] = parsed
-                                success_count += 1
-                            else:
-                                results[orig_idx] = {
-                                    "sentiment": None,
-                                    "intensity": 0,
-                                    "reason_cn": "解析失败",
-                                    "dimensions": [],
-                                }
-                                fail_count += 1
+                        parsed = (SentimentService._parse_sentiment(parts[j])
+                                  if j < len(parts) else None)
+                        if parsed:
+                            results[orig_idx] = parsed
+                            success_count += 1
                         else:
+                            # 模型整批没照分隔符输出时，切不出来的那几条以前记的是
+                            # neutral —— 那是编出来的结论：sentiment 一有值就绕过了
+                            # 下面的单条重试，还会被写上 sentiment_at 永久定死，最后
+                            # 以「中性 + 解析失败 + 空维度」落进报告和情感分布。
+                            # 记成 None 才进得了重试队列；重试再失败也只是诚实地
+                            # 留一条「未分析」
                             results[orig_idx] = {
-                                "sentiment": "neutral",
-                                "intensity": 1,
+                                "sentiment": None,
+                                "intensity": 0,
                                 "reason_cn": "解析失败",
                                 "dimensions": [],
                             }

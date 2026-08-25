@@ -58,11 +58,16 @@ class _Handler(BaseHTTPRequestHandler):
             joiner = chr(10) + "---POST_SEPARATOR---" + chr(10)
             content = joiner.join(f"译文{i + 1}" for i in range(max(n, 1)))
         elif n_posts > 1:
-            # 批量：前 n-1 条正常，最后一条给一段解析不了的文本。
-            # 分隔符数量仍然对得上，所以走的是 _parse_sentiment 失败那条路，
-            # 而不是「parts 不够」那条。
-            parts = [GOOD] * (n_posts - 1) + ["抱歉，我无法分析这条内容。"]
-            content = f"\n{SEPARATOR}\n".join(parts)
+            if self.server.drop_separator:
+                # 模型压根没照分隔符输出，整批 JSON 连成一段 —— parts 只有 1 段，
+                # 第 2 条往后落进「parts 不够」那条路。真实模型偶尔就是这样。
+                content = "\n".join([GOOD] * n_posts)
+            else:
+                # 批量：前 n-1 条正常，最后一条给一段解析不了的文本。
+                # 分隔符数量仍然对得上，所以走的是 _parse_sentiment 失败那条路，
+                # 而不是「parts 不够」那条。
+                parts = [GOOD] * (n_posts - 1) + ["抱歉，我无法分析这条内容。"]
+                content = f"\n{SEPARATOR}\n".join(parts)
         else:
             content = GOOD
 
@@ -94,8 +99,10 @@ class LLMSite:
     和图片描述。
     """
 
-    def __init__(self, port: int = 0):
+    def __init__(self, port: int = 0, drop_separator: bool = False):
         self._port = port
+        # True 时批量结果整段返回、不带分隔符，走「parts 不够」那条路
+        self.drop_separator = drop_separator
         self._server = None
         self._thread = None
         self.seen = []
@@ -111,6 +118,7 @@ class LLMSite:
         self._server.prompts = self.prompts
         self._server.user_prompts = self.user_prompts
         self._server.translated = self.translated
+        self._server.drop_separator = self.drop_separator
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         return "http://127.0.0.1:{}".format(self._server.server_address[1])

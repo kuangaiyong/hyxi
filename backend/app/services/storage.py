@@ -212,6 +212,59 @@ def _drop_stored_summary(conn) -> None:
         logger.warning("移除 summary_json 列失败（不影响功能，它已不再被读取）: %s", e)
 
 
+def purge_fake_parse_failures() -> None:
+    """清掉「解析失败」那种冒充结论的行，并把对应帖子的 sentiment_at 一并清空。
+
+    模型整批没照分隔符输出时，切不出来的那几条曾被记成
+    {"sentiment": "neutral", "intensity": 1, "reason_cn": "解析失败"}。那不是结论，
+    是兜底占位 —— 它带着 sentiment 值绕过单条重试，又被写上 sentiment_at 永久定死，
+    于是报告和情感分布里凭空多出几条「中性」。实测三个库共 10 条，其中一条正文是
+    「Deze update werkt niet na de update...」，明确在抱怨固件却算成了中性。
+
+    产生它的分支已改回记 None。这里清掉既有的：**两处都要清**，只删结论行的话
+    sentiment_at 还在，增量分析永远不会再碰它们，用户只能走一次全量重跑
+    （为 3 条帖子重算 258 条，还要重新付钱）。清完下一轮增量自然把它们捡回去。
+
+    **必须排在旧 JSON 舆情 blob 的迁移之后**，所以它不在 init_db() 的补丁链里，
+    而由 orchestrator 在 _migrate_sentiment() 之后调用。反过来的话，老库升上来的
+    第一次启动恰好是空转的：清理先跑完，migrate_sentiment_blob() 才把 blob 里那批
+    假 neutral 重新写进 sentiment_results —— 而这一次正是它最该生效的那一次，用户
+    得再重启一遍才看得到效果。
+
+    **`sentiment IS NOT NULL` 不能省**：新代码写下的占位是 sentiment 为空的诚实
+    记录，它带的「解析失败」是给用户看的原因，且本来就没有 sentiment_at、下一轮
+    增量自然会重算。连它一起删的话这个一次性迁移永远变不成 no-op —— 每次启动都在
+    删一条马上又要写回来的行，页面上那条「未分析」还白白丢掉了原因。
+
+    匹配的字符串是**旧版本写下的原文**，故意写死不引用现在的常量 —— 迁移认的是
+    历史数据长什么样，跟着当前代码走反而会在改文案那天静默失配。
+    """
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT source_id, fingerprint FROM sentiment_results "
+            "WHERE reason_cn=? AND sentiment IS NOT NULL",
+            ("解析失败",),
+        ).fetchall()
+        if not rows:
+            return
+        conn.execute(
+            "DELETE FROM sentiment_results WHERE reason_cn=? AND sentiment IS NOT NULL",
+            ("解析失败",),
+        )
+        conn.executemany(
+            "UPDATE posts SET sentiment_at=NULL WHERE source_id=? AND fingerprint=?",
+            [tuple(r) for r in rows],
+        )
+        conn.commit()
+        logger.info("清掉 %d 条「解析失败」占位结论，相关帖子下轮分析会重新算", len(rows))
+    except Exception as e:
+        # 清不掉只是那几条继续显示成「中性/解析失败」，不该拦住启动
+        logger.warning("清理「解析失败」占位结论失败: %s", e)
+    finally:
+        conn.close()
+
+
 def _rekey_sentiment_results(conn) -> None:
     """把主键含 task_id 的旧 sentiment_results 换成按帖子身份。
 

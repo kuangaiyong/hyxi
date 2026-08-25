@@ -271,6 +271,48 @@ class TestSentimentRetryEndToEnd:
         assert server.seen[0] == 3, server.seen
         assert server.seen[1:] == [1], f"重试没有按单条发出: {server.seen}"
 
+    def test_missing_segments_are_retried_not_faked_as_neutral(self):
+        """模型整批没照分隔符输出时，后面几条不能被编成一条 neutral。
+
+        批量结果按 ---SENTIMENT_SEPARATOR--- 切分，模型偶尔把几条 JSON 连成一段 ——
+        parts 只有 1 段，第 2 条往后落进「parts 不够」那条分支。它以前记的是
+        {"sentiment": "neutral", "intensity": 1, "reason_cn": "解析失败"}：
+        sentiment 一有值就绕过了下面的单条重试，还会被写上 sentiment_at 永久定死，
+        最后以「中性 + 解析失败 + 空维度」落进报告和情感分布。真实库里捞出 10 条，
+        其中一条正文是明确在抱怨固件的「Deze update werkt niet na de update...」，
+        却算成了中性。
+        """
+        import asyncio
+        site = self._llm_site()
+        from app.services.sentiment_service import SentimentService
+        from app.services.progress_manager import ProgressManager
+
+        posts = [
+            {"content": f"Deze update werkt niet, versie 2.4.{i} is een ramp.",
+             "fingerprint": f"nofp{i}", "source": "src_x", "timestamp": "01-07-2026 10:00"}
+            for i in range(3)
+        ]
+
+        server = site.LLMSite(drop_separator=True)
+        with server as base_url:
+            self.storage.set_app_config("llm", {
+                "api_key": "sk-test", "base_url": base_url, "model_name": "test-model",
+            })
+            out = asyncio.new_event_loop().run_until_complete(
+                SentimentService.analyze("nosep-e2e", posts, ProgressManager(),
+                                         source_names={"src_x": "Facebook"})
+            )
+
+        results = out["results"]
+        # 占位记录绝不能带着 sentiment 值出门 —— 那就是一条编出来的结论
+        for r in results:
+            assert not (r and r.get("reason_cn") == "解析失败" and r.get("sentiment")),                 f"「解析失败」冒充成了一条真结论: {r}"
+        # 三条全部进了单条重试并拿回真实结论
+        assert server.seen == [3, 1, 1, 1], f"后两条没进重试队列: {server.seen}"
+        assert out["failed"] == 0, f"仍有条目没救回来: {results}"
+        assert all(r["sentiment"] == "negative" for r in results), results
+        assert all(r["dimensions"] == ["固件更新"] for r in results), results
+
 
 class TestIndustryRoleIsSharedWithVision:
     """多模态模型的角色必须与翻译时一致（需求明确要求），且抽取常量没改动翻译行为"""
@@ -2147,6 +2189,187 @@ class TestSentimentRekeyMigrationEndToEnd:
         got = self.storage.get_sentiment("old-task", self.POSTS)
         assert got["success"] == 2, "孤儿表里的历史结论没被接回来"
         assert [r["reason_cn"] for r in got["results"]] == ["新结论", "只有旧任务分析过"]
+
+
+class TestFakeNeutralPurgeEndToEnd:
+    """把「解析失败」那种冒充结论的行连同 sentiment_at 一起清掉 —— 真库、真 SQL"""
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+        import app.config as cfg
+        import app.services.storage as storage_module
+        self.cfg, self.storage = cfg, storage_module
+        self._old_dir, self._old_db = cfg.settings.data_dir, storage_module.DB_PATH
+        cfg.settings.data_dir = self.tmpdir
+        storage_module.DB_PATH = os.path.join(self.tmpdir, "hyxi.db")
+
+    def teardown_method(self):
+        self.cfg.settings.data_dir = self._old_dir
+        self.storage.DB_PATH = self._old_db
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _seed(self):
+        """一条被编出来的 neutral 占位、一条真结论，两条帖子都已带 sentiment_at"""
+        self.storage.init_db()
+        conn = self.storage._get_conn()
+        conn.executemany(
+            """INSERT INTO posts (source_id, fingerprint, seq, content, sentiment_at)
+               VALUES (?,?,?,?,?)""",
+            [
+                ("src_x", "fake", 1, "Deze update werkt niet na de update...",
+                 "2026-08-25T09:48:43"),
+                ("src_x", "real", 2, "Prima batterij, snel geleverd.",
+                 "2026-08-25T09:48:43"),
+            ],
+        )
+        conn.executemany(
+            """INSERT INTO sentiment_results
+               (source_id, fingerprint, sentiment, intensity, reason_cn, dimensions_json,
+                task_id, analyzed_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            [
+                ("src_x", "fake", "neutral", 1, "解析失败", "[]", "t1", "2026-08-25T09:48:43"),
+                ("src_x", "real", "positive", 4, "交付顺利", '["价格/性价比"]', "t1",
+                 "2026-08-25T09:48:43"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+    def test_placeholder_row_and_its_sentiment_at_are_both_cleared(self):
+        """只删结论行不够：sentiment_at 还在的话增量分析永远不会再碰它。
+
+        增量的判据就是 `_processed.sentiment_at` 为空（orchestrator 那句列表推导），
+        清一半等于把那几条帖子永久钉在「已分析」上，用户只剩全量重跑一条路 ——
+        为 3 条帖子重算 258 条，还要重新付一次钱。
+        """
+        self._seed()
+        self.storage.purge_fake_parse_failures()      # 升级后第一次启动
+
+        conn = self.storage._get_conn()
+        rows = dict(conn.execute(
+            "SELECT fingerprint, sentiment FROM sentiment_results").fetchall())
+        ats = dict(conn.execute(
+            "SELECT fingerprint, sentiment_at FROM posts").fetchall())
+        conn.close()
+
+        assert "fake" not in rows, f"占位结论还在: {rows}"
+        assert ats["fake"] is None, "sentiment_at 没清，增量分析再也够不着它"
+        # 真结论一根汗毛都不能动
+        assert rows["real"] == "positive"
+        assert ats["real"] == "2026-08-25T09:48:43"
+
+    def test_the_purged_post_comes_back_as_pending(self):
+        """清完之后，它必须真的重新出现在待分析队列里（照 orchestrator 那句判据）"""
+        self._seed()
+        self.storage.purge_fake_parse_failures()
+
+        posts = self.storage.load_posts(["src_x"])
+        pending = [p for p in posts if not p.get("_processed", {}).get("sentiment_at")]
+        assert [p["fingerprint"] for p in pending] == ["fake"], pending
+
+    def test_purge_is_idempotent_and_quiet_on_clean_dbs(self):
+        """幂等：干净库上反复启动不该有任何动静"""
+        self._seed()
+        self.storage.purge_fake_parse_failures()
+        self.storage.purge_fake_parse_failures()
+        self.storage.purge_fake_parse_failures()
+
+        conn = self.storage._get_conn()
+        assert conn.execute("SELECT COUNT(*) FROM sentiment_results").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM posts WHERE sentiment_at IS NULL").fetchone()[0] == 1
+        conn.close()
+
+    def test_honest_null_placeholder_is_left_alone(self):
+        """新代码写下的占位是 sentiment 为空的诚实记录，不许连它一起删。
+
+        它带的「解析失败」是给用户看的原因，且本来就没有 sentiment_at、下一轮增量
+        自然会重算。连它一起删的话，这个一次性迁移永远变不成 no-op —— 每次启动都在
+        删一条马上又要写回来的行，页面上那条「未分析」还白白丢掉了原因。
+        """
+        self.storage.init_db()
+        conn = self.storage._get_conn()
+        conn.execute(
+            """INSERT INTO posts (source_id, fingerprint, seq, content, sentiment_at)
+               VALUES (?,?,?,?,?)""",
+            ("src_x", "honest", 1, "Onleesbare tekst", None),
+        )
+        conn.execute(
+            """INSERT INTO sentiment_results
+               (source_id, fingerprint, sentiment, intensity, reason_cn, dimensions_json,
+                task_id, analyzed_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            ("src_x", "honest", None, 0, "解析失败", "[]", "t1", "2026-08-25T09:48:43"),
+        )
+        conn.commit()
+        conn.close()
+
+        self.storage.purge_fake_parse_failures()
+
+        conn = self.storage._get_conn()
+        row = conn.execute("SELECT sentiment, reason_cn FROM sentiment_results "
+                           "WHERE fingerprint='honest'").fetchone()
+        conn.close()
+        assert row is not None, "诚实的占位被当成冒充结论删掉了"
+        assert row["sentiment"] is None and row["reason_cn"] == "解析失败"
+
+    def test_legacy_blob_migration_cannot_smuggle_them_back_in(self):
+        """清理必须排在旧 JSON blob 的迁移之后，否则升级那一次恰好是空转的。
+
+        老库升上来的第一次启动：清理先跑完，migrate_sentiment_blob() 才把 blob 里
+        那批假 neutral 重新写进 sentiment_results —— 而这一次正是它最该生效的那一次。
+        真 orchestrator、真 SQLite、真迁移，无 mock。
+        """
+        # **import 必须排在播种之前**：orchestrator 模块在 import 时就实例化一个全局
+        # 单例并跑完一轮迁移。留在下面的话这里会变成「单例 + 显式构造」两轮，而第二轮
+        # 开头的 init_db() 恰好把第一轮迁进来的假 neutral 又清掉 —— 这条测试于是在
+        # 修复前后都是绿的，等于什么都没测（实测踩过）
+        from app.services.orchestrator import TaskOrchestrator
+
+        self.storage.init_db()
+        conn = self.storage._get_conn()
+        conn.executemany(
+            """INSERT INTO posts (source_id, fingerprint, seq, content, sentiment_at)
+               VALUES (?,?,?,?,?)""",
+            [("src_x", "fake", 1, "Deze update werkt niet na de update...",
+              "2026-08-25T09:48:43"),
+             ("src_x", "real", 2, "Prima batterij, snel geleverd.",
+              "2026-08-25T09:48:43")],
+        )
+        # 旧版本那张「整份结果塞进一个 JSON 列」的表，现在的 SCHEMA 已不再建它
+        conn.execute("CREATE TABLE IF NOT EXISTS sentiment "
+                     "(task_id TEXT PRIMARY KEY, data_json TEXT NOT NULL)")
+        conn.execute(
+            "INSERT INTO sentiment (task_id, data_json) VALUES (?,?)",
+            ("t-legacy", json.dumps({"results": [
+                {"sentiment": "neutral", "intensity": 1, "reason_cn": "解析失败",
+                 "dimensions": []},
+                {"sentiment": "positive", "intensity": 4, "reason_cn": "交付顺利",
+                 "dimensions": ["价格/性价比"]},
+            ]})),
+        )
+        conn.execute(
+            """INSERT INTO tasks (id, status, description, result_json, created_at)
+               VALUES (?,?,?,?,?)""",
+            ("t-legacy", "completed", "旧任务",
+             json.dumps({"sources": [{"id": "src_x"}]}), "2026-08-20T10:00:00"),
+        )
+        conn.commit()
+        conn.close()
+
+        TaskOrchestrator()                      # 升级后的第一次启动
+
+        conn = self.storage._get_conn()
+        rows = dict(conn.execute(
+            "SELECT fingerprint, sentiment FROM sentiment_results").fetchall())
+        ats = dict(conn.execute(
+            "SELECT fingerprint, sentiment_at FROM posts").fetchall())
+        conn.close()
+        assert "fake" not in rows, f"迁移又把假 neutral 写回来了，这一轮清理是空转的: {rows}"
+        assert ats["fake"] is None, "sentiment_at 没清，这条帖子再也不会被重新分析"
+        # 同一份 blob 里的真结论必须照常迁进来
+        assert rows.get("real") == "positive", f"真结论没迁进来: {rows}"
 
 
 class TestPostsStorageEndToEnd:

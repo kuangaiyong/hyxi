@@ -22,6 +22,7 @@ from app.services.storage import (
     delete_task as db_delete_task,
     legacy_sentiment_task_ids, migrate_sentiment_blob, drop_legacy_sentiment_table,
     discard_legacy_sentiment, migrate_posts_file, retire_file,
+    purge_fake_parse_failures,
 )
 from app.services import storage
 
@@ -41,6 +42,9 @@ class TaskOrchestrator:
         self._load_tasks()
         self._migrate_posts()
         self._migrate_sentiment()
+        # **必须排在 _migrate_sentiment 之后**：旧 blob 里那批假 neutral 正是这一步
+        # 才写进 sentiment_results 的，放在 init_db() 里等于让升级那一次空转
+        purge_fake_parse_failures()
 
     def _migrate_posts(self):
         """把各来源的落盘 JSON 搬进 posts 表。

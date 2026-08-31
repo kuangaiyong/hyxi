@@ -692,7 +692,7 @@ C:\HYXi├── HYXi-1.8.1-win64\     ← 旧版本，升级后可直接删
 
 ## 测试
 
-**368 个测试，必须全部 PASSED**（本机实测 `368 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
+**373 个测试，必须全部 PASSED**（本机实测 `373 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
@@ -747,7 +747,8 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 - **时区故意不设**：跟随宿主机 `Asia/Shanghai`。检测方比的是时区与出口 IP 的地理位置，从中国境内出网却报 `Europe/Amsterdam` 是更硬的矛盾。将来改从欧洲机器出网时要一并调整
 - **节奏**：翻页间隔随机 4-11s，页内 `humanRead()` 随机滚动，每 8~15 页休息 25~60s（日志里的 ☕）
 - **会话复用**：`.scraper_state.json`（已 gitignore，含会话 cookie）保存 cookie/localStorage，不必每轮重走 DPG 隐私 gate。用 `storageState` 而非 `launchPersistentContext` —— 后者的用户数据目录不能被两个进程同时占用，`max_concurrent_tasks > 1` 时会启动失败
-- **限流即停**：`gotoPage()` 遇 429/403/503 读 `Retry-After` 退让一次（无则 60s，上限 300s），仍失败即抛错终止。`handleConsent()` 里跳转 DPG 回调那一跳**也必须走 `gotoPage`** —— 被拒时正是那个请求返回 403，而它落地后的 URL 仍是正常的 `/forum/...`，只看 URL 发现不了
+- **限流即停，但网络失败要重试 —— 两者绝不能混为一谈**：`gotoPage()` 遇 429/403/503 读 `Retry-After` 退让一次（无则 60s，上限 300s），仍失败即抛错终止；而 `page.goto` **自己抛出来**的（导航超时 / DNS 解析不了 / 连接被重置）是**一次响应都没拿到**，站点可能根本没事，只是路上抖了一下 —— 这类退避 5s、10s 重试 2 次再放弃。混着处理两头都错：不重试的话跨境线路抖一下就让整轮采集失败（用户实测报过：首个页面 `goto` 超时 30s → 退出码 1 → 整个任务失败）；反过来对着一个已经说「别打了」的站点重试，正是「明确不做」的那一类事。**网络重试必须包在限流循环的里面**（`gotoTolerant()` 在 `gotoPage()` 内层）——反过来的话，退让后的那一次要是抛了异常，整个限流循环会从头再走一遍：一个已经说「别打了」的站点被连打 3 轮、每轮还睡满一次 `Retry-After`（最坏 6 个请求 + 15 分钟）。且**站点一旦说过一次停，退让后的那一次就不再容忍网络抖动**（`retries` 传 0），于是限流路径上最多 4 个请求、真正拿到响应的仍然只有 2 个。
+  还有一条实测出来的边界：**没有正文的 4xx/5xx 会被 Chrome 直接抛成 `net::ERR_HTTP_RESPONSE_CODE_FAILURE`，而不是返回一个 Response**（503 + `Content-Length: 0` 实测如此）。那是「服务器答复了一个错误状态」不是网络失败，`RESPONDED_WITH_ERROR` 把它挡在重试之外 —— 漏掉它的话，一个回空正文 429 的限流器会被当成线路抖动连打 3 次。fixture 的限流响应因此**必须带真实正文**（`throttle_body`），否则测的根本不是限流那条路。`handleConsent()` 里跳转 DPG 回调那一跳**也必须走 `gotoPage`** —— 被拒时正是那个请求返回 403，而它落地后的 URL 仍是正常的 `/forum/...`，只看 URL 发现不了
 - **明确不做**：代理池 / IP 轮换、验证码破解、提高并发或速度、无视 robots.txt、stealth 插件
 - **升级路径**：若仍被拦，先改有头模式（`headless=False`）观察实际拦截页面，而不是继续叠伪装
 
@@ -778,6 +779,8 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 - **主贴时间倒序的排序键必须先转 ISO**，理由同上一条；**且只排主贴**，评论跟着自己的主贴走。没解析出时间的帖子沉到最后而不是当成最早 —— 早期采集读不到 tooltip 绝对时间时是**故意留空**的（写相对时间会污染指纹），这批帖子实际很新，排到最前面会把整页占满（实测那个任务里正好 12 条，用户看到的首屏一个时间都没有）。改排序时**页面和导出两条路都要顾**，回归测试分别在 `TestNestedPostsApiEndToEnd`、`TestPostTreeEndToEnd`、`TestExportEndpointEndToEnd::test_rows_are_ordered_newest_first`
 - **`/posts` 的 `index` 是扁平存储数组里的绝对位置，不是页内序号**：`SentimentView` 用 `index - 1` 反查帖子，而舆情结果数组的下标来自 `enumerate(all_posts)`。一页只保证 `page_size` 个**主贴**，带上评论后条目数会超出，按页内计数编号会让相邻两页的 index 区间重叠、详情弹窗显示错帖子
 - **删数据源不能让历史任务结果变空白**：`task["result"]["sources"]` 里存了当时的 `output_path`，来源从注册表消失后 `results.py` 照原路读文件兜底
+- **`error_message` 取 stderr 的第一行，不是最后一行**：脚本先写 `stopReason`，而 Playwright 的报错是多行的 —— 第一行才是原因（`page.goto: Timeout 30000ms exceeded.`），后面跟着一整段 `Call log:` 明细。取末行拿到的是 `  - navigating to "..."`，真正的原因整个丢掉，还把 ANSI 转义码带进界面：用户实测看到的就是 `采集脚本异常退出 (code=1): [2m - navigating to "…"[22m`，完全看不出是超时还是被拒。ANSI 在 `CollectorRunner` 读完 stderr 时**一次剥干净**（SSE 日志、人工授权原因、`error_message` 三处都拿它，各剥各的迟早漏一处）；`_stderr_reason()` 另外跳过 Node 告警 —— 它**占两行**（实测 node v24.14.1：`(node:11032) ExperimentalWarning: x` 后面还跟一行 ``(Use `node --trace-warnings ...` to show where the warning was created)``），只跳第一行的话返回的是第二行，原因照样丢、只是往后挪了一格。
+- **测「网络失败」不能按请求次数掐连接**：Chrome 对 `ERR_EMPTY_RESPONSE` 会自己重发（实测一次 `page.goto` 打了 4 个请求），掐一次会被它内部重试救回来，`gotoPage` 压根不抛异常 —— 那条用例于是在修复前后都是绿的。`fixture_site.py` 的 `drop_seconds` 因此按**时间窗**掐，且窗口从第一个页面请求起算而不是服务器启动起算（浏览器冷启动要一两秒）。同理，重试了几次只能数脚本自己打的日志，服务端收到的请求数不是那个数。
 - **爬虫必须通过 `node` 子进程调用**，不能 import
 - **日志有两套命名空间**：`logging_config.get_logger()` 用全局 `_logger` 缓存，**第一个调用者的 name 定死了整个 logger**（实际是 orchestrator 的 `app.services.orchestrator`）；其余 service 用 `logging.getLogger("hyxi.xxx")`，拿不到那些 handler。加日志时注意实际输出去向
 - **`TaskInputView.vue` 是死代码**（未注册路由，全项目零引用，功能已并入 `TaskManagementView`）

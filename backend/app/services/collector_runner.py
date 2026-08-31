@@ -5,6 +5,7 @@ job 指定。超时控制、进程树清理、退出码契约沿用已验证的�
 """
 
 import os
+import re
 import json
 import uuid
 import asyncio
@@ -26,6 +27,38 @@ STREAM_LIMIT = 4 * 1024 * 1024
 
 # 退出码契约：0 完整 / 1 硬失败 / 2 部分完成 / 3 需要人工授权
 EXIT_NEEDS_MANUAL_AUTH = 3
+
+# Playwright 的报错把 Call log 那一段用 ANSI 调暗，转义码会一路漏到界面上
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+# Node 告警的两行样板，都不是中断原因
+_NOISE_PREFIXES = ("(node:", "(Use ")
+
+
+def _stderr_reason(stderr_text: str) -> str:
+    """脚本写进 stderr 的中断原因 —— **取第一行，不是最后一行**。
+
+    脚本先写 stopReason，而 Playwright 的报错是多行的：第一行才是原因
+    （`抓取过程异常: page.goto: Timeout 30000ms exceeded.`），后面跟着一段
+    `Call log:` 明细。取末行拿到的是 `  - navigating to "..."` —— 真正的原因整个
+    被丢掉，还带着一串 ANSI 转义码进了任务的 error_message。用户实测报过：界面上
+    只剩 `采集脚本异常退出 (code=1): [2m - navigating to "…"[22m`，看不出是超时。
+
+    Node 的告警会抢在原因前面写进 stderr，跳过它们，否则原因又被顶掉一次。
+    **它占两行**（实测 node v24.14.1）：
+
+        (node:11032) ExperimentalWarning: x
+        (Use `node --trace-warnings ...` to show where the warning was created)
+
+    只跳第一行的话返回的是第二行，原因照样丢，只是往后挪了一格 —— 那正是这个
+    函数存在的意义所在。
+    """
+    for line in _ANSI_RE.sub("", stderr_text).strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith(_NOISE_PREFIXES):
+            continue
+        return line[:200]
+    return ""
 
 
 class ManualAuthRequired(Exception):
@@ -274,7 +307,9 @@ class CollectorRunner:
                 await _kill_process_tree(proc)
                 raise Exception(f"采集任务超时（超过 {settings.task_timeout_minutes} 分钟），已终止子进程")
 
-            stderr_text = await stderr_task
+            # ANSI 转义码在这里一次剥干净：下面的 SSE 日志、人工授权原因、
+            # error_message 三处都拿它，各剥各的迟早漏掉一处
+            stderr_text = _ANSI_RE.sub("", await stderr_task)
             if stderr_text.strip():
                 await progress.emit(task_id, "log", {
                     "level": "warning",
@@ -317,8 +352,8 @@ class CollectorRunner:
 
             if proc.returncode != 0:
                 # 脚本用 stderr 说明中断原因（限流 / 重定向 / 页面异常），不带上就只剩一个退出码
-                lines = stderr_text.strip().splitlines()
-                detail = f": {lines[-1][:200]}" if lines else ""
+                reason = _stderr_reason(stderr_text)
+                detail = f": {reason}" if reason else ""
                 raise Exception(f"采集脚本异常退出 (code={proc.returncode}){detail}")
 
             # 人工登录模式只落会话文件，不产出帖子数据

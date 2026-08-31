@@ -3915,6 +3915,44 @@ GOLDEN_FILE = os.path.join(_FIXTURES_DIR, "golden_tweakers.json")
 FIXTURE_THREAD_ID = 9990001
 
 
+class TestStderrReasonEndToEnd:
+    """error_message 里必须是真正的原因 —— 用真实输出的原文钉住，不构造样例"""
+
+    @staticmethod
+    def _reason(text):
+        from app.services.collector_runner import _stderr_reason
+        return _stderr_reason(text)
+
+    def test_playwright_multiline_error_keeps_the_cause_and_drops_the_ansi(self):
+        """用户实测那条报错的原文：第一行才是原因，后面跟着一段带 ANSI 的 Call log。
+
+        取末行的话界面上只剩 `[2m - navigating to "…"[22m`，看不出是超时还是被拒。
+        """
+        real = (
+            "抓取过程异常: page.goto: Timeout 30000ms exceeded.\n"
+            "Call log:\n"
+            "\x1b[2m  - navigating to "
+            '"https://gathering.tweakers.net/forum/list_messages/2336074/3", '
+            'waiting until "domcontentloaded"\x1b[22m\n'
+        )
+        reason = self._reason(real)
+        assert reason == "抓取过程异常: page.goto: Timeout 30000ms exceeded."
+        assert "\x1b" not in reason
+
+    def test_the_two_line_node_warning_does_not_displace_the_cause(self):
+        """Node 的告警占**两行**，只跳第一行的话原因照样丢，只是往后挪了一格。
+
+        下面这两行是本机 node v24.14.1 的真实输出原文（`node -e` 直接跑出来的），
+        不是照着文档编的。ExperimentalWarning / DeprecationWarning 在 Node 24 上很常见。
+        """
+        real = (
+            "(node:11032) ExperimentalWarning: x\n"
+            "(Use `node --trace-warnings ...` to show where the warning was created)\n"
+            "第 4 页抓取失败: net::ERR_CONNECTION_RESET\n"
+        )
+        assert self._reason(real) == "第 4 页抓取失败: net::ERR_CONNECTION_RESET"
+
+
 class TestTweakersCollectorGoldenEndToEnd:
     """真 Chrome + 真 HTTP + 真子进程跑本地 fixture 站点，提取结果必须与黄金基线逐字相等。
 
@@ -3992,6 +4030,97 @@ class TestTweakersCollectorGoldenEndToEnd:
         for got, want in zip(data["posts"], golden["posts"]):
             assert {k: got.get(k) for k in fields} == {k: want.get(k) for k in fields}
 
+
+    def test_a_flaky_connection_is_retried_instead_of_killing_the_whole_run(self):
+        """线路抖一下不该让整轮采集失败 —— 真 Chrome、真掐连接、真子进程。
+
+        用户实测报过：首个页面 page.goto 超时 30s，脚本以退出码 1 结束，整个任务失败。
+        gotoPage 当时只对 429/403/503 退让一次，而那三个是「拿到了响应、对方明确说停」；
+        超时 / 连接被重置是**一次响应都没拿到**，站点其实好好的，重试才是对的。
+        """
+        self._skip_unless_ready()
+        sys.path.insert(0, _FIXTURES_DIR)
+        from fixture_site import FixtureSite
+
+        progress = _RecordingProgress()
+        site = FixtureSite(drop_seconds=3)      # 开头 3 秒内的页面请求一律掐断
+        with site as base_url:
+            data = self._run(base_url, progress=progress)
+
+        # **必须断言重试真的发生过**：Chrome 自己也会重发，光看「掐断过 + 最终成功」
+        # 的话，内部重发恰好越过时间窗时这条用例在没有 NETWORK_RETRIES 的代码上照样绿
+        assert any("后重试第" in m for m in progress.messages), \
+            f"gotoPage 压根没重试，这条用例什么都没测: {progress.messages}"
+        assert site.dropped >= 1, "fixture 没真的掐断过连接，这条用例什么都没测"
+        assert data["complete"] is True, f"重试之后仍然失败: {data.get('stop_reason')}"
+
+        with open(GOLDEN_FILE, "r", encoding="utf-8") as f:
+            golden = json.load(f)
+        # 重试拿回来的必须是完整结果，不是「少了第一页」的残缺数据
+        assert len(data["posts"]) == len(golden["posts"]), "重试后帖子数与基线不一致"
+
+    def test_a_throttled_site_is_not_hammered_by_the_network_retry(self):
+        """站点说过一次 503 之后，退让那一次要是连不上，必须直接放弃、不许再重试。
+
+        网络重试如果包在限流循环的**外面**，退让那次抛异常会让整个限流循环从头再走
+        一遍 —— 一个已经说「别打了」的站点被连打 3 轮、每轮还睡满一次 Retry-After。
+        这正是「限流即停」那条反爬虫纪律要避免的事。
+
+        判据用脚本自己打的日志：限流之后一条「后重试第」都不许出现。
+        """
+        self._skip_unless_ready()
+        sys.path.insert(0, _FIXTURES_DIR)
+        from fixture_site import FixtureSite
+
+        progress = _RecordingProgress()
+        # 第一次页面请求回 503 + Retry-After: 1，之后整个连不上
+        site = FixtureSite(throttle_first=1, drop_seconds=600)
+        with site as base_url:
+            with pytest.raises(Exception):
+                self._run(base_url, progress=progress)
+
+        assert any("收到 HTTP 503" in m for m in progress.messages), \
+            f"fixture 没真的限流过，这条用例什么都没测: {progress.messages}"
+        retries = [m for m in progress.messages if "后重试第" in m]
+        assert not retries, f"站点已经说停，却还在做网络重试: {retries}"
+
+        # 同一条纪律的另一面：**空正文**的 503 会被 Chrome 直接抛异常而不是返回
+        # Response（实测），那条路同样不许被当成网络失败重试
+        bare = _RecordingProgress()
+        site = FixtureSite(throttle_first=1, throttle_body=False, drop_seconds=600)
+        with site as base_url:
+            with pytest.raises(Exception):
+                self._run(base_url, progress=bare)
+        retried = [m for m in bare.messages if "后重试第" in m]
+        assert not retried, f"空正文的 503 被当成网络失败重试了: {retried}"
+
+    def test_the_real_cause_survives_into_the_error_message(self):
+        """连不上时 error_message 必须说清是什么错，且不许漏 ANSI 转义码。
+
+        Playwright 的报错是多行的：第一行才是原因，后面跟着一段 Call log。
+        CollectorRunner 曾取 stderr 的**最后一行**，于是界面上只剩
+        `采集脚本异常退出 (code=1): [2m - navigating to "…"[22m` —— 真正的原因
+        整个被丢掉，用户看不出是超时还是被拒（实测报过）。
+
+        顺带钉住重试次数：一直连不上时总共只试 3 次就放弃，不会无限重打。
+        """
+        self._skip_unless_ready()
+        sys.path.insert(0, _FIXTURES_DIR)
+        from fixture_site import FixtureSite
+
+        progress = _RecordingProgress()
+        site = FixtureSite(drop_seconds=600)    # 一直掐，重试也救不回来
+        with site as base_url:
+            with pytest.raises(Exception) as excinfo:
+                self._run(base_url, progress=progress)
+
+        msg = str(excinfo.value)
+        assert "ERR_EMPTY_RESPONSE" in msg, f"真正的原因没进 error_message: {msg!r}"
+        assert "\x1b" not in msg, f"ANSI 转义码漏进界面了: {msg!r}"
+        # 重试次数只能数脚本自己打的日志：Chrome 对 ERR_EMPTY_RESPONSE 还会自己重发，
+        # 服务端收到的请求数（实测 12）与 gotoPage 的尝试次数不是一回事
+        retries = [m for m in progress.messages if "后重试第" in m]
+        assert len(retries) == 2, f"重试次数不对（应为 2 次后放弃）: {retries}"
 
     def test_body_images_are_downloaded_and_quoted_ones_ignored(self):
         """Tweakers 的正文图要抓回本地，引用块里的图和表情都不能算进来。

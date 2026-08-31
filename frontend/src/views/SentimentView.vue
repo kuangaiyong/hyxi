@@ -45,6 +45,8 @@ const highlightIdx = ref<number | null>(null)
 const focused = ref(false)
 const filterDimension = ref('')
 const filterKeyword = ref('')
+/** 【发表时间】列的排序方向。默认倒序（最新在前），与结果页 / 导出的既定口径一致 */
+const timeSort = ref<'desc' | 'asc'>('desc')
 /** 导出报告里「近期新回复」工作表用的时间窗口。后端只认 3/7/14，别的会 400。
  *  页面上的新回复展示已经整体搬到任务结果页，这里只剩导出还要用它 */
 const FRESH_DAYS_CHOICES = [3, 7, 14]
@@ -82,8 +84,33 @@ const filteredResults = computed(() => {
       x.result?.dimensions?.some(d => d.toLowerCase().includes(kw))
     )
   }
+  // 按发表时间排。**没有时间的一律沉底**，正序倒序都一样 —— 那批帖子是采集时
+  // 故意留空的（读不到 tooltip 绝对时间，写相对时间会污染指纹），实际很新，
+  // 当成「最早」会在倒序下把首屏整个占满（结果页踩过这个坑）。
+  // rows 到这里必然是 map/filter 出来的新数组，就地排不会动到 data.results。
+  const dir = timeSort.value === 'desc' ? -1 : 1
+  rows.sort((a, b) => {
+    const ta = rawTime(a._idx)
+    const tb = rawTime(b._idx)
+    if (!ta || !tb) return ta === tb ? 0 : (ta ? -1 : 1)
+    return ta < tb ? -dir : ta > tb ? dir : 0
+  })
   return rows
 })
+
+function toggleTimeSort() {
+  timeSort.value = timeSort.value === 'desc' ? 'asc' : 'desc'
+}
+
+/** 帖子发表时间。postsMap 按扁平下标存，与 results 的下标是同一套；
+ *  API 出口已把落盘的 dd-mm-yyyy 归一成 ISO，所以按字符串比就是按时间比 */
+function rawTime(idx: number): string {
+  return postsMap.value.get(idx)?.timestamp?.trim() || ''
+}
+
+// 早期采集读不到 tooltip 的绝对时间，落盘就是空的（写相对时间会污染指纹）。
+// 留一段空白看着像功能坏了，明说没有反而清楚 —— 措辞与结果页保持一致
+const postTime = (idx: number) => rawTime(idx) || '时间未知'
 
 function clearFilters() {
   filterSentiment.value = ''
@@ -964,20 +991,32 @@ function mediaUrl(rel: string): string {
             <span class="text-sm text-secondary" style="white-space: nowrap;">共 {{ filteredResults.length }} 条</span>
           </div>
         </div>
-        <table class="data-table">
+        <table class="data-table" data-testid="post-sentiment-table">
           <thead>
             <tr>
               <th style="width: 44px; text-align: center;">#</th>
               <th style="width: 72px; text-align: center;">情感</th>
               <th style="width: 100px; text-align: center;">强度</th>
               <th>分析理由</th>
+              <th
+                style="width: 168px; white-space: nowrap; cursor: pointer; user-select: none;"
+                tabindex="0"
+                :aria-sort="timeSort === 'desc' ? 'descending' : 'ascending'"
+                :title="timeSort === 'desc' ? '当前：时间倒序，点击切换为正序' : '当前：时间正序，点击切换为倒序'"
+                @click="toggleTimeSort"
+                @keydown.enter.prevent="toggleTimeSort"
+                @keydown.space.prevent="toggleTimeSort"
+              >
+                发表时间
+                <span style="margin-left: 4px; font-size: 10px; color: var(--primary);">{{ timeSort === 'desc' ? '▼' : '▲' }}</span>
+              </th>
               <th style="width: 220px;">涉及维度</th>
               <th style="width: 64px; text-align: center;">操作</th>
             </tr>
           </thead>
           <tbody>
             <tr v-if="!filteredResults.length">
-              <td colspan="6" class="text-center text-secondary" style="padding: 32px;">无匹配结果</td>
+              <td colspan="7" class="text-center text-secondary" style="padding: 32px;">无匹配结果</td>
             </tr>
             <tr
               v-for="row in filteredResults"
@@ -1009,6 +1048,9 @@ function mediaUrl(rel: string): string {
               </td>
               <td style="font-size: 13px; max-width: 360px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
                 {{ row.result?.reason_cn || '-' }}
+              </td>
+              <td class="text-secondary" style="font-size: 12px; white-space: nowrap;">
+                {{ postTime(row._idx) }}
               </td>
               <td>
                 <div v-if="row.result?.dimensions?.length" style="display: flex; gap: 3px; flex-wrap: wrap;">

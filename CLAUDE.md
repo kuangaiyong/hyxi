@@ -109,6 +109,7 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
 | `sentiment_runs` | 某个任务最近一次触发分析的时间，只此一列 |
 | `sentiment_results` | **舆情结论，按 `(source_id, fingerprint)` 存** |
 | `sources` / `credentials` | 数据源与加密凭据，`ON DELETE CASCADE` |
+| `post_aliases` | 被归并掉的指纹 → 规范身份。`known_fingerprints()` 必须并上它，否则采集器每轮把编辑过的帖子当新帖、重新回源下载配图 |
 | `app_config` | LLM 配置，按 `llm.api_key` / `llm.base_url` / `llm.model_name` 分列；多模态模型同形，换 `vision.` 前缀 |
 | `schedules` | 定时任务业务配置 |
 | `apscheduler_jobs` | APScheduler 自建，调度触发器 |
@@ -121,12 +122,13 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
 | `backend/data/jobs/{run}_out.json` | 采集脚本的产出，**读完入库即删的交接文件** |
 | `backend/data/sessions/{source_id}.json` | Playwright `storageState`。它只认文件路径，且是可重建的运行时缓存，丢了只是重新登录一次 |
 
-**四条存储红线**（静默错误，改存储层前必看）：
+**五条存储红线**（静默错误，改存储层前必看）：
 
 - `intensity` 列必须是 `NUMERIC` 不能是 `REAL` —— REAL 亲和性把整数 3 存成 3.0，导出跟着变「3.0」
 - **舆情结论按 `(source_id, fingerprint)` 存，不按下标、也不按 task_id**。下标只在写入现场有意义
 - **`posts` 故意不挂 `sources` 外键** —— `ON DELETE CASCADE` 会让「删数据源」清空历史任务结果
 - **不留双写**：同一份数据存两处必然长出「改了一边另一边还是旧的」的 bug（已实测踩过）
+- **帖子身份认 `message_id`，不认指纹**。指纹吃 `用户名|时间戳|正文前100字`，这三样对**同一条真实帖子**并不稳定 —— 作者编辑正文、相对时间这轮读不到、正文展开长度不同，都会算出新指纹，于是多存一行「新帖」；重采到的回复又被刷新指向新那行，旧那行却永不删除，页面上同一条主贴出现两次、回复只跟着其中一份（**用户实测报过「主贴 A 的回复贴不是他的」**）。真实库三种漂移全都发生过，实测重复 5/179 与 1/258。`upsert_posts()` 因此在 message_id 认得出来时归并到**先入库的那个指纹**（规范身份），并把同批回复的父指针一起改写；存量由 `merge_duplicate_posts()` 合并。**指纹算法本身一个字符都不能动** —— 改了历史数据全部失配。message_id 为空时退回按指纹判定，空 id 不是身份；分组必须带 source_id，它只在来源内唯一
 
 设计论证（为什么这么定）见 `Skill(hyxi-architecture)`。
 
@@ -235,7 +237,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 
 ## 测试
 
-**373 个测试，必须全部 PASSED**（本机实测 `373 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
+**385 个测试，必须全部 PASSED**（本机实测 `385 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v

@@ -2372,6 +2372,324 @@ class TestFakeNeutralPurgeEndToEnd:
         assert rows.get("real") == "positive", f"真结论没迁进来: {rows}"
 
 
+class TestStablePostIdentityEndToEnd:
+    """同一条真实帖子不许被存成多行 —— 真库、真 SQL、真 upsert
+
+    指纹吃 `用户名|时间戳|正文前100字`，这三样对同一条帖子并不稳定：作者编辑正文、
+    相对时间这轮读不到、正文展开长度不同，都会换出一个新指纹。真实库里实测到三种全有。
+    身份一变就多出一行「新帖」，重采到的回复又会被刷新指向新那行，旧那行却永不删除 ——
+    于是同一条主贴在页面上出现两次，回复只跟着其中一份。用户报的「主贴 A 的回复贴
+    不是他的」就是这么来的。
+
+    平台自己的稳定 ID（message_id）一直在采也一直在存，这里让它真正承担身份。
+    """
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.storage, self._restore = _use_temp_db(self.tmpdir)
+
+    def teardown_method(self):
+        self._restore()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    @staticmethod
+    def _post(fp, mid, **over):
+        p = {"fingerprint": fp, "message_id": mid, "username": "Walter",
+             "timestamp": "16-07-2026 02:22", "content": f"正文{fp}",
+             "page_number": 1, "parent_fingerprint": None, "reply_level": 0}
+        p.update(over)
+        return p
+
+    def _rows(self, src="src_x"):
+        conn = self.storage._get_conn()
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM posts WHERE source_id=? ORDER BY seq", (src,))]
+        conn.close()
+        return rows
+
+    def test_an_edited_post_does_not_become_a_second_row(self):
+        """作者改了正文 → 新指纹。但 message_id 没变，就还是同一条帖子。
+
+        实测原文：message_id=2491589267983459 被存成 seq12 和 seq88 两行，
+        后者正文多了个「UPDATE 4/8:」前缀。
+        """
+        parent_a = self._post("aaa", "M1", content="原始正文")
+        reply = self._post("rrr", "M2", content="一条回复",
+                           parent_fingerprint="aaa", reply_level=1)
+        self.storage.upsert_posts("src_x", [parent_a, reply])
+        assert len(self._rows()) == 2
+
+        # 下一轮：作者编辑了正文，指纹跟着变；回复原样，但它算出来的父指纹是新的
+        parent_b = self._post("bbb", "M1", content="UPDATE 4/8: 原始正文")
+        reply2 = self._post("rrr", "M2", content="一条回复",
+                            parent_fingerprint="bbb", reply_level=1)
+        self.storage.upsert_posts("src_x", [parent_b, reply2])
+
+        rows = self._rows()
+        assert len(rows) == 2, f"同一条帖子被存成了 {len(rows)} 行: {[r['fingerprint'] for r in rows]}"
+        parent = rows[0]
+        assert parent["seq"] == 0, "seq 是全链路顺序锚点，不能因为改名就动"
+        assert parent["fingerprint"] == "aaa", "规范身份应保持为先入库的那个"
+        assert parent["content"] == "UPDATE 4/8: 原始正文", "正文该更新到最新一次提取的结果"
+        assert rows[1]["parent_fingerprint"] == "aaa", \
+            f"回复没跟着改挂到规范身份上: {rows[1]['parent_fingerprint']}"
+
+    def test_paid_work_survives_the_identity_change(self):
+        """译文和舆情标记是花钱换来的，不许因为换了个指纹就丢掉重算"""
+        self.storage.upsert_posts("src_x", [self._post("aaa", "M1")])
+        conn = self.storage._get_conn()
+        conn.execute("UPDATE posts SET translation=?, translated=1, sentiment_at=? "
+                     "WHERE source_id='src_x' AND fingerprint='aaa'",
+                     ("中文译文", "2026-08-25T09:48:43"))
+        conn.commit()
+        conn.close()
+
+        self.storage.upsert_posts("src_x", [self._post("bbb", "M1", content="改过的正文")])
+
+        rows = self._rows()
+        assert len(rows) == 1, f"多出来一行: {rows}"
+        assert rows[0]["translation"] == "中文译文", "译文被冲掉了，下一轮要重新付费翻译"
+        assert rows[0]["translated"] == 1
+        assert rows[0]["sentiment_at"] == "2026-08-25T09:48:43", "舆情标记丢了会重新花钱分析"
+
+    def test_posts_without_a_message_id_are_never_merged(self):
+        """没有 message_id 就退回按指纹判定 —— 空 id 不是身份，合并会把两条真帖子并成一条"""
+        self.storage.upsert_posts("src_x", [
+            self._post("aaa", "", content="第一条"),
+            self._post("bbb", "", content="第二条"),
+        ])
+        assert len(self._rows()) == 2, "两条没有 message_id 的帖子被错误地并成了一条"
+
+    def test_the_same_reply_is_not_split_across_duplicate_parents(self):
+        """存量迁移：同一条主贴的两行合并，两份回复也要收敛回一条、挂在规范父贴上。
+
+        实测原文：主贴 message_id=2510996366042749 存了 seq139/seq147 两行（只差一个
+        读不到的时间戳），它的回复 message_id=2510998052709247 跟着存了 seq140/seq148
+        两行，分别挂在那两行主贴下。
+        """
+        conn = self.storage._get_conn()
+        conn.executemany(
+            """INSERT INTO posts (source_id, fingerprint, seq, username, timestamp,
+               content, page_number, message_id, parent_fingerprint, reply_level)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            [
+                ("src_x", "p_old", 139, "Jan", "17-08-2026 17:21", "主贴正文", 1, "MP", None, 0),
+                ("src_x", "r_old", 140, "Piet", "17-08-2026 17:23", "回复正文", 1, "MR", "p_old", 1),
+                ("src_x", "p_new", 147, "Jan", "", "主贴正文", 1, "MP", None, 0),
+                ("src_x", "r_new", 148, "Piet", "", "回复正文", 1, "MR", "p_new", 1),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        self.storage.merge_duplicate_posts()
+
+        rows = self._rows()
+        assert len(rows) == 2, f"重复行没合掉: {[(r['seq'], r['fingerprint']) for r in rows]}"
+        parent, reply = rows
+        assert parent["fingerprint"] == "p_old" and parent["seq"] == 139
+        assert reply["fingerprint"] == "r_old" and reply["seq"] == 140
+        assert reply["parent_fingerprint"] == "p_old", \
+            f"回复没挂回规范父贴: {reply['parent_fingerprint']}"
+
+    def test_the_merge_keeps_whichever_row_paid_for_the_work(self):
+        """合并时译文/舆情可能落在被删的那一行上，必须搬过来而不是跟着行一起删掉"""
+        conn = self.storage._get_conn()
+        conn.executemany(
+            """INSERT INTO posts (source_id, fingerprint, seq, username, timestamp,
+               content, translation, translated, page_number, message_id, sentiment_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            [
+                ("src_x", "old", 0, "Jan", "17-08-2026 17:21", "正文", "", 0, 1, "MP", None),
+                ("src_x", "new", 5, "Jan", "", "正文", "中文译文", 1, 1, "MP", "2026-08-25T09:48:43"),
+            ],
+        )
+        conn.execute(
+            """INSERT INTO sentiment_results (source_id, fingerprint, sentiment, intensity,
+               reason_cn, dimensions_json, task_id, analyzed_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            ("src_x", "new", "negative", 4, "固件问题", '["固件更新"]', "t1", "2026-08-25T09:48:43"),
+        )
+        conn.commit()
+        conn.close()
+
+        self.storage.merge_duplicate_posts()
+
+        rows = self._rows()
+        assert len(rows) == 1 and rows[0]["fingerprint"] == "old"
+        assert rows[0]["translation"] == "中文译文", "译文跟着被删的行一起没了"
+        assert rows[0]["sentiment_at"] == "2026-08-25T09:48:43"
+        conn = self.storage._get_conn()
+        got = conn.execute(
+            "SELECT fingerprint, sentiment FROM sentiment_results WHERE source_id='src_x'"
+        ).fetchall()
+        conn.close()
+        assert [tuple(r) for r in got] == [("old", "negative")], \
+            f"舆情结论没搬到规范身份上: {[tuple(r) for r in got]}"
+
+    def test_an_orphan_reply_is_promoted_to_a_root(self):
+        """父贴根本没进库的回复必须就地提成主贴，不留悬空 parent。
+
+        真实库里有两条（seq17/18），是 drop_empty_posts 硬化之前留下的。悬空 parent
+        会让「这条是不是回复」在不同代码路径上给出不同答案。
+        """
+        conn = self.storage._get_conn()
+        conn.execute(
+            """INSERT INTO posts (source_id, fingerprint, seq, username, timestamp,
+               content, page_number, message_id, parent_fingerprint, reply_level)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            ("src_x", "kid", 17, "Piet", "02-08-2026 23:29", "回复正文", 1, "MK", "gone", 1),
+        )
+        conn.commit()
+        conn.close()
+
+        self.storage.merge_duplicate_posts()
+
+        rows = self._rows()
+        assert len(rows) == 1
+        assert rows[0]["parent_fingerprint"] is None, \
+            f"悬空 parent 还留着: {rows[0]['parent_fingerprint']}"
+        assert rows[0]["reply_level"] == 0, "提成主贴了，层级也要跟着回到 0"
+
+    def test_the_merge_is_idempotent_and_source_agnostic(self):
+        """两个来源各自合并、互不干扰；反复跑不该有任何动静。
+
+        判定落在 storage 这个**唯一入库口**上，所以对三个采集器和以后新加的都成立 ——
+        各个采集脚本不用各自记得处理一遍。
+        """
+        conn = self.storage._get_conn()
+        conn.executemany(
+            """INSERT INTO posts (source_id, fingerprint, seq, username, timestamp,
+               content, page_number, message_id, parent_fingerprint, reply_level)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            [
+                ("src_fb", "a1", 0, "Jan", "17-08-2026 17:21", "正文", 1, "M1", None, 0),
+                ("src_fb", "a2", 1, "Jan", "", "正文", 1, "M1", None, 0),
+                # 另一个来源用了同一个 message_id 值 —— 不同来源之间绝不能相互合并
+                ("src_tw", "b1", 0, "Kees", "17-08-2026 10:00", "别的帖子", 1, "M1", None, 0),
+                ("src_tw", "b2", 1, "Kees", "18-08-2026 10:00", "又一条", 1, "M2", None, 0),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        for _ in range(3):
+            self.storage.merge_duplicate_posts()
+
+        assert [r["fingerprint"] for r in self._rows("src_fb")] == ["a1"]
+        assert [r["fingerprint"] for r in self._rows("src_tw")] == ["b1", "b2"], \
+            "跨来源被错误地合并了 —— message_id 只在来源内唯一"
+
+    def test_a_blank_field_in_a_later_round_cannot_wipe_a_good_one(self):
+        """归并分支绝不能用这一轮的空值覆盖库里已有的好值。
+
+        时间戳读不到正是制造重复的三个原因之一 —— 归并把两行并成一行之后，如果还
+        照搬新一轮的字段，好数据就不是「多一行重复」而是**被销毁**了。与旁边
+        images / translation「采集不得把已有值冲回空」是同一条规矩。
+        """
+        self.storage.upsert_posts("src_x", [
+            self._post("aaa", "M1", timestamp="17-08-2026 17:21", content="完整正文")])
+
+        # 下一轮：正文展开长度变了（新指纹），而这次没读到相对时间的绝对值
+        self.storage.upsert_posts("src_x", [
+            self._post("bbb", "M1", timestamp="", content="完整正文的更长版本")])
+
+        rows = self._rows()
+        assert len(rows) == 1
+        assert rows[0]["timestamp"] == "17-08-2026 17:21", "好时间戳被这一轮的空值冲掉了"
+        assert rows[0]["content"] == "完整正文的更长版本", "正文该更新到最新一次提取的结果"
+
+    def test_history_migration_must_not_merge_or_the_old_conclusions_are_lost(self):
+        """迁移路径必须关掉归并 —— 理由与 drop_empty=False 完全一样。
+
+        旧舆情 blob 的 results[i] 对齐的是旧数组的第 i 条。归并少搬一条，条数就对不上，
+        migrate_sentiment_blob() 的「条数不等整份跳过」会把那个来源的历史结论永久挡在
+        门外，而且此后每次启动都仍然对不上（posts 已合并、原 JSON 已 retire）。
+        存量归并交给启动链上排在迁移之后的 merge_duplicate_posts()。
+        """
+        self.storage.upsert_posts("src_x", [
+            self._post("aaa", "M1", content="原文"),
+            self._post("bbb", "M1", content="UPDATE: 原文"),
+        ], drop_empty=False, merge_by_message_id=False)
+        assert len(self._rows()) == 2, "迁移时被归并了，历史舆情结论会整份丢失"
+
+    def test_a_merged_away_fingerprint_stays_known_to_the_collector(self):
+        """被归并掉的指纹必须仍然算「见过」，否则采集器每轮都把它当新帖。
+
+        known_fingerprints() 读的是 posts 表，而归并掉的那个指纹从不入库 ——
+        采集脚本于是每轮重新提取它、**每轮重新回源下载它的全部配图**（文件名按指纹），
+        水位线的「本轮没有新增就早停」也永远不成立。反复回源与「请求节奏是反爬纪律」
+        直接冲突，media 目录还会一直涨。
+        """
+        self.storage.upsert_posts("src_x", [self._post("aaa", "M1")])
+        self.storage.upsert_posts("src_x", [self._post("bbb", "M1", content="改过了")])
+
+        known = set(self.storage.known_fingerprints("src_x"))
+        assert "aaa" in known
+        assert "bbb" in known, "归并掉的指纹没被记住，采集器下一轮会把它当新帖重下图"
+
+    def test_runtime_upsert_targets_the_same_row_the_merge_would_keep(self):
+        """库里还有重复行时，实时入库必须挑 seq 最小那行 —— 与 merge 的规范身份一致。
+
+        挑错了的话，服务运行期新采到的回复会挂到那条**即将被删**的重复主贴下，
+        要等下次重启才被改挂 —— 仍然是这次要修的「回复只跟着其中一份」。
+        """
+        conn = self.storage._get_conn()
+        conn.executemany(
+            """INSERT INTO posts (source_id, fingerprint, seq, username, timestamp,
+               content, page_number, message_id, parent_fingerprint, reply_level)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            [
+                ("src_x", "keep", 3, "Jan", "17-08-2026 17:21", "正文", 1, "M1", None, 0),
+                ("src_x", "dupe", 9, "Jan", "", "正文", 1, "M1", None, 0),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        self.storage.upsert_posts("src_x", [
+            self._post("fresh", "M1", content="又改了一版"),
+            self._post("kid", "MK", content="回复", parent_fingerprint="fresh",
+                       reply_level=1),
+        ])
+
+        rows = {r["fingerprint"]: r for r in self._rows()}
+        assert "fresh" not in rows, "又多存了一行"
+        assert rows["kid"]["parent_fingerprint"] == "keep", \
+            f"回复挂到了即将被删的那行重复主贴上: {rows['kid']['parent_fingerprint']}"
+
+    def test_upgrading_merges_the_duplicates_on_first_start(self):
+        """升级后启动一次就该把存量重复行合掉 —— 真 orchestrator、真 SQLite、真迁移。
+
+        import 必须排在播种之前：orchestrator 在 import 时就实例化全局单例并跑一轮
+        迁移，留在后面的话这里会变成两轮，第二轮把第一轮的效果盖掉，用例就白测了
+        （TestFakeNeutralPurgeEndToEnd 踩过同一个坑）。
+        """
+        from app.services.orchestrator import TaskOrchestrator
+
+        conn = self.storage._get_conn()
+        conn.executemany(
+            """INSERT INTO posts (source_id, fingerprint, seq, username, timestamp,
+               content, page_number, message_id, parent_fingerprint, reply_level)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            [
+                ("src_x", "p_old", 139, "Jan", "17-08-2026 17:21", "主贴", 1, "MP", None, 0),
+                ("src_x", "r_old", 140, "Piet", "17-08-2026 17:23", "回复", 1, "MR", "p_old", 1),
+                ("src_x", "p_new", 147, "Jan", "", "主贴", 1, "MP", None, 0),
+                ("src_x", "r_new", 148, "Piet", "", "回复", 1, "MR", "p_new", 1),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        TaskOrchestrator()                      # 升级后的第一次启动
+
+        rows = self._rows()
+        assert [r["fingerprint"] for r in rows] == ["p_old", "r_old"], \
+            f"启动时没合并重复行: {[(r['seq'], r['fingerprint']) for r in rows]}"
+        assert rows[1]["parent_fingerprint"] == "p_old"
+
+
 class TestPostsStorageEndToEnd:
     """posts 表：seq 是全链路的顺序锚点，upsert 不能碰已处理标记"""
 

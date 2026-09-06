@@ -5,7 +5,7 @@ import json
 import sqlite3
 import logging
 from datetime import datetime
-from typing import Optional, List
+from typing import Dict, Optional, List
 from app.config import settings
 
 logger = logging.getLogger("hyxi.storage")
@@ -130,6 +130,17 @@ CREATE TABLE IF NOT EXISTS posts (
     image_desc         TEXT NOT NULL DEFAULT '',
     translated         INTEGER NOT NULL DEFAULT 0,
     sentiment_at       TEXT,
+    PRIMARY KEY (source_id, fingerprint)
+);
+
+-- 被归并掉的指纹 → 规范身份。**采集器的增量去重靠它**：归并掉的那个指纹从不进
+-- posts 表，known_fingerprints() 看不见它，采集脚本每轮都会把这条帖子当新出现的，
+-- 于是每轮重新回源下载它的全部配图（文件名按指纹），水位线的「本轮没有新增就早停」
+-- 也永远不成立。反复回源与「请求节奏是反爬纪律」直接冲突
+CREATE TABLE IF NOT EXISTS post_aliases (
+    source_id   TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    canonical   TEXT NOT NULL,
     PRIMARY KEY (source_id, fingerprint)
 );
 
@@ -390,7 +401,8 @@ def migrate_posts_file(source_id: str, path: str) -> int:
     posts = loaded.get("posts") or []
     for p in posts:
         p.setdefault("source", source_id)
-    added = upsert_posts(source_id, posts, drop_empty=False)
+    added = upsert_posts(source_id, posts, drop_empty=False,
+                          merge_by_message_id=False)
     logger.info("来源 %s 的 %d 条帖子已迁入 posts 表", source_id, added)
     return added
 
@@ -819,11 +831,18 @@ def count_posts(source_id: str) -> int:
 
 
 def known_fingerprints(source_id: str) -> List[str]:
-    """交给采集脚本做增量去重。以前脚本自己读旧落盘文件，现在由 job 下发"""
+    """交给采集脚本做增量去重。以前脚本自己读旧落盘文件，现在由 job 下发。
+
+    **必须并上 post_aliases**：帖子被编辑过之后算出来的新指纹会归并到规范身份，
+    自己从不进 posts 表。漏掉它，采集脚本每轮都把这条帖子当新出现的 —— 每轮重新
+    回源下载它的配图，水位线的「本轮没有新增就早停」也永远不成立。
+    """
     conn = _get_conn()
     try:
         return [r[0] for r in conn.execute(
-            "SELECT fingerprint FROM posts WHERE source_id = ?", (source_id,)
+            "SELECT fingerprint FROM posts WHERE source_id = ? "
+            "UNION SELECT fingerprint FROM post_aliases WHERE source_id = ?",
+            (source_id, source_id),
         )]
     finally:
         conn.close()
@@ -837,6 +856,142 @@ def max_page_number(source_id: str) -> int:
             "SELECT MAX(page_number) FROM posts WHERE source_id = ?", (source_id,)
         ).fetchone()
         return row[0] or 0
+    finally:
+        conn.close()
+
+
+def merge_duplicate_posts() -> None:
+    """把「同一条真实帖子被存成多行」合并回一行，并把回复挂回规范父贴。
+
+    存量成因见 upsert_posts 里那段注释：指纹吃 `用户名|时间戳|正文前100字`，这三样
+    对同一条帖子并不稳定。真实库实测到三种漂移全都发生过 ——
+      · 作者编辑正文：`UPDATE 4/8:` 前缀让 message_id=2491589267983459 存成两行
+      · 相对时间这轮读不到：message_id=2510996366042749 正文一字不差、只差个时间戳
+      · 正文展开长度不同：message_id=2510894682719584 分别是 89 和 157 字
+    最直接的一例是 message_id=2510998052709247 那条回复：它的两个副本分别挂在同一条
+    主贴的两个副本下，页面上就成了「这条回复不是这个主贴的」。
+
+    **规范身份取 seq 最小的那行** —— seq 是全链路顺序锚点，舆情结论和译文都按它对齐，
+    保留先入库的那个才不会让既有结论错位。
+
+    **每个字段取「从最新一行往回数第一个非空值」**：直接照搬最新一行会把时间戳冲成空
+    （那正是制造重复的原因之一），照搬最旧一行又丢掉作者的编辑。译文 / 舆情标记同理 ——
+    它们可能恰好落在要被删掉的那一行上，跟着行一起删等于重新付一次钱。
+
+    合并完再统一做两件事：把所有回复的父指针改写到规范身份；父贴根本不在库里的回复
+    **就地提成主贴**，不留悬空 parent（与 drop_empty_posts 的既定规则一致，那种回复
+    在 build_tree() 里本来就已经按主贴处理，数据和呈现口径要一致）。
+
+    判定落在 storage 这个**唯一入库口**上，对三个采集器和以后新加的都成立；
+    message_id 只在来源内唯一，所以分组必须带上 source_id。
+    """
+    conn = _get_conn()
+    try:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM posts ORDER BY source_id, seq")]
+        if not rows:
+            return
+
+        groups: Dict[tuple, List[dict]] = {}
+        for r in rows:
+            mid = (r.get("message_id") or "").strip()
+            if mid:
+                groups.setdefault((r["source_id"], mid), []).append(r)
+
+        merged = 0
+        remap: Dict[tuple, str] = {}      # (source_id, 被删指纹) → 规范指纹
+        for (src, _mid), members in groups.items():
+            if len(members) < 2:
+                continue
+            members.sort(key=lambda r: r["seq"])
+            canonical, extras = members[0], members[1:]
+            newest_first = sorted(members, key=lambda r: r["seq"], reverse=True)
+
+            def pick(field, blank=("", None, "[]", 0)):
+                for r in newest_first:
+                    if r.get(field) not in blank:
+                        return r[field]
+                return canonical.get(field)
+
+            parent = pick("parent_fingerprint")
+            conn.execute(
+                """UPDATE posts SET username=?, timestamp=?, content=?, page_number=?,
+                   parent_fingerprint=?, reply_level=?, images_json=?, image_desc=?,
+                   translation=?, translated=?, sentiment_at=?
+                   WHERE source_id=? AND fingerprint=?""",
+                (
+                    pick("username"), pick("timestamp"), pick("content"),
+                    pick("page_number") or 1, parent,
+                    (pick("reply_level") or 0) if parent else 0,
+                    pick("images_json") or "[]", pick("image_desc") or "",
+                    pick("translation") or "", 1 if pick("translated") else 0,
+                    pick("sentiment_at"),
+                    src, canonical["fingerprint"],
+                ),
+            )
+            for extra in extras:
+                remap[(src, extra["fingerprint"])] = canonical["fingerprint"]
+                # 记号同 upsert_posts：这些指纹马上就要从 posts 表消失，
+                # 不留下来采集器会把它们当成新帖，每轮重新回源下载配图
+                conn.execute(
+                    "INSERT OR REPLACE INTO post_aliases (source_id, fingerprint, canonical)"
+                    " VALUES (?,?,?)",
+                    (src, extra["fingerprint"], canonical["fingerprint"]),
+                )
+                # 舆情结论可能只算在要删的那一行上。规范身份没有结论就把它搬过来，
+                # 有就丢掉重复的那份 —— 主键是 (source_id, fingerprint)，两条并存不了
+                has = conn.execute(
+                    "SELECT 1 FROM sentiment_results WHERE source_id=? AND fingerprint=?",
+                    (src, canonical["fingerprint"]),
+                ).fetchone()
+                if has:
+                    conn.execute(
+                        "DELETE FROM sentiment_results WHERE source_id=? AND fingerprint=?",
+                        (src, extra["fingerprint"]),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE sentiment_results SET fingerprint=? "
+                        "WHERE source_id=? AND fingerprint=?",
+                        (canonical["fingerprint"], src, extra["fingerprint"]),
+                    )
+                conn.execute("DELETE FROM posts WHERE source_id=? AND fingerprint=?",
+                             (src, extra["fingerprint"]))
+                merged += 1
+
+        # 回复挂回规范父贴
+        repointed = 0
+        for (src, dead_fp), keep_fp in remap.items():
+            cur = conn.execute(
+                "UPDATE posts SET parent_fingerprint=? WHERE source_id=? AND parent_fingerprint=?",
+                (keep_fp, src, dead_fp),
+            )
+            repointed += cur.rowcount or 0
+
+        # 悬空 parent 就地提成主贴
+        alive = set()
+        for r in conn.execute("SELECT source_id, fingerprint FROM posts"):
+            alive.add((r["source_id"], r["fingerprint"]))
+        orphans = 0
+        for r in conn.execute(
+            "SELECT source_id, fingerprint, parent_fingerprint FROM posts "
+            "WHERE TRIM(COALESCE(parent_fingerprint, '')) <> ''"
+        ).fetchall():
+            if (r["source_id"], r["parent_fingerprint"]) not in alive:
+                conn.execute(
+                    "UPDATE posts SET parent_fingerprint=NULL, reply_level=0 "
+                    "WHERE source_id=? AND fingerprint=?",
+                    (r["source_id"], r["fingerprint"]),
+                )
+                orphans += 1
+
+        conn.commit()
+        if merged or repointed or orphans:
+            logger.info("合并重复帖子 %d 行，回复改挂 %d 条，孤儿回复提为主贴 %d 条",
+                        merged, repointed, orphans)
+    except Exception as e:
+        # 合并不掉只是页面上继续看到重复的主贴，不该拦住启动
+        logger.warning("合并重复帖子失败: %s", e)
     finally:
         conn.close()
 
@@ -904,7 +1059,8 @@ def drop_empty_posts(posts: List[dict]) -> List[dict]:
     return kept
 
 
-def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True) -> int:
+def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True,
+                 merge_by_message_id: bool = True) -> int:
     """写入采集结果，返回新增条数。
 
     **已存在的帖子只更新采集字段，绝不覆盖 translation / translated / sentiment_at**。
@@ -917,6 +1073,10 @@ def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True) -> 
     `drop_empty=False` 只给历史迁移用：迁移是**照原样重建**，不是采集。少搬一条
     就会让入库条数对不上旧舆情 blob 的 results 长度，`migrate_sentiment_blob()`
     的「条数不等整份跳过」会因此把那个来源的历史结论永久挡在门外。
+    `merge_by_message_id=False` 是同一个理由的另一半：旧 JSON 里本来就带着重复行，
+    在迁移这一步把它们并掉同样会让条数对不上，而且此后每次启动都仍然对不上
+    （posts 已合并、原 JSON 已 retire）。存量归并交给启动链上排在迁移之后的
+    `merge_duplicate_posts()`。
     """
     if drop_empty:
         posts = drop_empty_posts(posts)
@@ -933,11 +1093,64 @@ def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True) -> 
             "SELECT MAX(seq) FROM posts WHERE source_id = ?", (source_id,)
         ).fetchone()[0] or -1) + 1
 
-        added = 0
+        # **同一条真实帖子的指纹并不稳定**：作者编辑正文、相对时间这轮读不到、正文
+        # 展开长度不同，都会算出一个新指纹，于是多存一行「新帖」；重采到的回复又被
+        # 刷新指向新那行，旧那行却永不删除 —— 页面上同一条主贴出现两次、回复只跟着
+        # 其中一份。用户报过「主贴 A 的回复贴不是他的」，根子就在这里。
+        # 平台自己的 message_id 才是稳定身份，让它来决定「是不是同一条」。
+        # **指纹算法一个字符都没动**（改了历史数据全部失配、已翻译的要重新付费），
+        # 只是当 message_id 认得出来时，以先入库的那个指纹为规范身份归并过去。
+        # **ORDER BY seq + setdefault**：库里还有重复行时要挑 seq 最小那行，与
+        # merge_duplicate_posts() 的规范身份口径一致。挑错了的话，运行期新采到的回复
+        # 会挂到那条即将被删的重复主贴下，要等下次重启才被改挂
+        by_mid: Dict[str, str] = {}
+        if merge_by_message_id:
+            for r in conn.execute(
+                "SELECT message_id, fingerprint FROM posts "
+                "WHERE source_id = ? AND TRIM(COALESCE(message_id, '')) <> '' "
+                "ORDER BY seq",
+                (source_id,),
+            ):
+                by_mid.setdefault(r["message_id"], r["fingerprint"])
+        # 已经归并过的指纹直接认账，不必再靠 message_id 重新认一遍
+        aliases = {} if not merge_by_message_id else {
+            r["fingerprint"]: r["canonical"] for r in conn.execute(
+                "SELECT fingerprint, canonical FROM post_aliases WHERE source_id = ?",
+                (source_id,),
+            )
+        }
+        # 本批指纹 → 落库用的规范指纹。**父指针必须走同一张表改写**，否则孩子会挂到
+        # 刚被归并掉的那个身份上，当场变成孤儿
+        canon: Dict[str, str] = {}
         for post in posts:
             fp = post.get("fingerprint")
             if not fp:
                 continue
+            mid = (post.get("message_id") or "").strip()
+            keep = aliases.get(fp)
+            # 开关要挡在**查找**这一步：只挡初始查询的话，同一批里前一条帖子会把
+            # by_mid 填回去，迁移那一路照样会被归并（实测踩过）
+            if merge_by_message_id and not keep and mid and fp not in existing:
+                # 空 message_id 不是身份，两条真帖子都没有 id 时合并会把它们并成一条
+                keep = by_mid.get(mid)
+            canon[fp] = keep or fp
+            if keep and keep != fp:
+                # 记下来：这个指纹从不进 posts 表，不留记号采集器每轮都当新帖
+                conn.execute(
+                    "INSERT OR REPLACE INTO post_aliases (source_id, fingerprint, canonical)"
+                    " VALUES (?,?,?)", (source_id, fp, keep),
+                )
+            elif mid:
+                by_mid.setdefault(mid, fp)
+
+        added = 0
+        for post in posts:
+            fp = canon.get(post.get("fingerprint") or "")
+            if not fp:
+                continue
+            parent_fp = post.get("parent_fingerprint")
+            if parent_fp:
+                parent_fp = canon.get(parent_fp, parent_fp)
             if fp in existing:
                 # seq 保持不变 —— 它是全链路的顺序锚点，动一下所有历史结论就错位了。
                 # translation / translated / sentiment_at / image_desc 也一律不在这条
@@ -955,13 +1168,19 @@ def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True) -> 
                         (json.dumps(images, ensure_ascii=False), source_id, fp),
                     )
                 conn.execute(
-                    """UPDATE posts SET username=?, timestamp=?, content=?, page_number=?,
+                    # **空值不许覆盖已有的好值**：归并分支两边的 username /
+                    # timestamp / content 本来就可能不同，而「这轮没读到时间戳」正是
+                    # 制造重复的三个原因之一 —— 照搬的话好数据不是多一行重复，是被销毁。
+                    # 与旁边 images / translation「采集不得把已有值冲回空」同一条规矩
+                    """UPDATE posts SET username=COALESCE(NULLIF(?,''), username),
+                       timestamp=COALESCE(NULLIF(?,''), timestamp),
+                       content=COALESCE(NULLIF(?,''), content), page_number=?,
                        message_id=?, parent_fingerprint=?, reply_level=?
                        WHERE source_id=? AND fingerprint=?""",
                     (
                         post.get("username", ""), post.get("timestamp", ""),
                         post.get("content", ""), int(post.get("page_number", 1) or 1),
-                        post.get("message_id", ""), post.get("parent_fingerprint"),
+                        post.get("message_id", ""), parent_fp,
                         int(post.get("reply_level", 0) or 0),
                         source_id, fp,
                     ),
@@ -977,7 +1196,7 @@ def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True) -> 
                     source_id, fp, next_seq, post.get("username", ""),
                     post.get("timestamp", ""), post.get("content", ""),
                     post.get("translation", ""), int(post.get("page_number", 1) or 1),
-                    post.get("message_id", ""), post.get("parent_fingerprint"),
+                    post.get("message_id", ""), parent_fp,
                     int(post.get("reply_level", 0) or 0),
                     json.dumps(post.get("images") or [], ensure_ascii=False),
                     post.get("image_desc", ""),

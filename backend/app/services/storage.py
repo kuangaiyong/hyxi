@@ -1022,12 +1022,21 @@ def drop_empty_posts(posts: List[dict]) -> List[dict]:
     的 flatten() 是按「主贴 → 它的评论」嵌套遍历的，在那里过滤会把评论一起带走。
     所以过滤放在这个唯一的入库口。真被丢掉的父贴（整棵子树都没内容）才把孤儿评论
     就地提成主贴，不留悬空 parent。
+
+    **有 message_id 就不算空**：平台给了这条内容一个 id，它就真实存在，正文空多半是
+    提取失败。上面那条「有评论就不算空」只捞得到**父贴**（它要求有个非空的*子*帖），
+    而叶子回复没有子帖 —— 永远捞不回来。纯贴图 / 表情回复正文是空的，而采集脚本的
+    imagesOf() 只认 scontent 上 ≥100px 的图（贴图和 emoji 都不在其列），images 也空，
+    于是在这个唯一入口被静默丢掉：主贴下 4 条回复只剩 3 条，页面上完全看不出。
+    采集脚本的 isNotAPost() 早就是这个口径（「纯图片帖有 id 没正文…两种都是真帖子」），
+    存储层比它严就是两层自相矛盾。没有 id 又没正文的照旧丢 —— 广告和推荐卡片正是那样。
     """
     empty = {
         p.get("fingerprint") for p in posts
         if p.get("fingerprint")
         and not (p.get("content") or "").strip()
         and not (p.get("images") or [])
+        and not (p.get("message_id") or "").strip()
     }
     if not empty:
         return posts
@@ -1150,7 +1159,13 @@ def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True,
                 continue
             parent_fp = post.get("parent_fingerprint")
             if parent_fp:
-                parent_fp = canon.get(parent_fp, parent_fp)
+                # 父指针和帖子身份必须走**同一套**解析。canon 只认本批里的帖子，
+                # 而父贴常常根本没被下发：它漂出来的那个指纹已经进了 post_aliases，
+                # 而 known_fingerprints() 并上了别名表，采集器于是把它当已见过的过滤掉。
+                # 这时只有 aliases 认得出「这个指纹已经被归并掉了」——
+                # 漏掉它，回复就指向一个 posts 表里不存在的指纹，下次启动被
+                # merge_duplicate_posts() 当孤儿**提成主贴**，而那一步不可逆
+                parent_fp = canon.get(parent_fp) or aliases.get(parent_fp) or parent_fp
             if fp in existing:
                 # seq 保持不变 —— 它是全链路的顺序锚点，动一下所有历史结论就错位了。
                 # translation / translated / sentiment_at / image_desc 也一律不在这条

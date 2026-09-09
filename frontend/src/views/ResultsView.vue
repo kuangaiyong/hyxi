@@ -341,6 +341,20 @@ function getStatusText(): string {
             >
               📊 {{ SENTIMENT_LABEL[sentimentOf(t.root)!.sentiment!] }} ›
             </button>
+            <!-- 原帖链接。在用户自己的浏览器里打开，用的就是他本人的登录态；
+                 没登录时 Facebook 会自己带着这个目标走一遍登录再跳回原贴 ——
+                 所以这里不需要、也不该做任何自动登录。
+                 rel 两个值都必要：noopener 断掉新页面对 window.opener 的引用，
+                 noreferrer 不把本机的内网地址带到外站去 -->
+            <a
+              v-if="t.root.source_url"
+              class="source-link"
+              :href="t.root.source_url"
+              target="_blank"
+              rel="noopener noreferrer"
+              :title="`在新标签页打开原帖：${t.root.source_url}`"
+              data-testid="source-link"
+            >🔗 原帖</a>
             <span class="text-sm text-secondary">#{{ t.root.index }}</span>
             <span v-if="t.replies.length" class="reply-count">💬 {{ t.replies.length }}</span>
             <!-- 这条主贴很旧，但下面有新回复。按主贴时间倒序排的话它会沉到下面去，
@@ -502,6 +516,21 @@ function getStatusText(): string {
 .reply-count {
   font-size: 12px;
   color: var(--text-secondary);
+}
+/* 原帖链接。做成和舆情徽标同一个量级的小胶囊，而不是一眼就抢注意力的主按钮 ——
+   它是「需要时点一下」的辅助入口，不是这一页的主操作 */
+.source-link {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.source-link:hover {
+  color: var(--primary);
+  border-color: var(--primary);
 }
 /* 情感标签本身就是入口：既让人一眼看到结论，又不用再多摆一个「查看」按钮。
    主贴和评论共用同一个样式 —— 结论是逐条给的，评论也有自己那份 */

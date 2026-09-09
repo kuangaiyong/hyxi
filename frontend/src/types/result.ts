@@ -7,6 +7,12 @@ export interface PostData {
   page_number: number
   source: string
   source_name: string
+  /**
+   * 原帖固定链接，**只有主贴有**，回复贴一律空串。后端现算（group_id + message_id），
+   * 来源被删掉或该来源没有 URL 形态时也是空串 —— 按空串决定不渲染即可，
+   * 前端不判断来源类型。
+   */
+  source_url: string
   reply_level: number
   /** 搜索命中标记：命中评论时父贴会被一起带出来，靠这个区分谁才是命中项 */
   matched: boolean

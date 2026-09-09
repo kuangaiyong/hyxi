@@ -8,6 +8,7 @@ from datetime import datetime
 from urllib.parse import quote
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
+from app.collectors import get_collector
 from app.models import PostsResponse, PostData, TaskStats
 from app.services import source_service, storage
 from app.services.excel_service import (
@@ -100,9 +101,41 @@ def _validate_fresh_days(days: int) -> int:
     return days
 
 
+def _url_sources() -> dict:
+    """来源 id → (采集器, 来源记录)，用来现算原帖链接。
+
+    只收还注册着的来源 —— 链接要靠它 params 里的 group_id 才拼得出来。数据源被删掉
+    后历史任务照旧能看，只是没有链接（帖子本身按 source_id 直接查表，不受影响）。
+    """
+    out = {}
+    for s in source_service.list_sources():
+        try:
+            out[s["id"]] = (get_collector(s["collector_id"]), s)
+        except ValueError:
+            # 采集器被下掉了（来源记录里的 collector_id 已不在注册表里）就是没有链接，
+            # 不该让整个帖子列表 500
+            continue
+    return out
+
+
+def _post_url(post: dict, url_sources: dict) -> str:
+    """原帖链接。**只给主贴** —— 用户明确只要主贴，而评论的锚点是 `?comment_id=`
+    另一种形态；每条回复都挂一个链接还会把列表塞满。
+    """
+    if int(post.get("reply_level", 0) or 0) != 0:
+        return ""
+    entry = url_sources.get(post.get("source", ""))
+    message_id = (post.get("message_id") or "").strip()
+    if not entry or not message_id:
+        return ""
+    collector, source = entry
+    return collector.post_url(source, message_id) or ""
+
+
 def _to_post_data(post: dict, index: int, names: dict, matched: bool = False,
-                  fresh_days_gap: int = None) -> PostData:
+                  fresh_days_gap: int = None, url_sources: dict = None) -> PostData:
     return PostData(
+        source_url=_post_url(post, url_sources or {}),
         fresh_reply=fresh_days_gap is not None,
         days_since_root=fresh_days_gap or 0,
         index=index,
@@ -203,12 +236,15 @@ async def get_posts(
     index_of = {post_key(p): i + 1 for i, p in enumerate(posts)}
 
     names = _source_names(task)
+    # 一次查完所有来源：链接是逐条现算的，放在 build() 里会变成每条帖子查一次库
+    url_sources = _url_sources()
 
     def build(post) -> PostData:
         item = _to_post_data(
             post, index_of.get(post_key(post), 0), names,
             matched=bool(hit_keys) and post_key(post) in hit_keys,
             fresh_days_gap=fresh.get(post_key(post)),
+            url_sources=url_sources,
         )
         item.replies = [build(c) for c in children.get(post_key(post), [])]
         # 整棵子树里有几条新回复，主贴上挂个数好做徽标（嵌套回复也算进来）
@@ -233,7 +269,8 @@ async def get_post_detail(task_id: str, post_index: int):
     if post_index < 0 or post_index >= len(posts):
         raise HTTPException(status_code=404, detail="帖子不存在")
 
-    return _to_post_data(posts[post_index], post_index + 1, _source_names(task))
+    return _to_post_data(posts[post_index], post_index + 1, _source_names(task),
+                         url_sources=_url_sources())
 
 
 @router.get("/stats", response_model=TaskStats)

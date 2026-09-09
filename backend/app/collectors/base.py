@@ -40,6 +40,13 @@ class Collector:
         """构造传给 Node 脚本的 job —— 唯一允许每个来源各不相同的地方，纯数据无逻辑。"""
         raise NotImplementedError
 
+    def post_url(self, source: Dict[str, Any], message_id: str) -> Optional[str]:
+        """一条帖子在原站上的固定链接，**现算不落库**（存一份就是双写，而且历史数据
+        没有那一列）。默认 `None` —— 只有知道自己站点 URL 形态的来源才实现它，
+        出口拿到 None 就不给链接，不需要按来源分支。
+        """
+        return None
+
     def normalize(self, raw: Dict[str, Any]) -> List[Dict[str, Any]]:
         """把脚本输出拍平成统一的 post 数组。"""
         return raw.get("posts", [])

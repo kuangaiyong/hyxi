@@ -52,6 +52,27 @@ class FacebookGroupCollector(Collector):
             return None
         return os.path.join(settings.project_root, f"facebook_group_{group_id}.json")
 
+    def post_url(self, source: Dict[str, Any], message_id: str) -> Optional[str]:
+        """小组帖子的固定链接：`/groups/{gid}/permalink/{mid}/`。
+
+        这是 Facebook 自己的规范形态 —— 用户手里那条
+        `.../groups/2407063016436085/permalink/2494381381037581/` 就是它，
+        末尾那串数字正是 posts 表里的 message_id。
+
+        **不需要也不该做自动登录**：链接在用户自己的浏览器里打开，用的就是他本人的
+        登录态；没登录时 Facebook 会自己带着这个目标走一遍登录再跳回原贴。把采集
+        小号的会话递进用户浏览器是安全倒退（凭据只进不出），为省一次点击不值得。
+
+        `base_url` 取自数据源参数而不是写死常量：本地 fixture 验证时它指向测试站点，
+        写死会让链接指到真站上去。
+        """
+        params = source.get("params") or {}
+        group_id = params.get("group_id")
+        if not group_id or not message_id:
+            return None
+        base = (params.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
+        return f"{base}/groups/{group_id}/permalink/{message_id}/"
+
     def session_path(self, source: Dict[str, Any]) -> str:
         """会话按 source 隔离而不是按 collector —— 同一个采集器可能挂两个账号"""
         return os.path.join(

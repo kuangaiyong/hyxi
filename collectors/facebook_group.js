@@ -85,6 +85,21 @@ const SELECTORS = {
     // 「… 展开」。都是界面文案不是正文，而 content 前 100 字进指纹 —— 留着等于把
     // UI 文案写进去重锚点，还会让同一条帖子展开前后算出两个指纹。
     bodyTrail: '\\s*(…\\s*)?(展开|收起|See more|See less|Meer weergeven|Minder weergeven)$',
+    // **评论区自己的折叠，和上面正文那个「展开」是两回事**：首屏每条主贴只渲染前
+    // 两三条评论，其余藏在「查看更多评论」后面（还分页，点一次只多出一页）；一条评论
+    // 底下的嵌套回复另有一个「查看 N 条回复」。expandText 那三个词一个都碰不到它们。
+    // 这些文案里**带条数**，所以不能像 expandText 那样当成完整词精确匹配。
+    // 必须挡住「回复」「评论」「分享」这类动作按钮：每一条模式都要么带「查看/更多/
+    // weergeven/bekijken」，要么带一个数字，光是「回复」两个字匹配不上 ——
+    // 误点「分享」会弹出对话框，误点「回复」会打开输入框，两者都会把页面搞乱。
+    commentFoldText: [
+        '查看更多评论', '查看之前的评论', '查看全部评论', '更多评论',
+        'View more comments', 'View previous comments', 'View all comments',
+        'Meer reacties weergeven', 'Eerdere reacties weergeven', 'Alle reacties weergeven',
+        '查看(全部)?\\s*\\d+\\s*条回复', '查看更多回复', '\\d+\\s*条回复',
+        'View\\s*(all\\s*)?\\d+\\s*(more\\s*)?repl(y|ies)', '\\d+\\s*repl(y|ies)',
+        '(Alle\\s*)?\\d+\\s*antwoord(en)?\\s*bekijken', 'Meer antwoorden weergeven',
+    ].join('|'),
     // 正文图。2026-08-04 对真实小组页实测：
     //   - 正文图是 <img>，host 为 scontent-*.xx.fbcdn.net，渲染尺寸 367×795 这个量级
     //   - 界面图标是 data:image/svg+xml（16~18px），emoji 在 static.xx.fbcdn.net，
@@ -192,8 +207,59 @@ async function expandBodies(page) {
     }
 }
 
+// 评论折叠的点击轮次上限。评论是分页加载的，一轮只多出一页，热帖要点好几轮才见底；
+// 但也不能无上限，否则一条几百条评论的帖子会把整批时间耗光
+const COMMENT_FOLD_ROUNDS = 8;
+
+/**
+ * 提取前把评论区的折叠点开 —— 和 expandBodies() 点的**正文**折叠是两回事。
+ *
+ * Facebook 首屏每条主贴只渲染前两三条评论，其余藏在「查看更多评论」后面，
+ * 一条评论底下的嵌套回复另有一个「查看 N 条回复」。不点它们，采到的就只是首屏
+ * 那几条：真实库实测 79 条主贴的回复数分布 {1条:17, 2条:30, 3条:5}，
+ * **上限死死卡在 3、一条都没超过** —— 那不是自然分布，是首屏渲染上限的指纹
+ * （用户报「只采到 3 条、实际应有 4 条」）。回复采不全，舆情就少统计一份声音，
+ * 而页面上完全看不出少了什么。
+ *
+ * 评论**分页加载**，点一次只多出一页，所以要循环点到不再增长；每轮之间照常
+ * humanDelay —— 连着几十次点「加载更多」在行为分析里比翻页还扎眼。
+ * 撞上轮次上限**必须说出来**：静默停在半路等于又一次少采，而这回连日志都不提。
+ */
+async function expandComments(page) {
+    const count = (sel) => document.querySelectorAll(sel.comment).length;
+    let total = 0;
+    for (let round = 1; round <= COMMENT_FOLD_ROUNDS; round++) {
+        const before = await page.evaluate(count, SELECTORS);
+        const clicked = await page.evaluate((sel) => {
+            const re = new RegExp(`^(${sel.commentFoldText})$`);
+            const btns = [...document.querySelectorAll(`${sel.post} [role="button"]`)]
+                .filter((el) => re.test(el.textContent.replace(/\s+/g, ' ').trim()));
+            btns.forEach((b) => b.click());
+            return btns.length;
+        }, SELECTORS);
+        if (!clicked) return total;
+        total += clicked;
+        try {
+            // 等评论真的多出来。点了却没变多说明这一页的折叠已经到底（或那个按钮
+            // 压根不是「加载更多」），再点下去只是空转
+            await page.waitForFunction(
+                ([sel, n]) => document.querySelectorAll(sel.comment).length > n,
+                [SELECTORS, before], { timeout: 5000 });
+        } catch (e) {
+            if (/has been closed|target closed|crashed/i.test(e.message)) throw e;
+            return total;
+        }
+        await humanDelay(CONFIG.delayMin, CONFIG.delayMax);
+    }
+    log(`   ⚠️ 评论折叠点了 ${COMMENT_FOLD_ROUNDS} 轮仍未见底，这一批的回复可能不全`);
+    return total;
+}
+
 async function extractBatch(page) {
     await expandBodies(page);
+    // 点开了几处折叠要报出来：这是远端唯一能看出「这一轮到底有没有多采到回复」的地方
+    const folds = await expandComments(page);
+    if (folds) log(`   点开评论折叠 ${folds} 处`);
     const { posts: raw, scan } = await page.evaluate((sel) => {
         const scan = { candidates: [], accepted: [], rejected: [] };
         const text = (el) => (el ? el.textContent.replace(/\s+/g, ' ').trim() : '');

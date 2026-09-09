@@ -1111,6 +1111,136 @@ class TestExportEndpointEndToEnd:
             assert resp.status_code == 404, f"{path} 仍然可用（{resp.status_code}）"
 
 
+class TestPostSourceUrlEndToEnd:
+    """主贴要带原帖固定链接 —— 真 HTTP → 真 SQLite → 真数据源记录
+
+    用户要的是「在结果页点一下就跳到 Facebook 原贴」。链接**现算**：group_id 在
+    sources.params_json 里、message_id 在 posts 表里，两样都已经有了，存一份 url 列
+    是双写（CLAUDE.md 存储红线第四条），而且历史数据全都没有那一列 —— 现算则连三个月
+    前采的帖子一起有链接。
+
+    站点 URL 形态是**站点知识**，落在采集器声明里而不是出口路由里，否则
+    「新增一个来源 = 一个 Node 脚本加十几行声明」这条前提就破了。
+    """
+
+    GROUP_ID = "2407063016436085"
+    # 用户报的那条主贴，permalink 里的数字就是库里的 message_id（实测核对过 seq=26）
+    MESSAGE_ID = "2494381381037581"
+
+    @classmethod
+    def setup_class(cls):
+        import app.config as cfg
+
+        cls.cfg = cfg
+        cls.tmpdir = tempfile.mkdtemp()
+        cls._old_key = cfg.settings.api_key
+        cls._old_dir = cfg.settings.data_dir
+        cfg.settings.api_key = ""
+        cfg.settings.data_dir = cls.tmpdir
+
+        from main import app
+        from app.services import storage, source_service
+        cls.storage = storage
+        cls.source_service = source_service
+        cls._old_db = storage.DB_PATH
+        storage.DB_PATH = os.path.join(cls.tmpdir, "hyxi.db")
+        storage.init_db()
+        cls.client = TestClient(app)
+
+        # 真的注册一个数据源：链接要靠它的 params 里的 group_id 才拼得出来
+        cls.fb = source_service.create_source(
+            collector_id="facebook_group", name="Facebook 小组",
+            params={"group_id": cls.GROUP_ID},
+        )
+        cls.tw = source_service.create_source(
+            collector_id="tweakers", name="Tweakers", params={"thread_id": "2336074"},
+        )
+
+        storage.upsert_posts(cls.fb["id"], [
+            {"username": "Dries Boink", "timestamp": "31-07-2026 17:47",
+             "content": "Iemand enig idee hoe ik een account aanmaak?",
+             "page_number": 2, "fingerprint": "fbroot", "message_id": cls.MESSAGE_ID,
+             "source": cls.fb["id"], "parent_fingerprint": None, "reply_level": 0},
+            {"username": "Peter Quekel", "timestamp": "13-08-2026 05:03",
+             "content": "Klopt, via de api krijg je alleen gegevens.",
+             "page_number": 2, "fingerprint": "fbreply", "message_id": "2506705343138518",
+             "source": cls.fb["id"], "parent_fingerprint": "fbroot", "reply_level": 1},
+        ])
+        storage.upsert_posts(cls.tw["id"], [
+            {"username": "Dorpjes", "timestamp": "22-05-2026 17:06", "content": "Halo test",
+             "page_number": 1, "fingerprint": "twroot", "message_id": "77123456",
+             "source": cls.tw["id"], "parent_fingerprint": None, "reply_level": 0},
+        ])
+
+        cls.task_id = "source-url-e2e"
+        from app.services.orchestrator import orchestrator
+        cls.orchestrator = orchestrator
+        orchestrator.tasks[cls.task_id] = {
+            "id": cls.task_id, "status": "completed", "description": "带链接的任务",
+            "plan": [], "logs": [], "progress": 1.0, "current_step": None,
+            "result": {"total_posts": 3, "sources": [
+                {"id": cls.fb["id"], "name": "Facebook 小组",
+                 "collector_id": "facebook_group", "post_count": 2},
+                {"id": cls.tw["id"], "name": "Tweakers",
+                 "collector_id": "tweakers", "post_count": 1},
+            ]},
+        }
+
+    @classmethod
+    def teardown_class(cls):
+        cls.cfg.settings.api_key = cls._old_key
+        cls.cfg.settings.data_dir = cls._old_dir
+        cls.storage.DB_PATH = cls._old_db
+        cls.orchestrator.tasks.pop(cls.task_id, None)
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _posts(self):
+        resp = self.client.get(f"/api/v1/tasks/{self.task_id}/posts")
+        assert resp.status_code == 200, resp.text
+        return {p["source"]: p for p in resp.json()["posts"]}, resp.json()["posts"]
+
+    def test_facebook_root_post_carries_its_permalink(self):
+        """主贴的 source_url 必须是 Facebook 自己的 permalink 形态，能直接打开"""
+        by_source, _ = self._posts()
+        root = by_source[self.fb["id"]]
+        assert root["source_url"] == (
+            f"https://www.facebook.com/groups/{self.GROUP_ID}/permalink/{self.MESSAGE_ID}/"
+        ), "链接形态和用户手里那条对不上"
+
+    def test_replies_get_no_url(self):
+        """回复贴不给链接 —— 用户明确只要主贴，而评论锚点是 ?comment_id= 另一种形态"""
+        _, posts = self._posts()
+        replies = [r for p in posts for r in p["replies"]]
+        assert replies, "前置条件：这个任务里得有回复贴"
+        assert all(r["source_url"] == "" for r in replies), (
+            f"回复贴也挂上了链接: {[r['source_url'] for r in replies]}"
+        )
+
+    def test_a_source_without_a_url_shape_stays_empty(self):
+        """Tweakers 没有覆写 post_url，就该是空串而不是一个拼错的链接或 500"""
+        by_source, _ = self._posts()
+        assert by_source[self.tw["id"]]["source_url"] == ""
+
+    def test_url_survives_deleting_the_source(self):
+        """数据源删掉后历史任务照旧能看，只是没链接 —— 不许 500、不许整页空白"""
+        self.source_service.delete_source(self.fb["id"])
+        try:
+            by_source, _ = self._posts()
+            assert by_source[self.fb["id"]]["source_url"] == ""
+            assert by_source[self.fb["id"]]["content"], "帖子本身不该跟着消失"
+        finally:
+            # 后面的用例还要用它，按原记录写回去（create_source 会换一个新 id）
+            self.storage.save_source(self.fb)
+
+    def test_post_url_is_not_stored_in_the_posts_table(self):
+        """链接现算，不落库 —— 存一份就是双写，历史数据也不会凭空长出这一列"""
+        conn = self.storage._get_conn()
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(posts)")}
+        conn.close()
+        assert "url" not in cols and "source_url" not in cols, \
+            f"posts 表里多了一列存链接的字段: {cols}"
+
+
 class TestImagesInExportAndApiEndToEnd:
     """纯图帖走完整条出口：真 HTTP → 真 SQLite → 真图片文件 → 真 xlsx / csv"""
 

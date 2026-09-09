@@ -158,6 +158,10 @@ class PostData(BaseModel):
     page_number: int
     source: str = ""
     source_name: str = ""
+    # 原帖固定链接，**只有主贴有**（回复贴的锚点是另一种形态，需求也只要主贴）。
+    # 现算不落库；来源被删掉、没有 message_id、或该来源没有 URL 形态时都是空串，
+    # 前端按空串决定不渲染，不需要判断来源类型
+    source_url: str = ""
     reply_level: int = 0
     matched: bool = False  # 搜索命中标记：带出父贴时用来告诉前端高亮哪几条
     # 正文图，相对 data/media 的路径（如 src_xxx/abc_0.png），经 /api/v1/media 回读。

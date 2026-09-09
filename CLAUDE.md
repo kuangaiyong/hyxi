@@ -122,13 +122,15 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
 | `backend/data/jobs/{run}_out.json` | 采集脚本的产出，**读完入库即删的交接文件** |
 | `backend/data/sessions/{source_id}.json` | Playwright `storageState`。它只认文件路径，且是可重建的运行时缓存，丢了只是重新登录一次 |
 
-**五条存储红线**（静默错误，改存储层前必看）：
+**七条存储红线**（静默错误，改存储层前必看）：
 
 - `intensity` 列必须是 `NUMERIC` 不能是 `REAL` —— REAL 亲和性把整数 3 存成 3.0，导出跟着变「3.0」
 - **舆情结论按 `(source_id, fingerprint)` 存，不按下标、也不按 task_id**。下标只在写入现场有意义
 - **`posts` 故意不挂 `sources` 外键** —— `ON DELETE CASCADE` 会让「删数据源」清空历史任务结果
 - **不留双写**：同一份数据存两处必然长出「改了一边另一边还是旧的」的 bug（已实测踩过）
 - **帖子身份认 `message_id`，不认指纹**。指纹吃 `用户名|时间戳|正文前100字`，这三样对**同一条真实帖子**并不稳定 —— 作者编辑正文、相对时间这轮读不到、正文展开长度不同，都会算出新指纹，于是多存一行「新帖」；重采到的回复又被刷新指向新那行，旧那行却永不删除，页面上同一条主贴出现两次、回复只跟着其中一份（**用户实测报过「主贴 A 的回复贴不是他的」**）。真实库三种漂移全都发生过，实测重复 5/179 与 1/258。`upsert_posts()` 因此在 message_id 认得出来时归并到**先入库的那个指纹**（规范身份），并把同批回复的父指针一起改写；存量由 `merge_duplicate_posts()` 合并。**指纹算法本身一个字符都不能动** —— 改了历史数据全部失配。message_id 为空时退回按指纹判定，空 id 不是身份；分组必须带 source_id，它只在来源内唯一
+- **父指针必须和帖子身份走同一套解析：`canon` 查不到就查 `post_aliases`**。`canon` 只认**本批**下发的帖子，而父贴常常压根没被下发 —— 它漂出来的那个指纹已经进了别名表，而 `known_fingerprints()` 并上了别名表，采集器于是把它当已见过的过滤掉。这时只有 `aliases` 认得出「这个指纹已被归并掉」。漏掉它，回复就指向一个 posts 表里不存在的指纹，下次启动被 `merge_duplicate_posts()` 当孤儿**提成主贴**，而那一步不可逆 —— 这正是 v1.10.1 修完之后仍然会复发「回复贴对不上」的那条缝（v1.10.2 补）
+- **`drop_empty_posts()` 里「有 message_id 就不算空」**。它的「有评论就不算空」只捞得到**父贴**（要求有个非空的*子*帖），叶子回复没有子帖、**永远捞不回来**：纯贴图 / 表情回复正文空，而 `imagesOf()` 只认 scontent 上 ≥100px 的图（贴图和 emoji 都不在其列），images 也空，于是在这唯一入库口被静默丢掉 —— 主贴下 4 条回复只剩 3 条，页面上完全看不出。采集脚本的 `isNotAPost()` 早就是「id 和正文全缺才丢」这个口径，存储层比它严就是两层自相矛盾。没 id 又没正文的照旧丢，广告和推荐卡片正是那样
 
 设计论证（为什么这么定）见 `Skill(hyxi-architecture)`。
 
@@ -237,17 +239,25 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 
 ## 测试
 
-**385 个测试，必须全部 PASSED**（本机实测 `385 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
+**394 个测试，必须全部 PASSED**（本机实测 `394 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
 ```
 
-**前端没有单元测试框架**（package.json 里无 vitest / jest / @vue/test-utils）。
-结果页筛选条件那条回归靠真浏览器守：`frontend/e2e/results_filters.js`
-（`cd frontend; npm run e2e`）—— 真 Chrome、真前后端、无 mock，**要求两个服务都起着**
-（先跑 `.\start.ps1`），所以它进不了 pytest。它自己从 `/tasks` 里挑任务、探出一个
-筛得空和一个筛得出的窗口，不写死任何 ID。密钥从项目根 `.env` 读。
+**前端没有单元测试框架**（package.json 里无 vitest / jest / @vue/test-utils），
+三条前端回归靠真浏览器守，都在 `frontend/e2e/` 下：
+
+| 脚本 | 命令 | 守的是 |
+|---|---|---|
+| `results_filters.js` | `npm run e2e` | 结果页筛选条件（筛得空 / 筛得出两种窗口） |
+| `sentiment_time_column.js` | `npm run e2e:sentiment` | 舆情详情页【发表时间】列与正倒序切换 |
+| `results_source_link.js` | `npm run e2e:link` | 主贴【🔗 原帖】链接：形态、只挂主贴、rel/target |
+
+真 Chrome、真前后端、无 mock，**要求两个服务都起着**（先跑 `.\start.ps1`），所以它们
+进不了 pytest。都自己从 `/tasks` 里挑任务，不写死任何 ID；密钥从项目根 `.env` 读。
+**改完后端记得重启 `start.ps1`** —— uvicorn 没开 `--reload`，端口已在监听时
+`start.ps1` 会跳过启动直接验证，于是 E2E 跑的还是改动前那份代码（实测踩过）。
 
 跑单个测试类：
 

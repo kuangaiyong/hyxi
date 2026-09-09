@@ -2689,6 +2689,83 @@ class TestStablePostIdentityEndToEnd:
             f"启动时没合并重复行: {[(r['seq'], r['fingerprint']) for r in rows]}"
         assert rows[1]["parent_fingerprint"] == "p_old"
 
+    def test_reply_pointing_at_a_merged_away_fingerprint_is_repointed(self):
+        """父指针指向**已被归并掉**的指纹时必须改写到规范身份，不能留悬空。
+
+        v1.10.1 只把父指针过了 `canon`（本批帖子的指纹映射），而 `post_aliases`
+        只在查**本批帖子自己**的身份时用。于是这条路漏了：
+
+          1. 主贴 P 首次入库拿指纹 F1
+          2. 下一轮 P 漂成 F2 → 按 message_id 归并回 F1，F2 记进 post_aliases
+          3. 再下一轮 P 又渲染成 F2 —— 而 F2 已经在 known_fingerprints() 里
+             （它并上了 post_aliases），采集器把 P 当已见过的**过滤掉不再下发**
+          4. 这一轮新出现的回复 R 算出的父指针是 F2，本批里却没有 P，
+             `canon` 查不到 F2 → 原样落库
+
+        F2 在 posts 表里根本不存在，R 就成了悬空回复；下次启动
+        `merge_duplicate_posts()` 把它**提成主贴**（那一步是不可逆的）。
+        用户看到的就是「这条回复不在它该在的主贴下」。真实库里 seq 17/18 两条
+        回复的父指针 5de87dc32c712b76 至今就是这个状态。
+
+        修法是让父指针和帖子身份走**同一套**解析：canon 查不到就查 post_aliases。
+        """
+        parent = self._post("F1", "MP", content="主贴原文")
+        self.storage.upsert_posts("src_x", [parent])
+
+        # 第二轮：主贴漂成 F2，按 message_id 归并回 F1，F2 进 post_aliases
+        self.storage.upsert_posts("src_x", [self._post("F2", "MP", content="主贴被编辑过")])
+        assert [r["fingerprint"] for r in self._rows()] == ["F1"], "前置条件：只该有一行主贴"
+        assert "F2" in self.storage.known_fingerprints("src_x"), (
+            "前置条件：被归并掉的指纹要进 known_fingerprints，否则采集器每轮当新帖"
+        )
+
+        # 第三轮：主贴因为 F2 已知而被采集器过滤掉，只下发新出现的回复
+        reply = self._post("R1", "MR", content="一条新回复",
+                           parent_fingerprint="F2", reply_level=1)
+        self.storage.upsert_posts("src_x", [reply])
+
+        rows = {r["fingerprint"]: r for r in self._rows()}
+        assert set(rows) == {"F1", "R1"}
+        assert rows["R1"]["parent_fingerprint"] == "F1", (
+            "回复挂在一个已被归并掉的指纹上 —— 启动时会被当孤儿提成主贴"
+        )
+        assert rows["R1"]["reply_level"] == 1
+
+    def test_a_reply_with_an_id_but_no_text_is_not_silently_dropped(self):
+        """有 message_id 的回复正文空也不许丢 —— 平台给了 id，它就真实存在。
+
+        `drop_empty_posts()` 的「有评论就不算空」只捞**父贴**（条件是有个非空的
+        *子*帖）。叶子回复没有子帖，**永远捞不回来**：纯贴图 / 表情回复正文是空的，
+        而 `imagesOf()` 只认 scontent 上 ≥100px 的图（贴图和 emoji 都不在其列），
+        images 也是空的 —— 于是在 posts 表这唯一的入口被静默丢掉，
+        主贴下 4 条回复只剩 3 条，页面上完全看不出少了一条。
+
+        判据用 message_id：采集脚本的 `isNotAPost()` 早就是这个口径
+        （「纯图片帖有 id 没正文…两种都是真帖子」），存储层却比它严，两层自相矛盾。
+        代价是报告里多一行空正文的「未分析」—— 那是实话，比悄悄少一条回复诚实。
+        """
+        root = self._post("P1", "MP", content="主贴正文")
+        talk = self._post("R1", "MR1", content="有字的回复",
+                          parent_fingerprint="P1", reply_level=1)
+        # 贴图回复：平台给了 comment_id，正文和配图都提不出来
+        sticker = self._post("R2", "MR2", content="",
+                             parent_fingerprint="P1", reply_level=1)
+        self.storage.upsert_posts("src_x", [root, talk, sticker])
+
+        rows = {r["fingerprint"]: r for r in self._rows()}
+        assert "R2" in rows, "有 message_id 的空正文回复被静默丢掉了"
+        assert rows["R2"]["parent_fingerprint"] == "P1", "别把它提成主贴，它是回复"
+        assert rows["R2"]["reply_level"] == 1
+
+    def test_a_truly_empty_post_with_no_id_is_still_dropped(self):
+        """但 id 和正文都没有的照旧要丢 —— 广告 / 推荐卡片就是这样，别把门开太大"""
+        root = self._post("P1", "MP", content="主贴正文")
+        junk = self._post("J1", "", content="")
+        self.storage.upsert_posts("src_x", [root, junk])
+
+        assert set(r["fingerprint"] for r in self._rows()) == {"P1"}, \
+            "把没有 id 也没有正文的空壳存进来了"
+
 
 class TestPostsStorageEndToEnd:
     """posts 表：seq 是全链路的顺序锚点，upsert 不能碰已处理标记"""
@@ -4794,12 +4871,12 @@ class TestFacebookLoginEndToEnd:
             data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
 
         assert data["complete"] is True, data.get("stop_reason")
-        assert len(data["posts"]) == 4          # 2 主贴 + 1 评论 + 1 嵌套回复
+        assert len(data["posts"]) == 7          # 2 主贴 + 3 顶层评论 + 2 嵌套回复
         assert os.path.exists(self.state), "会话文件没有落盘，下一轮还得再输一次密码"
 
         roots = [p for p in data["posts"] if not p["parent_fingerprint"]]
         comments = [p for p in data["posts"] if p["parent_fingerprint"]]
-        assert len(roots) == 2 and len(comments) == 2
+        assert len(roots) == 2 and len(comments) == 5
         assert comments[0]["reply_level"] == 1
         import re
         assert re.match(r"^\d{2}-\d{2}-\d{4} \d{2}:\d{2}$", roots[0]["timestamp"])
@@ -4869,7 +4946,7 @@ class TestFacebookLoginEndToEnd:
         blank = [p for p in data["posts"]
                  if not p["message_id"] and not (p["content"] or "").strip()]
         assert blank == [], f"广告 article 被存成了空帖: {blank}"
-        assert len(data["posts"]) == 4, "丢空帖时把真帖子也带走了"
+        assert len(data["posts"]) == 7, "丢空帖时把真帖子也带走了"
 
     def test_multi_paragraph_comment_keeps_every_paragraph(self):
         """评论的多段正文必须全取，而且不能把嵌套回复的正文吞进来。
@@ -4893,6 +4970,50 @@ class TestFacebookLoginEndToEnd:
         assert "min SOC blijft een raadsel" in parent["content"], "第三段丢了"
         assert "ondergrens" not in parent["content"], "把嵌套回复的正文吞进父评论了"
         assert child["content"] == "Die 8% ondergrens is inderdaad vreemd."
+
+    def test_folded_comments_are_expanded_before_extraction(self):
+        """评论区的折叠必须点开，而且要循环点到不再增长。
+
+        Facebook 首屏每条主贴只渲染前两三条评论，其余藏在「查看更多评论」后面，
+        评论还**分页** —— 点一次只多出一页；一条评论底下的嵌套回复另有一个
+        「查看 N 条回复」。这三处折叠和正文那个「展开」是两回事，
+        `expandBodies()` 只认 `^(展开|See more|Meer weergeven)$`，一个都碰不到。
+
+        真实库实测的后果：src_b32bc603 的 79 条主贴，每主贴回复数分布
+        {1条:17, 2条:30, 3条:5}，**上限死死卡在 3、一条都没超过** —— 不是自然分布，
+        是首屏渲染上限的指纹。用户报的「只采集到 3 条、实际应该有 4 条」正落在这个
+        天花板上。回复采不全，舆情就少统计一份声音，而页面上完全看不出少了。
+
+        按条数断言而不只看总数：折叠里那条评论的 message_id 是 5503 / 5505 / 5504，
+        少任何一条都是漏采。**5505 尤其重要** —— 它在第二页，只点一次折叠拿不到它。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+
+        with site.LoginSite() as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
+
+        assert data["complete"] is True, data.get("stop_reason")
+        got = {p["message_id"] for p in data["posts"]}
+        assert "5503" in got, "「查看更多评论」没点开，第一页折叠评论漏了"
+        assert "5505" in got, "折叠只点了一次，第二页评论漏了（评论是分页加载的）"
+        assert "5504" in got, "「查看 1 条回复」没点开，嵌套回复漏了"
+
+        root = [p for p in data["posts"] if p["message_id"] == "9001"][0]
+        folded = [p for p in data["posts"] if p["message_id"] in ("5503", "5505")]
+        nested = [p for p in data["posts"] if p["message_id"] == "5504"][0]
+        # 折叠出来的评论必须是**完整的一条帖子**，不能是只有 id 的空壳
+        for p in folded:
+            assert p["parent_fingerprint"] == root["fingerprint"], "折叠评论挂错了主贴"
+            assert p["reply_level"] == 1 and p["username"] and p["content"]
+            assert p["timestamp"], "折叠出来的评论没取到时间（tooltip 没 hover 到）"
+        assert nested["parent_fingerprint"] == root["fingerprint"], (
+            "嵌套回复必须挂在主贴上 —— 存储层是扁平的，嵌套只在出口组装"
+        )
+        # 按钮文字不许进正文：它们是界面文案，而 content 前 100 字进指纹
+        for p in data["posts"]:
+            for ui in ("查看更多评论", "查看 1 条回复", "条回复"):
+                assert ui not in (p["content"] or ""), f"折叠按钮文字混进正文: {p}"
 
     def test_body_images_are_downloaded_and_decoys_ignored(self):
         """正文图要下载到本地，头像 / emoji / 非 scontent 的图都不能混进来。
@@ -4988,7 +5109,7 @@ class TestFacebookLoginEndToEnd:
             data = self._run(base_url, site.GOOD_USER, "这个密码是错的")
 
         assert data["complete"] is True, data.get("stop_reason")
-        assert len(data["posts"]) == 4
+        assert len(data["posts"]) == 7
 
     def test_deleting_session_falls_back_to_credentials(self):
         """(b) 删掉会话重跑仍能成功"""

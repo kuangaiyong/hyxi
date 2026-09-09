@@ -83,6 +83,15 @@ _REG_PAGE = """<html><head><meta charset="utf-8"><title>注册</title></head><bo
 #     querySelector 只拿第一段。第一条评论复刻成 3 段，并在它里面再嵌一条回复 ——
 #     嵌套回复也是 article，取多段时必须限定在本条评论这一层，否则会把子回复的
 #     正文吞进父评论。
+#   - **评论区自己还有两处折叠，和正文那个「展开」是两回事**：首屏每条主贴只渲染前
+#     两三条评论，其余藏在「查看更多评论」后面（还分页，点一次只多出一页）；一条评论
+#     底下的嵌套回复另有一个「查看 N 条回复」。真实库实测每主贴回复数分布
+#     {1条:17, 2条:30, 3条:5}，上限死死卡在 3、79 条主贴一条都没超过 —— 就是这两处
+#     从来没被点开（用户报「只采到 3 条、实际应有 4 条」）。第一条主贴把两者都摆上，
+#     「查看更多评论」故意分两页，用来钉住「必须循环点到不再增长」而不是点一次就算完。
+#     按钮文字里带条数，**不能像正文「展开」那样精确匹配**。
+#     按钮一律不是 div[dir=auto]：真实库里 171 条正文没有一条带 UI 文案尾巴，
+#     说明评论正文提取压根碰不到这些按钮，复刻时别把它们做成 dir=auto。
 _FEED_PAGE = """<html><head><meta charset="utf-8"><title>小组</title></head><body>
 <div role="feed">
   <div role="article">
@@ -112,7 +121,11 @@ _FEED_PAGE = """<html><head><meta charset="utf-8"><title>小组</title></head><b
         <a href="/groups/2407063016436085/posts/9001/?comment_id=5502"
            aria-label="2026年5月28日凌晨4:10" data-tip="2026年5月28日周三19:10">6天</a>
       </div>
+      <div id="replyfold" role="button" tabindex="0" onclick="moreReplies()"
+        >查看 1 条回复</div>
     </div>
+    <div id="cmtfold" role="button" tabindex="0" onclick="moreComments()"
+      >查看更多评论</div>
   </div>
   <div role="article">
     <div>Gesponsord</div>
@@ -132,6 +145,36 @@ function unfold() {
     '<span>Firmware 2.4.1 heeft bij mij de WiFi-verbinding gesloopt. '
     + 'Na een downgrade werkt alles weer. '
     + '<div role="button" tabindex="0">收起</div></span>';
+}
+// 评论区的折叠。**分两页**：点一次只多出一页评论，按钮还留着 —— 采集器必须循环点
+// 到不再增长，点一次就收工照样漏。真站上的「查看更多评论」就是这个行为。
+var cmtPage = 0;
+function newComment(id, uid, name, body, hhmm) {
+  return '<div role="article">'
+    + '<a href="/groups/2407063016436085/user/' + uid + '/" aria-label="' + name + '"></a>'
+    + '<a href="/groups/2407063016436085/user/' + uid + '/">' + name + '</a>'
+    + '<div dir="auto">' + body + '</div>'
+    + '<a href="/groups/2407063016436085/posts/9001/?comment_id=' + id + '"'
+    + ' data-tip="2026年5月28日周三' + hhmm + '">6天</a>'
+    + '</div>';
+}
+function moreComments() {
+  var fold = document.getElementById('cmtfold');
+  cmtPage++;
+  if (cmtPage === 1) {
+    fold.insertAdjacentHTML('beforebegin', newComment(
+      '5503', '55', 'Bram_H', 'Bij mij hangt hij aan een Shelly 3EM, werkt prima.', '19:55'));
+  } else {
+    fold.insertAdjacentHTML('beforebegin', newComment(
+      '5505', '66', 'Lieke_dV', 'Let op de firmware, 2.4.1 gaf hier problemen.', '20:31'));
+    fold.remove();
+  }
+}
+function moreReplies() {
+  var fold = document.getElementById('replyfold');
+  fold.insertAdjacentHTML('beforebegin', newComment(
+    '5504', '77', 'Ruud_T', 'Die ondergrens is instelbaar in de app.', '19:22'));
+  fold.remove();
 }
 </script>
 <script>

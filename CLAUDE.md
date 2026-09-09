@@ -47,6 +47,14 @@ cd frontend; npm run dev
 
 `start.ps1` 存的是 **UTF-8 带 BOM**：PS 5.1 会把无 BOM 的 UTF-8 当 ANSI 读，中文输出全是乱码。用别的工具改写它时注意别把 BOM 弄掉。
 
+> **⛔ 8000 / 5173 上已经在监听的进程不是你的，不许直接杀。**
+> `start.ps1` 说「端口 8000 已在监听（PID xxxx），跳过启动」时，**那上面很可能是用户
+> 正在用的便携包**（它也监听 8000）。杀掉再换成开发态后端，用户那个开着的标签页会
+> 立刻变成：接口 401（开发态读项目根 `.env` 里的 `TWEAKERS_API_KEY`，便携包没有）、
+> 点任何导航菜单毫无反应（开发态不托管 `/assets`，懒加载 chunk 全 404）。
+> **已经这样坑过用户一次。**要换服务先说清「8000 上现在有个进程，是不是你在跑的
+> 便携包？我要停掉它」，由用户决定 —— 别自己拿主意。
+
 生产构建是 `frontend` 目录下的 `npm run build`（= `vue-tsc -b && vite build`）。**必须在 `frontend` 里跑**——根 `package.json` 只有 playwright 依赖、`scripts` 是空的，在仓库根目录执行会直接报「Missing script: build」。
 
 **PowerShell 路径注意**：PS 5.1 下调用相对路径的 exe 必须带 `.\` 前缀，写 `backend\.venv\Scripts\python.exe` 会报 `CommandNotFoundException`；且 `&&` 是语法错误，串联用 `;`。
@@ -246,18 +254,25 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 ```
 
 **前端没有单元测试框架**（package.json 里无 vitest / jest / @vue/test-utils），
-三条前端回归靠真浏览器守，都在 `frontend/e2e/` 下：
+四条前端回归靠真浏览器守，都在 `frontend/e2e/` 下：
 
 | 脚本 | 命令 | 守的是 |
 |---|---|---|
 | `results_filters.js` | `npm run e2e` | 结果页筛选条件（筛得空 / 筛得出两种窗口） |
 | `sentiment_time_column.js` | `npm run e2e:sentiment` | 舆情详情页【发表时间】列与正倒序切换 |
 | `results_source_link.js` | `npm run e2e:link` | 主贴【🔗 原帖】链接：形态、只挂主贴、rel/target |
+| `stale_bundle_navigation.js` | `npm run e2e:stale` | 服务端换了构建后点导航必须有反馈，不许静默失败 |
 
 真 Chrome、真前后端、无 mock，**要求两个服务都起着**（先跑 `.\start.ps1`），所以它们
 进不了 pytest。都自己从 `/tasks` 里挑任务，不写死任何 ID；密钥从项目根 `.env` 读。
 **改完后端记得重启 `start.ps1`** —— uvicorn 没开 `--reload`，端口已在监听时
 `start.ps1` 会跳过启动直接验证，于是 E2E 跑的还是改动前那份代码（实测踩过）。
+`e2e:stale` 是例外，它要的是**单端口形态**：`npm run build` 后把 `frontend/dist`
+拷成项目根的 `web/`，再让后端跑在 8000 上；条件不满足时它以退出码 2 说明原因。
+
+**整套 E2E 都是「打开一个全新页面 → 操作 → 断言」，唯独 `e2e:stale` 覆盖
+「页面已经开着、服务端变了」。** 那一类失败的共同特征是**静默** —— 不崩溃、不报错、
+界面不变化，测试和用户都看不出来。加新的前端回归时想一想它属于哪一类。
 
 跑单个测试类：
 
@@ -277,7 +292,25 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 
 **新采集器没出现在下拉框里，先看 `Collector.internal`**：该端点会过滤掉 `internal = True` 的采集器（`collector_catalog()`）。目前只有 `group_feed`「公开小组信息流」是这样 —— 它是多来源那一版为本地 fixture 站点写的通用采集器，`base_url` 必填且没有默认站点，真实场景下用户填不出可用地址，真实版本是 `facebook_group`。**它只是不进界面，`get_collector()` 照常解析**，已注册的数据源、任务编排和 `TestGroupFeedCollectorEndToEnd` 那条增量回归都还在用它。
 
+**路由全是懒加载，`router.onError` 不能删**（静默错误）。每条路由都是
+`() => import('@/views/XxxView.vue')`，chunk 文件名带内容哈希。**页面开着的时候
+服务端换了一份构建**（升级便携包不硬刷新、或那个端口后面换了个服务），旧名字全部
+404、`import()` reject，而 **vue-router 对导航失败不做任何界面反馈** —— URL 不变、
+标题不变、侧栏高亮不变，用户点了一下什么都没发生，只有控制台里有一行报错。
+用户实测报过「点击【LLM 配置】菜单没有任何反应」。处理器做两件事：整页刷到目标路径
+（自愈），刷完仍失败才提示；**必须只刷一次**，否则服务端真挂了会变成页面一直闪。
+回归见 `frontend/e2e/stale_bundle_navigation.js`。
+
 **生产构建**：`npm run build`（= `vue-tsc -b && vite build`）。
+
+**同一个端口号在两种形态下是两个完全不同的东西**：源码开发态 8000 只有 `/api/*`，
+页面在 Vite 的 5173 上（访问 `127.0.0.1:8000/tasks` 回的是 `404 {"detail":"Not Found"}`）；
+便携包里 8000 同时供页面和 API（`mount_frontend()` 挂项目根的 `web/`）。
+**给别人验证地址时必须说清哪个是哪个**。想在开发机上复现便携包那种单端口形态，
+把 `frontend/dist` 拷成项目根的 `web/` 即可（已 gitignore）。
+
+**localStorage 按 origin 隔离**：`localhost:5173`、`127.0.0.1:8000`、`localhost:8000`
+是三个不同的 origin，接口密钥在一个地方填了，换个地址访问照样 401。
 
 ## 关键设计决策 / 反爬虫姿态
 

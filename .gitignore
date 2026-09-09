@@ -30,6 +30,10 @@ venv/
 # 构建产物
 frontend/dist/
 frontend/tsconfig.tsbuildinfo
+# 项目根的 web/ 是 mount_frontend() 认的目录：把 frontend/dist 拷过来就能在开发机上
+# 复现便携包那种「单端口同时供页面和 API」的形态（e2e:stale 就要这个）。
+# 它是构建产物不是源码，几百 KB 的 bundle 不该进仓库
+/web/
 # 便携包的中间产物与成品（几百 MB，且 build/out/collectors 是压缩后的采集脚本）
 build/out/
 build/*.log

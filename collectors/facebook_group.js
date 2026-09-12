@@ -92,14 +92,23 @@ const SELECTORS = {
     // 必须挡住「回复」「评论」「分享」这类动作按钮：每一条模式都要么带「查看/更多/
     // weergeven/bekijken」，要么带一个数字，光是「回复」两个字匹配不上 ——
     // 误点「分享」会弹出对话框，误点「回复」会打开输入框，两者都会把页面搞乱。
+    // 回复数那几条允许带「某某 已回复 · 」这样的前缀：折叠起来的回复串，按钮上常常
+    // 先写是谁回的、再写条数（「Jan replied · 2 replies」）。前缀里必须有「·」，
+    // 动作按钮不会长这样。
+    // 回复也分页：第一页点开后按钮变成「查看更多回复」/「View more replies」，三种语言都要收。
     commentFoldText: [
         '查看更多评论', '查看之前的评论', '查看全部评论', '更多评论',
         'View more comments', 'View previous comments', 'View all comments',
         'Meer reacties weergeven', 'Eerdere reacties weergeven', 'Alle reacties weergeven',
-        '查看(全部)?\\s*\\d+\\s*条回复', '查看更多回复', '\\d+\\s*条回复',
-        'View\\s*(all\\s*)?\\d+\\s*(more\\s*)?repl(y|ies)', '\\d+\\s*repl(y|ies)',
+        '查看(全部)?\\s*\\d+\\s*条回复', '查看更多回复', '(.+[·•]\\s*)?\\d+\\s*条回复',
+        'View\\s*(all\\s*|more\\s*|previous\\s*)?(\\d+\\s*)?(more\\s*)?repl(y|ies)',
+        '(.+[·•]\\s*)?\\d+\\s*repl(y|ies)',
         '(Alle\\s*)?\\d+\\s*antwoord(en)?\\s*bekijken', 'Meer antwoorden weergeven',
+        '(.+[·•]\\s*)?\\d+\\s*antwoord(en)?',
     ].join('|'),
+    // 大小写不敏感：英文界面是「2 Replies」「View More Replies」这类大写开头的写法。
+    // 和上面的模式放在一起，expandComments() 与回归测试都从这里取，别各写一份
+    commentFoldFlags: 'i',
     // 正文图。2026-08-04 对真实小组页实测：
     //   - 正文图是 <img>，host 为 scontent-*.xx.fbcdn.net，渲染尺寸 367×795 这个量级
     //   - 界面图标是 data:image/svg+xml（16~18px），emoji 在 static.xx.fbcdn.net，
@@ -231,7 +240,7 @@ async function expandComments(page) {
     for (let round = 1; round <= COMMENT_FOLD_ROUNDS; round++) {
         const before = await page.evaluate(count, SELECTORS);
         const clicked = await page.evaluate((sel) => {
-            const re = new RegExp(`^(${sel.commentFoldText})$`);
+            const re = new RegExp(`^(${sel.commentFoldText})$`, sel.commentFoldFlags);
             const btns = [...document.querySelectorAll(`${sel.post} [role="button"]`)]
                 .filter((el) => re.test(el.textContent.replace(/\s+/g, ' ').trim()));
             btns.forEach((b) => b.click());
@@ -256,10 +265,15 @@ async function expandComments(page) {
 }
 
 async function extractBatch(page) {
-    await expandBodies(page);
+    // **先点评论折叠，再点正文「展开」，顺序不能反**：被「查看更多评论」加载出来的长评论，
+    // 它自己的正文也折叠着。反过来的话，点正文「展开」那一轮它还不在 DOM 里，等它出现
+    // 本批已经没人去点了，残文剥掉「… 展开」后看起来就是一句完整的话，照样入库。
+    // 截断点在 100 字之后时这是永久的：指纹只吃正文前 100 字，截断版和完整版同一个指纹，
+    // 下一批就算展开了也会被 seen 当成已见过丢掉（发版前评审用真脚本复现过）
     // 点开了几处折叠要报出来：这是远端唯一能看出「这一轮到底有没有多采到回复」的地方
     const folds = await expandComments(page);
     if (folds) log(`   点开评论折叠 ${folds} 处`);
+    await expandBodies(page);
     const { posts: raw, scan } = await page.evaluate((sel) => {
         const scan = { candidates: [], accepted: [], rejected: [] };
         const text = (el) => (el ? el.textContent.replace(/\s+/g, ' ').trim() : '');
@@ -301,10 +315,17 @@ async function extractBatch(page) {
             });
             return urls;
         };
+        // 嵌套回复的固定链接常见形态是 ?comment_id=<父评论>&reply_comment_id=<自己>（本机
+        // 未在真站核实，这台机器不访问 Facebook）。只认 comment_id 就拿到父评论的 id ——
+        // message_id 撞车，入库时按 id 归并，**父评论那一行整条被回复覆盖**（作者、正文都
+        // 换成回复的），回复自己的指纹进了别名表、永远不会再下发；时间锚点的标记也由 id
+        // 派生，回复连时间都继承了父评论的。所以先认 reply_comment_id；comment_id 要求
+        // 前面是 ? 或 &，免得参数顺序反过来时从「reply_comment_id=」里半截匹配出来
         const idOf = (link, kind) => {
             const href = link ? link.getAttribute('href') : '';
             const m = href && (kind === 'comment'
-                ? href.match(/comment_id=([^&#]+)/)
+                ? (href.match(/[?&]reply_comment_id=([^&#]+)/)
+                    || href.match(/[?&]comment_id=([^&#]+)/))
                 : href.match(/\/posts\/([^/?#]+)/));
             return m ? m[1] : '';
         };

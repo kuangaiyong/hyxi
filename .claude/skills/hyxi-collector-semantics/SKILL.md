@@ -17,7 +17,7 @@ description: hyxi 采集语义：Facebook 评论区的三处折叠必须点开�
 是首屏渲染上限的指纹 —— 用户报的「只采到 3 条、实际应有 4 条」正落在这个天花板上。
 回复采不全，舆情就少统计一份声音，而页面上完全看不出少了什么。
 
-修在 `expandComments()`（v1.10.2），四条要点，改它之前逐条对一遍：
+修在 `expandComments()`（v1.11.0），四条要点，改它之前逐条对一遍：
 
 1. **按文字认，但不能精确匹配** —— 这些文案里带条数（「查看 2 条回复」），每条帖子都不一样
 2. **必须挡住动作按钮**：每条模式要么带「查看/更多/weergeven/bekijken」，要么带一个数字。
@@ -30,6 +30,26 @@ description: hyxi 采集语义：Facebook 评论区的三处折叠必须点开�
 **按钮不是 `div[dir=auto]`**（真实库 171 条正文没有一条带 UI 文案尾巴，实测核对过），
 所以 `commentText()` 碰不到它们，`bodyTrail` 不需要为此扩充。改 fixture 时别把它们
 做成 `dir=auto`，那会复刻出一个真站上不存在的问题。
+
+### 三条只有实测才发现的坑（v1.11.0 发版前评审）
+
+- **`expandComments()` 必须排在 `expandBodies()` 之前**。被「查看更多评论」加载出来的
+  长评论，它自己的正文也折叠着；反过来的话，点正文「展开」那一轮它还不在 DOM 里，
+  等它出现本批已经没人去点了。残文剥掉「… 展开」后看起来就是一句完整的话，照样入库。
+  **可见部分超过 100 字时这是永久的**：指纹只吃正文前 100 字，截断版和完整版同一个
+  指纹，下一批就算展开了也会被 `seen` 当成已见过丢掉。实测：入库 115 字，换顺序后 232 字
+- **嵌套回复的 id 认 `reply_comment_id`，不认 `comment_id`**。回复的固定链接常见形态是
+  `?comment_id=<父评论>&reply_comment_id=<自己>`（本机不访问真站，未核实）。只认
+  `comment_id` 就拿到父评论的 id：**message_id 撞车 → 入库按 id 归并 → 父评论那一行的
+  作者和正文被回复整条覆盖**，回复自己的指纹进别名表、永远不会再下发。时间锚点的标记
+  也由 id 派生，回复连时间都继承父评论的。fixture 实测过：Joost 的评论整条消失，
+  那一行成了「Ruud 的正文 + Joost 的时间 + Joost 的指纹」。`comment_id` 的匹配要求前面
+  是 `?` 或 `&`，否则参数顺序反过来时会从 `reply_comment_id=` 里半截匹配出来
+- **折叠文案还有「某某 已回复 · N 条回复」这种带前缀的写法**，以及英文的
+  `View more replies` / 大写开头的 `2 Replies`。实测旧模式漏掉 7 种写法，其中
+  「Joost 已回复 · 2 条回复」是中文界面就会遇到的。模式与 `i` 标志都放在
+  `SELECTORS.commentFoldText` / `commentFoldFlags` 里，`expandComments()` 和回归测试
+  `TestCommentFoldPatternsEndToEnd` 都从那里取，别各写一份
 
 回归由 `test_folded_comments_are_expanded_before_extraction` 守（真 Chrome +
 `login_site.py` fixture，折叠故意分两页，专门钉「点一次就收工照样漏」）。

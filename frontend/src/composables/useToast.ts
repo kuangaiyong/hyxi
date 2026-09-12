@@ -10,12 +10,14 @@ const toasts = ref<Toast[]>([])
 let nextId = 0
 
 export function useToast() {
-  function add(message: string, type: Toast['type'] = 'info', duration = 4000) {
+  /** 返回 id：常驻提示（duration 0）得靠它在条件解除时主动撤掉，见 api/client.ts 的 401 */
+  function add(message: string, type: Toast['type'] = 'info', duration = 4000): number {
     const id = nextId++
     toasts.value.push({ id, message, type })
     if (duration > 0) {
       setTimeout(() => remove(id), duration)
     }
+    return id
   }
 
   function remove(id: number) {

@@ -25,13 +25,26 @@
  *   # 或： cd frontend; npm run e2e:stale
  */
 import { chromium } from 'playwright';
-import { readdirSync, renameSync, existsSync } from 'fs';
+import { readdirSync, renameSync, existsSync, readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const ASSETS = join(ROOT, 'web', 'assets');
 const BASE = 'http://127.0.0.1:8000';
+
+/** 后端设了密钥时列表会被 401 挡空，页面上就没有任务可点。密钥同其它脚本从项目根 .env 读 */
+function apiKey() {
+    try {
+        const m = readFileSync(join(ROOT, '.env'), 'utf-8').match(/^TWEAKERS_API_KEY=(.*)$/m);
+        return (m && m[1].trim()) || '';
+    } catch {
+        return '';
+    }
+}
+const KEY = apiKey();
+const seedKey = (ctx) => ctx.addInitScript(
+    k => { try { localStorage.setItem('hyxi_api_key', k) } catch {} }, KEY);
 
 let failures = 0;
 function check(name, ok, detail) {
@@ -70,7 +83,9 @@ async function main() {
     console.log(`目标 chunk: ${chunk}`);
 
     const browser = await chromium.launch({ headless: true, channel: 'chrome' });
-    const page = await (await browser.newContext({ viewport: { width: 1280, height: 800 } })).newPage();
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+    await seedKey(ctx);
+    const page = await ctx.newPage();
     const errs = [];
     page.on('console', m => { if (m.type() === 'error') errs.push(m.text()); });
     page.on('pageerror', e => errs.push(`[pageerror] ${e.message}`));
@@ -122,6 +137,105 @@ async function main() {
         check('④ 绝不是「什么都没发生」',
             after.url.endsWith('/config') || after.toasts.some(t => /加载失败/.test(t)),
             { url: after.url, toast: after.toasts });
+    } finally {
+        if (renamed) renameSync(moved, join(ASSETS, chunk));
+        await browser.close();
+    }
+
+    // ConfigView 没有自己的 CSS，所以上面那一路走的是「JS chunk 404」。**带 CSS 的视图
+    // 是另一条路**：Vite 的 __vitePreload 先等 CSS link 加载，失败时抛的是
+    // `Unable to preload CSS for ...`，而且是在 import() 执行**之前**就抛 ——
+    // 认不出它，router.onError 直接 return，照样「点了没反应」。
+    // 结果页和舆情详情页恰好是最常用的两个详情页，而且两个都带 CSS。
+    await cssScenario();
+    await blockedStorageScenario();
+}
+
+/** 找一个带 CSS 的视图（结果页），把它的 CSS 挪走 */
+async function cssScenario() {
+    const css = readdirSync(ASSETS).find(f => f.startsWith('ResultsView-') && f.endsWith('.css'));
+    if (!css) {
+        console.log('\n⚠️ 构建产物里没有 ResultsView 的 CSS，跳过「CSS 拿不到」这一路');
+        return;
+    }
+    const browser = await chromium.launch({ headless: true, channel: 'chrome' });
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+    await seedKey(ctx);
+    const page = await ctx.newPage();
+    const nav = [];
+    page.on('framenavigated', f => { if (f === page.mainFrame()) nav.push(f.url()); });
+
+    const moved = join(ASSETS, css + '.e2e-gone');
+    let renamed = false;
+    try {
+        await page.goto(`${BASE}/tasks`, { waitUntil: 'networkidle' });
+        // 「查看」是按钮走 router.push，不是链接；先把列表筛成已完成的，
+        // 这样点进去一定是结果页（未完成的会跳进度页，那个视图没有自己的 CSS）
+        await page.selectOption('select.form-input', 'completed');
+        await page.waitForTimeout(600);
+        const view = page.getByRole('button', { name: '查看', exact: true }).first();
+        if (!(await view.count())) {
+            console.log('\n⚠️ 没有已完成的任务可点，跳过「CSS 拿不到」这一路');
+            return;
+        }
+        renameSync(join(ASSETS, css), moved);
+        renamed = true;
+
+        console.log(`\n场景：点已完成任务的「查看」，${css} 拿不到`);
+        nav.length = 0;
+        await view.click();
+        await page.waitForTimeout(6000);
+
+        const url = page.url();
+        const toasts = await page.locator('.toast-item').allTextContents();
+        check('⑤ 带 CSS 的视图同样不许「什么都没发生」',
+            url.includes('/results') || toasts.some(t => /加载失败/.test(t)),
+            { url, toast: toasts });
+        check('⑥ 只自动刷一次', nav.length <= 2, { 导航次数: nav.length, 序列: nav });
+    } finally {
+        if (renamed) renameSync(moved, join(ASSETS, css));
+        await browser.close();
+    }
+}
+
+/**
+ * 浏览器禁止站点保存数据时（隐私模式 / Chrome 的「不允许网站保存数据」），
+ * 访问 sessionStorage 直接抛。「只刷一次」的标记就存不下了 —— 每次都判成「还没刷过」，
+ * 于是无限整页刷新，页面一直闪，比原来的静默失败更糟。
+ * 发版前评审实测过：8 秒内整页导航 213 次，始终没有提示。
+ */
+async function blockedStorageScenario() {
+    const chunk = readdirSync(ASSETS).find(f => f.startsWith('ConfigView-') && f.endsWith('.js'));
+    const browser = await chromium.launch({ headless: true, channel: 'chrome' });
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+    await seedKey(ctx);
+    await ctx.addInitScript(() => {
+        Object.defineProperty(window, 'sessionStorage', {
+            get() { throw new DOMException('denied', 'SecurityError'); },
+        });
+    });
+    const page = await ctx.newPage();
+    const nav = [];
+    page.on('framenavigated', f => { if (f === page.mainFrame()) nav.push(f.url()); });
+
+    const moved = join(ASSETS, chunk + '.e2e-gone');
+    let renamed = false;
+    try {
+        await page.goto(`${BASE}/tasks`, { waitUntil: 'networkidle' });
+        await page.waitForTimeout(1000);
+        renameSync(join(ASSETS, chunk), moved);
+        renamed = true;
+
+        console.log('\n场景：sessionStorage 被浏览器禁掉，chunk 又持续拿不到');
+        nav.length = 0;
+        await page.locator('.sidebar-nav a[href="/config"]').click();
+        await page.waitForTimeout(8000);
+
+        // 一直在刷的话这一步会抛「Execution context was destroyed」—— 那正是失败的样子
+        const toasts = await page.locator('.toast-item').allTextContents()
+            .catch(() => ['(读不到 —— 页面还在不停刷新)']);
+        check('⑦ 不许无限整页刷新', nav.length <= 2, { '8秒内整页导航次数': nav.length });
+        check('⑧ 存不下标记就直接提示，别闷着刷', toasts.some(t => /加载失败/.test(t)), toasts);
     } finally {
         if (renamed) renameSync(moved, join(ASSETS, chunk));
         await browser.close();

@@ -130,14 +130,15 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
 | `backend/data/jobs/{run}_out.json` | 采集脚本的产出，**读完入库即删的交接文件** |
 | `backend/data/sessions/{source_id}.json` | Playwright `storageState`。它只认文件路径，且是可重建的运行时缓存，丢了只是重新登录一次 |
 
-**七条存储红线**（静默错误，改存储层前必看）：
+**八条存储红线**（静默错误，改存储层前必看）：
 
 - `intensity` 列必须是 `NUMERIC` 不能是 `REAL` —— REAL 亲和性把整数 3 存成 3.0，导出跟着变「3.0」
 - **舆情结论按 `(source_id, fingerprint)` 存，不按下标、也不按 task_id**。下标只在写入现场有意义
 - **`posts` 故意不挂 `sources` 外键** —— `ON DELETE CASCADE` 会让「删数据源」清空历史任务结果
 - **不留双写**：同一份数据存两处必然长出「改了一边另一边还是旧的」的 bug（已实测踩过）
 - **帖子身份认 `message_id`，不认指纹**。指纹吃 `用户名|时间戳|正文前100字`，这三样对**同一条真实帖子**并不稳定 —— 作者编辑正文、相对时间这轮读不到、正文展开长度不同，都会算出新指纹，于是多存一行「新帖」；重采到的回复又被刷新指向新那行，旧那行却永不删除，页面上同一条主贴出现两次、回复只跟着其中一份（**用户实测报过「主贴 A 的回复贴不是他的」**）。真实库三种漂移全都发生过，实测重复 5/179 与 1/258。`upsert_posts()` 因此在 message_id 认得出来时归并到**先入库的那个指纹**（规范身份），并把同批回复的父指针一起改写；存量由 `merge_duplicate_posts()` 合并。**指纹算法本身一个字符都不能动** —— 改了历史数据全部失配。message_id 为空时退回按指纹判定，空 id 不是身份；分组必须带 source_id，它只在来源内唯一
-- **父指针必须和帖子身份走同一套解析：`canon` 查不到就查 `post_aliases`**。`canon` 只认**本批**下发的帖子，而父贴常常压根没被下发 —— 它漂出来的那个指纹已经进了别名表，而 `known_fingerprints()` 并上了别名表，采集器于是把它当已见过的过滤掉。这时只有 `aliases` 认得出「这个指纹已被归并掉」。漏掉它，回复就指向一个 posts 表里不存在的指纹，下次启动被 `merge_duplicate_posts()` 当孤儿**提成主贴**，而那一步不可逆 —— 这正是 v1.10.1 修完之后仍然会复发「回复贴对不上」的那条缝（v1.10.2 补）
+- **`merge_duplicate_posts()` 判孤儿之前也要查 `post_aliases`（含别名链）**。它只查「posts 表里还活着的指纹」时，v1.10.1 那一版留下的、父指针指着已归并指纹的回复，会在升级后的**第一次启动**被提成主贴 —— 而那一步不可逆（父指针被清空），规范父贴明明一直在别名表里。别名可以成链（`F3→F2` 记下之后 `F2` 又被并进 `F1`），要一路跟到活着的那一个；别名只在来源内有效，键必须带 `source_id`
+- **父指针必须和帖子身份走同一套解析：`canon` 查不到就查 `post_aliases`**。`canon` 只认**本批**下发的帖子，而父贴常常压根没被下发 —— 它漂出来的那个指纹已经进了别名表，而 `known_fingerprints()` 并上了别名表，采集器于是把它当已见过的过滤掉。这时只有 `aliases` 认得出「这个指纹已被归并掉」。漏掉它，回复就指向一个 posts 表里不存在的指纹，下次启动被 `merge_duplicate_posts()` 当孤儿**提成主贴**，而那一步不可逆 —— 这正是 v1.10.1 修完之后仍然会复发「回复贴对不上」的那条缝（v1.11.0 补）
 - **`drop_empty_posts()` 里「有 message_id 就不算空」**。它的「有评论就不算空」只捞得到**父贴**（要求有个非空的*子*帖），叶子回复没有子帖、**永远捞不回来**：纯贴图 / 表情回复正文空，而 `imagesOf()` 只认 scontent 上 ≥100px 的图（贴图和 emoji 都不在其列），images 也空，于是在这唯一入库口被静默丢掉 —— 主贴下 4 条回复只剩 3 条，页面上完全看不出。采集脚本的 `isNotAPost()` 早就是「id 和正文全缺才丢」这个口径，存储层比它严就是两层自相矛盾。没 id 又没正文的照旧丢，广告和推荐卡片正是那样
 
 设计论证（为什么这么定）见 `Skill(hyxi-architecture)`。
@@ -247,14 +248,14 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 
 ## 测试
 
-**394 个测试，必须全部 PASSED**（本机实测 `394 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
+**409 个测试，必须全部 PASSED**（本机实测 `409 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
 ```
 
 **前端没有单元测试框架**（package.json 里无 vitest / jest / @vue/test-utils），
-四条前端回归靠真浏览器守，都在 `frontend/e2e/` 下：
+五条前端回归靠真浏览器守，都在 `frontend/e2e/` 下：
 
 | 脚本 | 命令 | 守的是 |
 |---|---|---|
@@ -262,6 +263,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 | `sentiment_time_column.js` | `npm run e2e:sentiment` | 舆情详情页【发表时间】列与正倒序切换 |
 | `results_source_link.js` | `npm run e2e:link` | 主贴【🔗 原帖】链接：形态、只挂主贴、rel/target |
 | `stale_bundle_navigation.js` | `npm run e2e:stale` | 服务端换了构建后点导航必须有反馈，不许静默失败 |
+| `access_key_flow.js` | `npm run e2e:key` | 被 401 挡住后照提示填服务访问密钥：找得到、首屏可见、填错明说、填对当场生效 |
 
 真 Chrome、真前后端、无 mock，**要求两个服务都起着**（先跑 `.\start.ps1`），所以它们
 进不了 pytest。都自己从 `/tasks` 里挑任务，不写死任何 ID；密钥从项目根 `.env` 读。
@@ -299,18 +301,43 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 标题不变、侧栏高亮不变，用户点了一下什么都没发生，只有控制台里有一行报错。
 用户实测报过「点击【LLM 配置】菜单没有任何反应」。处理器做两件事：整页刷到目标路径
 （自愈），刷完仍失败才提示；**必须只刷一次**，否则服务端真挂了会变成页面一直闪。
-回归见 `frontend/e2e/stale_bundle_navigation.js`。
+回归见 `frontend/e2e/stale_bundle_navigation.js`。两个只有实测才发现的坑：
+
+- **匹配的报错里必须有 `Unable to preload CSS`**。带自己 CSS 的视图（结果页、舆情详情页
+  —— 恰好是最常用的两个）走的是另一条路：Vite 的 `__vitePreload` 先等 CSS link 加载，
+  失败时抛的是这句，而且在 `import()` 执行**之前**就抛，所以拿到的永远是 CSS 那条。
+  认不出它就照样「点了没反应」，而且注册了 `onError` 之后 vue-router 自己的
+  `console.error` 兜底也没了，**连控制台都不留痕**
+- **「只刷一次」的标记存不下时也不许刷**。隐私模式 / 浏览器禁用站点数据时
+  `sessionStorage` 直接抛，每次都判成「还没刷过」—— 实测 8 秒整页导航 296 次，
+  一个提示都没有。`writeFlag()` 因此返回是否真的存下了，存不下就直接提示
 
 **生产构建**：`npm run build`（= `vue-tsc -b && vite build`）。
 
 **同一个端口号在两种形态下是两个完全不同的东西**：源码开发态 8000 只有 `/api/*`，
-页面在 Vite 的 5173 上（访问 `127.0.0.1:8000/tasks` 回的是 `404 {"detail":"Not Found"}`）；
+页面在 Vite 的 5173 上（访问 `127.0.0.1:8000/tasks` 回 404，`detail` 里指路到 5173 ——
+`main.py` 的 `point_to_frontend()`，`/api/` 开头的 404 原样放行）；
 便携包里 8000 同时供页面和 API（`mount_frontend()` 挂项目根的 `web/`）。
 **给别人验证地址时必须说清哪个是哪个**。想在开发机上复现便携包那种单端口形态，
-把 `frontend/dist` 拷成项目根的 `web/` 即可（已 gitignore）。
+把 `frontend/dist` 拷成项目根的 `web/` 即可（已 gitignore）。**用完删掉** —— 它在的时候
+`main.app` 就不是开发态了，`TestDevModePointsToTheFrontendEndToEnd` 会整类跳过。
 
 **localStorage 按 origin 隔离**：`localhost:5173`、`127.0.0.1:8000`、`localhost:8000`
-是三个不同的 origin，接口密钥在一个地方填了，换个地址访问照样 401。
+是三个不同的 origin，服务访问密钥在一个地方填了，换个地址访问照样 401。
+
+**主贴的「🔗 原帖」链接是现算的，`Collector.post_url()` 是唯一产地**（`source_url` 不落库 ——
+存一份就是双写，历史数据也不会凭空长出那一列）。它拼出来的串**原样进 `<a :href>`**，
+而 `base_url` / `group_id` 都是用户在数据源页填的：**base_url 不是 http(s) 就不给链接**
+（`javascript:alert(1)//x` 拼出来是段合法脚本）、**非字符串也不给**（手工构造的 API 请求
+能把它存成数字，`.rstrip` 一抛就是整页帖子列表 500）、路径段一律 `quote()`。
+只给主贴，回复贴一律空串。
+
+**「服务访问密钥」这个名字四处必须逐字一致**：401 提示（`api/client.ts`）、LLM 配置页
+的卡片标题与输入框标签、《使用说明》。用户是**照着提示里的那几个字**去页面上找框的 ——
+曾经提示叫「服务访问密钥」、标签叫「Access Key」、说明书叫「接口密钥」，照着提示根本
+找不到（用户实测反馈过）。那张卡片也必须排在 LLM 配置页**第一张**：没有它，下面两张
+卡片连自己的值都读不回来。回归见 `frontend/e2e/access_key_flow.js`（按提示原文找标签，
+不按 testid 找 —— 按 testid 找就钉不住「名字对不上」这一条）。
 
 ## 关键设计决策 / 反爬虫姿态
 

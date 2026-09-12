@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { getApiKey, setApiKey } from '@/api/client'
+import * as configApi from '@/api/config'
 import { useConfigStore } from '@/stores/config'
 import { useToast } from '@/composables/useToast'
 
@@ -30,9 +31,35 @@ async function handleTest() {
   await configStore.testConnection(apiKey.value)
 }
 
-function handleSaveAccessKey() {
-  setApiKey(accessKey.value.trim())
-  toast.success(accessKey.value.trim() ? '访问密钥已保存' : '访问密钥已清除')
+/**
+ * 存下来不等于填对了 —— 当场拿它请求一次。
+ *
+ * 曾经这里只写 localStorage 就报「已保存」：填错了也这么说；填对了，右上角那条常驻的
+ * 401 提示还挂着、下面两张卡片仍是空的（它们是在 401 时加载的），用户看不出自己做对
+ * 没有（实测反馈过）。验证成功的那次响应会顺手撤掉 401 提示（见 api/client.ts）。
+ */
+async function handleSaveAccessKey() {
+  const key = accessKey.value.trim()
+  setApiKey(key)
+  // 请求头只装得下 Latin-1：axios 发出去之前会把 U+00FF 以上的字符（中文等）直接删掉，
+  // X-API-Key 变成空串，接口必然 401。后端是按 utf-8 字节比的（auth.py 专门为中文密钥
+  // 改过），密钥本身没错 —— 这时报「与后端不一致」会让人反复重填一个本来正确的密钥
+  if (/[^\x00-\xff]/.test(key)) {
+    toast.error('服务访问密钥含中文等非 Latin-1 字符，浏览器无法把它放进请求头，'
+      + '接口会一直 401。请把后端 .env 里的 TWEAKERS_API_KEY 换成 ASCII 字符')
+    return
+  }
+  try {
+    await configApi.fetchConfig()
+  } catch (e: any) {
+    toast.error(e?.response?.status === 401
+      ? '服务访问密钥与后端不一致，接口仍然返回 401，请检查后重新填写'
+      : '已保存到本机，但验证时后端没有响应，请确认服务在运行')
+    return
+  }
+  // 两张卡片的值是在 401 时加载的（加载失败留着默认值），用新密钥补一遍
+  await Promise.all([configStore.fetchConfig(), configStore.fetchVisionConfig()])
+  toast.success(key ? '服务访问密钥已保存，验证通过' : '服务访问密钥已清除')
 }
 
 async function handleSaveVision() {
@@ -72,6 +99,37 @@ async function handleReset() {
 
 <template>
   <div style="max-width: 600px;">
+    <!-- **必须排在最前面**：它是另外两张卡的前置条件 —— 后端设了密钥而这里没填，
+         下面两张卡连自己的值都读不回来（401）。用户被 401 提示打发到这一页时，
+         唯一该做的就是这一件事；排在两组「API Key」后面的话它落在首屏之外，
+         而首屏那两个「API Key」是完全不同的东西，极易填错（用户实测反馈过）。 -->
+    <div class="card">
+      <div class="card-header">🔐 服务访问密钥</div>
+      <p class="text-secondary text-sm mb-4">
+        后端设置了 <code>TWEAKERS_API_KEY</code> 时必须在此填入相同的值，否则所有接口返回 401。
+        后端未设置则留空即可。<strong>它与下面的大模型 API Key 是两回事。</strong>
+      </p>
+
+      <div class="form-group">
+        <!-- 标签跟报错提示、《使用说明》逐字统一成「服务访问密钥」。曾经这里叫
+             「Access Key」、提示里叫「服务访问密钥」、说明书里叫「接口密钥」——
+             同一个东西三个名字，用户照着提示在页面上根本找不到它 -->
+        <label class="form-label">服务访问密钥</label>
+        <input
+          v-model="accessKey"
+          type="password"
+          class="form-input"
+          placeholder="与后端 TWEAKERS_API_KEY 一致"
+          autocomplete="off"
+          data-testid="access-key-input"
+        />
+      </div>
+
+      <button class="btn btn-primary" @click="handleSaveAccessKey">
+        💾 保存到本机
+      </button>
+    </div>
+
     <div class="card">
       <div class="card-header">🔑 LLM API 配置</div>
       <p class="text-secondary text-sm mb-4">
@@ -238,29 +296,6 @@ async function handleReset() {
         <span v-if="configStore.visionConfigured" class="badge badge-completed">已配置</span>
         <span v-else>未配置（纯文本分析）</span>
       </p>
-    </div>
-
-    <div class="card">
-      <div class="card-header">🔐 服务访问密钥</div>
-      <p class="text-secondary text-sm mb-4">
-        后端设置了 <code>TWEAKERS_API_KEY</code> 时必须在此填入相同的值，否则所有接口返回 401。
-        后端未设置则留空即可。
-      </p>
-
-      <div class="form-group">
-        <label class="form-label">Access Key</label>
-        <input
-          v-model="accessKey"
-          type="password"
-          class="form-input"
-          placeholder="与后端 TWEAKERS_API_KEY 一致"
-          autocomplete="off"
-        />
-      </div>
-
-      <button class="btn btn-primary" @click="handleSaveAccessKey">
-        💾 保存到本机
-      </button>
     </div>
 
     <div class="card" v-if="configStore.isConfigured">

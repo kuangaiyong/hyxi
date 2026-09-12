@@ -149,31 +149,52 @@ function unfold() {
 // 评论区的折叠。**分两页**：点一次只多出一页评论，按钮还留着 —— 采集器必须循环点
 // 到不再增长，点一次就收工照样漏。真站上的「查看更多评论」就是这个行为。
 var cmtPage = 0;
-function newComment(id, uid, name, body, hhmm) {
+// qs 缺省是「评论自带 id」的形态；嵌套回复可以传 comment_id=父&reply_comment_id=自己
+function newComment(id, uid, name, body, hhmm, qs) {
   return '<div role="article">'
     + '<a href="/groups/2407063016436085/user/' + uid + '/" aria-label="' + name + '"></a>'
     + '<a href="/groups/2407063016436085/user/' + uid + '/">' + name + '</a>'
     + '<div dir="auto">' + body + '</div>'
-    + '<a href="/groups/2407063016436085/posts/9001/?comment_id=' + id + '"'
+    + '<a href="/groups/2407063016436085/posts/9001/?' + (qs || 'comment_id=' + id) + '"'
     + ' data-tip="2026年5月28日周三' + hhmm + '">6天</a>'
     + '</div>';
+}
+// 5503 的正文**自己也折叠着**：长评论在真站上同样只渲染前几行、末尾挂一个「展开」
+// （真实库最长的回复 815 字，结尾全都完整，说明真站评论确实带这个按钮、靠
+// expandBodies 点开）。它是被「查看更多评论」**加载出来**的 —— 先点正文「展开」
+// 再点评论折叠的话，它出现时那一轮已经点完了，残文就这么入库。
+// 可见部分故意超过 100 字：指纹只吃正文前 100 字，截断版和完整版于是算出**同一个
+// 指纹**，下一批就算展开了也会被当成已见过丢掉，残文永远修不回来
+var LONG_5503 = 'Bij mij hangt hij aan een Shelly 3EM, werkt prima. De P1-koppeling via de '
+  + 'HomeWizard gaf de eerste week storingen, maar sinds firmware 2.4.3 is dat helemaal '
+  + 'opgelost en laadt hij netjes op zonne-overschot. Alleen de app blijft traag bij het '
+  + 'wisselen tussen de tabbladen.';
+function unfoldComment(btn) {
+  btn.parentElement.innerHTML = LONG_5503 + ' <div role="button" tabindex="0">收起</div>';
 }
 function moreComments() {
   var fold = document.getElementById('cmtfold');
   cmtPage++;
   if (cmtPage === 1) {
     fold.insertAdjacentHTML('beforebegin', newComment(
-      '5503', '55', 'Bram_H', 'Bij mij hangt hij aan een Shelly 3EM, werkt prima.', '19:55'));
+      '5503', '55', 'Bram_H', LONG_5503.slice(0, 110)
+        + '… <div role="button" tabindex="0" onclick="unfoldComment(this)">展开</div>', '19:55'));
   } else {
     fold.insertAdjacentHTML('beforebegin', newComment(
       '5505', '66', 'Lieke_dV', 'Let op de firmware, 2.4.1 gaf hier problemen.', '20:31'));
     fold.remove();
   }
 }
+// 5504 的链接是 ?comment_id=<父评论 5501>&reply_comment_id=<自己>。这是 Facebook 嵌套回复
+// 固定链接的常见形态，**本机未在真站核实**（这台机器不访问 Facebook）；5502 保留
+// 「自带 id」的形态，两种都要认。只认 comment_id 的话，回复拿到的是父评论的 id ——
+// message_id 撞车，入库时按 id 归并，父评论的作者和正文被回复覆盖；时间锚点的标记也
+// 由 id 派生，回复连时间都继承了父评论的
 function moreReplies() {
   var fold = document.getElementById('replyfold');
   fold.insertAdjacentHTML('beforebegin', newComment(
-    '5504', '77', 'Ruud_T', 'Die ondergrens is instelbaar in de app.', '19:22'));
+    '5504', '77', 'Ruud_T', 'Die ondergrens is instelbaar in de app.', '19:22',
+    'comment_id=5501&reply_comment_id=5504'));
   fold.remove();
 }
 </script>

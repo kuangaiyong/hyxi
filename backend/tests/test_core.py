@@ -2731,6 +2731,79 @@ class TestStablePostIdentityEndToEnd:
         )
         assert rows["R1"]["reply_level"] == 1
 
+    def _insert_raw(self, fp, parent, src="src_x", seq=99, mid="MR"):
+        """直接写库，复刻旧版本留下的存量行 —— 那种行正是经 upsert_posts 进不来的"""
+        conn = self.storage._get_conn()
+        conn.execute(
+            """INSERT INTO posts (source_id, fingerprint, seq, username, timestamp,
+               content, page_number, message_id, parent_fingerprint, reply_level)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (src, fp, seq, "Piet", "16-07-2026 03:00", f"回复{fp}", 1, mid, parent, 1),
+        )
+        conn.commit()
+        conn.close()
+
+    def _alias(self, fp, canonical, src="src_x"):
+        conn = self.storage._get_conn()
+        conn.execute("INSERT OR REPLACE INTO post_aliases (source_id, fingerprint, canonical)"
+                     " VALUES (?,?,?)", (src, fp, canonical))
+        conn.commit()
+        conn.close()
+
+    def test_startup_repoints_a_reply_whose_parent_was_merged_away(self):
+        """存量回复的父指针指着一个已进别名表的指纹：启动合并必须顺着别名表挂回去。
+
+        上面那条修的是**以后**的写入；v1.10.1 运行期间已经这样落库的回复还躺在库里。
+        `merge_duplicate_posts()` 的「悬空 parent 就地提成主贴」曾经只查 posts 表里活着的
+        指纹、不查别名表，于是升级到新版本后的**第一次启动**就把它们提成主贴 —— 那一步
+        不可逆（父指针被清空），而别名表里其实一直存着规范父贴。发版前评审用临时库实测
+        复现过：执行前 R {parent: F2, level: 1}，执行后 {parent: None, level: 0}。
+        """
+        self.storage.upsert_posts("src_x", [self._post("F1", "MP", content="主贴原文")])
+        self.storage.upsert_posts("src_x", [self._post("F2", "MP", content="主贴被编辑过")])
+        assert [r["fingerprint"] for r in self._rows()] == ["F1"], "前置条件：F2 已归并进 F1"
+        self._insert_raw("R1", parent="F2")
+
+        self.storage.merge_duplicate_posts()
+
+        r = {x["fingerprint"]: x for x in self._rows()}["R1"]
+        assert r["parent_fingerprint"] == "F1", (
+            f"别名表里明明有 F2→F1，回复却被当孤儿提成了主贴：{r['parent_fingerprint']!r}"
+        )
+        assert r["reply_level"] == 1
+
+    def test_startup_follows_an_alias_chain(self):
+        """别名可以成链：F3→F2 记下之后 F2 自己又被并进了 F1，F2 已不在 posts 表里"""
+        self.storage.upsert_posts("src_x", [self._post("F1", "MP")])
+        self._alias("F2", "F1")
+        self._alias("F3", "F2")
+        self._insert_raw("R1", parent="F3")
+
+        self.storage.merge_duplicate_posts()
+
+        assert {x["fingerprint"]: x for x in self._rows()}["R1"]["parent_fingerprint"] == "F1"
+
+    def test_startup_still_promotes_a_true_orphan(self):
+        """父贴哪里都找不到的回复照旧提成主贴 —— 别把悬空指针留在库里"""
+        self.storage.upsert_posts("src_x", [self._post("F1", "MP")])
+        self._insert_raw("R1", parent="GONE")
+
+        self.storage.merge_duplicate_posts()
+
+        r = {x["fingerprint"]: x for x in self._rows()}["R1"]
+        assert r["parent_fingerprint"] is None and r["reply_level"] == 0
+
+    def test_an_alias_from_another_source_is_not_used(self):
+        """别名只在来源内有效：指纹不含来源，别的来源里同名的别名不能拿来认亲"""
+        self.storage.upsert_posts("src_x", [self._post("F1", "MP")])
+        self._alias("F2", "F1", src="src_y")
+        self._insert_raw("R1", parent="F2")
+
+        self.storage.merge_duplicate_posts()
+
+        r = {x["fingerprint"]: x for x in self._rows()}["R1"]
+        assert r["parent_fingerprint"] is None, "拿别的来源的别名把回复挂到了 src_x 的帖子上"
+
     def test_a_reply_with_an_id_but_no_text_is_not_silently_dropped(self):
         """有 message_id 的回复正文空也不许丢 —— 平台给了 id，它就真实存在。
 
@@ -4785,6 +4858,69 @@ def _RecordingProgress():
     return _Recording()
 
 
+class TestCommentFoldPatternsEndToEnd:
+    """评论折叠按钮的文字模式：该点的全点到，动作按钮一个都不许碰 —— 真 node 跑真脚本里的模式
+
+    fixture 站点是中文界面，只能钉住中文那一路；采集账号的界面语言由 Facebook 账号自己
+    的设置决定，英文和荷兰语同样会遇到。发版前评审实测：英文的「View more replies」
+    「View previous replies」、大写开头的「2 Replies」、以及「Jan replied · 2 replies」
+    这种带前缀的写法全都匹配不上 —— 回复第一页之后的一条都采不到，而日志里
+    「点开评论折叠 N 处」照样大于 0，看不出漏了。
+
+    模式和标志都**从 collectors/facebook_group.js 里原样取出**，按 expandComments() 的
+    同一种构造方式建正则，不在测试里另抄一份。
+    """
+
+    CLICK = [
+        "查看更多评论", "查看之前的评论", "查看 3 条回复", "查看全部 12 条回复", "查看更多回复",
+        "2 条回复", "Joost 已回复 · 2 条回复",
+        "View more comments", "View previous comments", "View 3 more replies",
+        "View all 5 replies", "View 1 reply", "View more replies", "View previous replies",
+        "2 Replies", "Jan replied · 2 replies", "View More Replies",
+        "Meer reacties weergeven", "Alle 3 antwoorden bekijken", "2 antwoorden bekijken",
+        "Meer antwoorden weergeven", "Jan heeft gereageerd · 3 antwoorden",
+    ]
+    # 误点的后果：「分享」弹对话框、「回复/评论」打开输入框、计数标签可能跳去帖子详情页
+    NEVER = [
+        "回复", "赞", "分享", "评论", "发送", "展开", "收起", "最相关", "12 条评论", "12",
+        "Reply", "Like", "Share", "Comment", "See more", "Most relevant", "3 comments",
+        "Reageren", "Vind ik leuk", "Delen", "Beantwoorden", "Meer weergeven", "3 reacties",
+    ]
+
+    def test_patterns_click_every_fold_and_no_action_button(self):
+        import pytest
+        import subprocess
+        from app.config import settings
+
+        if not _HAS_NODE:
+            pytest.skip("未安装 node")
+        script = os.path.join(settings.project_root, "collectors", "facebook_group.js")
+        src = open(script, encoding="utf-8").read()
+        # expandComments() 必须真的用上这组标志，否则下面测的就不是线上的行为
+        assert "sel.commentFoldFlags" in src, "expandComments() 建正则时没带 commentFoldFlags"
+
+        # SELECTORS 是一个顶格的对象字面量，到第一个顶格的 `};` 为止（对象内部全是缩进行）
+        start = src.index("const SELECTORS = {") + len("const SELECTORS = ")
+        body = src[start:src.index("\n};", start) + 2]
+        js = (
+            "const vm = require('vm');"
+            "const S = vm.runInNewContext('(' + process.env.SEL + ')');"
+            "const re = new RegExp(`^(${S.commentFoldText})$`, S.commentFoldFlags);"
+            "const t = (s) => re.test(s.replace(/\\s+/g, ' ').trim());"
+            "const c = JSON.parse(process.env.CLICK), n = JSON.parse(process.env.NEVER);"
+            "console.log(JSON.stringify({missed: c.filter(s => !t(s)), wrong: n.filter(t)}));"
+        )
+        env = dict(os.environ, SEL=body,
+                   CLICK=json.dumps(self.CLICK, ensure_ascii=False),
+                   NEVER=json.dumps(self.NEVER, ensure_ascii=False))
+        out = subprocess.run(["node", "-e", js], env=env, capture_output=True,
+                             text=True, encoding="utf-8", timeout=30)
+        assert out.returncode == 0, out.stderr
+        res = json.loads(out.stdout)
+        assert res["missed"] == [], f"这些折叠按钮点不到，后面的评论/回复会整批漏采：{res['missed']}"
+        assert res["wrong"] == [], f"这些动作按钮会被误点：{res['wrong']}"
+
+
 class TestFacebookLoginEndToEnd:
     """登录 / 会话复用 / 两步验证退出路径 —— 真 Chrome 打真带登录门的本地站点。
 
@@ -5014,6 +5150,63 @@ class TestFacebookLoginEndToEnd:
         for p in data["posts"]:
             for ui in ("查看更多评论", "查看 1 条回复", "条回复"):
                 assert ui not in (p["content"] or ""), f"折叠按钮文字混进正文: {p}"
+
+    def test_body_of_a_comment_loaded_from_a_fold_is_expanded_too(self):
+        """被「查看更多评论」加载出来的长评论，它自己的「展开」也必须点开。
+
+        extractBatch() 曾经先 expandBodies() 再 expandComments()：点正文「展开」那一轮，
+        折叠里的评论还不在 DOM 里；等它被加载出来，本批已经没人去点它的「展开」了，
+        残文剥掉「… 展开」后看起来就是一句完整的话，照样入库。
+        **可见部分超过 100 字时这是永久的**：指纹只吃正文前 100 字，截断版和完整版
+        算出同一个指纹，下一批就算展开了也会被 seen 当成已见过丢掉。（发版前评审用
+        仓库原脚本复现过：可见 115 字入库，调换两步顺序后得到完整的 232 字。）
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+
+        with site.LoginSite() as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
+
+        c = [p for p in data["posts"] if p["message_id"] == "5503"][0]
+        assert "wisselen tussen de tabbladen" in c["content"], (
+            f"折叠评论只存下了截断的前 {len(c['content'])} 个字符：{c['content']!r}"
+        )
+        assert not c["content"].rstrip().endswith("…"), "截断省略号残留在正文末尾"
+        assert "展开" not in c["content"] and "收起" not in c["content"]
+
+    def test_nested_reply_keeps_its_own_id_and_time(self):
+        """嵌套回复的链接是 comment_id=父&reply_comment_id=自己 时，id 和时间都要是它自己的。
+
+        只认 `comment_id=` 就拿到父评论的 id：message_id 撞车 —— 入库时按 id 归并，
+        父评论那一行的作者和正文被回复覆盖、回复自己消失，而回复的指纹进了别名表，
+        永远不会再下发。时间锚点的标记也由 id 派生，回复连时间都继承了父评论的。
+        v1.11 开始成批点开「查看 N 条回复」，这条路才大面积走得到。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+
+        with site.LoginSite() as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
+
+        # data["posts"] 是 CollectorRunner **入库之后** load_posts() 读回来的 —— 看到的就是
+        # 库里真实存下的样子。别断言「message_id 不重复」：撞车的两条在入库时已经按 id
+        # 塌成一行了，那句断言在这里天然成立、钉不住任何东西（写这条测试时实测踩过）
+        comments = [p for p in data["posts"] if p["parent_fingerprint"]]
+        who = {p["username"]: p for p in comments}
+        assert "Joost1988" in who, (
+            "父评论整条消失了 —— 它那一行被嵌套回复覆盖："
+            f"{[(p['message_id'], p['username'], p['timestamp']) for p in comments]}"
+        )
+        assert who["Joost1988"]["message_id"] == "5501"
+        assert "+1" in who["Joost1988"]["content"], "父评论的正文被回复的正文覆盖了"
+
+        assert "Ruud_T" in who, "嵌套回复没有作为独立的一行存下来"
+        reply = who["Ruud_T"]
+        assert reply["message_id"] == "5504", "嵌套回复拿到的是父评论的 id"
+        assert reply["timestamp"] == "28-05-2026 19:22", (
+            f"嵌套回复继承了父评论的时间：{reply['timestamp']}"
+        )
+        assert len(comments) == 5, f"应有 3 条顶层评论 + 2 条嵌套回复，实际 {len(comments)}"
 
     def test_body_images_are_downloaded_and_decoys_ignored(self):
         """正文图要下载到本地，头像 / emoji / 非 scontent 的图都不能混进来。

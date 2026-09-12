@@ -1232,6 +1232,53 @@ class TestPostSourceUrlEndToEnd:
             # 后面的用例还要用它，按原记录写回去（create_source 会换一个新 id）
             self.storage.save_source(self.fb)
 
+    def _with_params(self, **params):
+        src = dict(self.fb)
+        src["params"] = {**self.fb["params"], **params}
+        self.storage.save_source(src)
+
+    def test_a_non_web_base_url_yields_no_link(self):
+        """base_url 是用户在数据源页填的，原样进 `<a :href>` —— 不是 http(s) 就不给链接。
+
+        「javascript:alert(document.domain)//x」拼出来是一段合法脚本（后面全是注释），
+        每条主贴的「🔗 原帖」都会变成它；而且链接是逐条现算的，改一次参数所有历史
+        任务的链接一起被换掉。（发版前评审实测 post_url 原样返回了这串）
+        """
+        try:
+            for bad in ("javascript:alert(document.domain)//x", "data:text/html,x",
+                        "JAVASCRIPT:alert(1)", "//evil.example", "ftp://x.example"):
+                self._with_params(base_url=bad)
+                by_source, _ = self._posts()
+                assert by_source[self.fb["id"]]["source_url"] == "", f"{bad!r} 进了链接"
+        finally:
+            self.storage.save_source(self.fb)
+
+    def test_a_non_string_base_url_does_not_break_the_whole_list(self):
+        """表单总是提交字符串，但手工构造的 API 请求能把 base_url 存成数字 ——
+        链接逐条现算，一条抛异常整页帖子列表就 500，所有引用这个来源的历史结果页全挂"""
+        try:
+            for bad in (5, True, ["x"]):
+                self._with_params(base_url=bad)
+                by_source, _ = self._posts()        # 内含 status_code == 200 的断言
+                assert by_source[self.fb["id"]]["source_url"] == ""
+                assert by_source[self.fb["id"]]["content"], "帖子本身不该受影响"
+        finally:
+            self.storage.save_source(self.fb)
+
+    def test_group_id_cannot_break_out_of_its_path_segment(self):
+        """group_id 同样是用户填的：带 / ? # 的值要被编码在它自己那一段里"""
+        try:
+            self._with_params(group_id="abc/../x?y#z")
+            by_source, _ = self._posts()
+            url = by_source[self.fb["id"]]["source_url"]
+            assert url.startswith("https://www.facebook.com/groups/"), url
+            tail = url[len("https://www.facebook.com/groups/"):]
+            assert "?" not in url and "#" not in url and tail.count("/") == 3, (
+                f"group_id 冲出了自己那一段路径：{url}"
+            )
+        finally:
+            self.storage.save_source(self.fb)
+
     def test_post_url_is_not_stored_in_the_posts_table(self):
         """链接现算，不落库 —— 存一份就是双写，历史数据也不会凭空长出这一列"""
         conn = self.storage._get_conn()
@@ -1659,3 +1706,70 @@ class TestFrontendHostingEndToEnd:
         from main import mount_frontend
 
         assert mount_frontend(FastAPI(), os.path.join(self.tmpdir, "nope")) is False
+
+
+class TestDevModePointsToTheFrontendEndToEnd:
+    """源码开发态的 8000 只有 API，有人拿浏览器打开页面路径时必须告诉他页面在哪。
+
+    用户实测：打开 `http://127.0.0.1:8000/tasks`，开发态回的是 `404 {"detail":"Not Found"}`，
+    没有任何一个字说「页面在 5173」。同一个端口号在便携包里是同时供页面和 API 的，
+    用户去访问 8000 是完全合理的行为。
+
+    打到**真实的 `main.app`**（uvicorn 起的就是它），不另造一个应用：要钉住的正是
+    开发态启动路径上那一段 `if not mount_frontend(...)`。
+    """
+
+    @classmethod
+    def setup_class(cls):
+        import pytest
+        import app.config as cfg
+        import app.services.storage as storage_module
+
+        if os.path.isfile(os.path.join(cfg.settings.project_root, "web", "index.html")):
+            pytest.skip("项目根有 web/，main.app 走的是便携包那种单端口形态，不是开发态")
+
+        # 同 TestFrontendHostingEndToEnd：import main 之前先把库重定向走
+        cls.tmpdir = tempfile.mkdtemp()
+        cls.cfg, cls.storage = cfg, storage_module
+        cls._old = (cfg.settings.api_key, cfg.settings.data_dir, storage_module.DB_PATH)
+        cfg.settings.api_key = ""
+        cfg.settings.data_dir = cls.tmpdir
+        storage_module.DB_PATH = os.path.join(cls.tmpdir, "hyxi.db")
+        storage_module.init_db()
+
+        from main import app
+        cls.client = TestClient(app)
+
+    @classmethod
+    def teardown_class(cls):
+        if hasattr(cls, "_old"):
+            (cls.cfg.settings.api_key, cls.cfg.settings.data_dir, cls.storage.DB_PATH) = cls._old
+            shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def test_page_path_says_where_the_pages_are(self):
+        resp = self.client.get("/tasks")
+        assert resp.status_code == 404, "状态码仍然该是 404 —— 这里确实没有这个页面"
+        assert "5173" in resp.json()["detail"], (
+            f"开发态打开页面路径只回了一句 {resp.json()!r}，没告诉用户页面在 5173"
+        )
+
+    def test_deep_link_says_it_too(self):
+        """结果页那种深链是最常被人直接粘贴过来的"""
+        resp = self.client.get("/tasks/abc-123/results")
+        assert resp.status_code == 404 and "5173" in resp.json()["detail"]
+
+    def test_unknown_api_path_is_still_a_plain_404(self):
+        """接口调用方要的是干净的 404，指路的话对它是噪音 —— 只对页面路径说"""
+        resp = self.client.get("/api/v1/definitely-not-a-route")
+        assert resp.status_code == 404
+        assert "5173" not in resp.json()["detail"], "打错的接口地址也被指去了前端"
+
+    def test_real_api_404_keeps_its_own_detail(self):
+        """接口自己抛的 404 带着业务含义（「任务不存在」），不能被统一文案盖掉"""
+        resp = self.client.get("/api/v1/tasks/definitely-not-a-task")
+        assert resp.status_code == 404
+        assert "5173" not in resp.json()["detail"]
+
+    def test_root_and_docs_are_untouched(self):
+        assert self.client.get("/").json()["service"] == "HYXi 舆情分析 API"
+        assert self.client.get("/api/health").status_code == 200

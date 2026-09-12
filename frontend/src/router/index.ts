@@ -76,8 +76,14 @@ const router = createRouter({
  */
 const RELOAD_FLAG = 'hyxi_chunk_reload'
 
-// 浏览器对 dynamic import 失败的措辞各不相同，三种都要认（Chrome / Firefox / Safari）
-const CHUNK_GONE = /dynamically imported module|Importing a module script failed|error loading dynamically imported/i
+// 浏览器对 dynamic import 失败的措辞各不相同，三种都要认（Chrome / Firefox / Safari）。
+// **`Unable to preload CSS` 不能漏**：带自己 CSS 的视图（结果页、舆情详情页 —— 恰好是
+// 最常用的两个）走的是另一条路，Vite 的 __vitePreload 先等 CSS link 加载，失败时抛的是
+// 这句，而且是在 import() 执行**之前**就抛，所以拿到的永远是 CSS 那条报错。认不出它，
+// 下面直接 return，那两个页面照样「点了没反应」—— 而且注册了 onError 之后，
+// vue-router 自己的 console.error 兜底也没了，连控制台都不留痕（发版前评审实测）
+const CHUNK_GONE =
+  /dynamically imported module|Importing a module script failed|error loading dynamically imported|Unable to preload CSS/i
 
 function readFlag(): string {
   // 隐私模式 / 禁用站点数据时 sessionStorage 会直接抛，不能让它把错误处理本身搞挂
@@ -88,12 +94,14 @@ function readFlag(): string {
   }
 }
 
-function writeFlag(value: string): void {
+/** 返回是否真的存下了 —— 存不下就不能刷，见 onError */
+function writeFlag(value: string): boolean {
   try {
     if (value) sessionStorage.setItem(RELOAD_FLAG, value)
     else sessionStorage.removeItem(RELOAD_FLAG)
+    return true
   } catch {
-    // 存不下就退化成「不自动刷、直接提示」，比抛出去强
+    return false
   }
 }
 
@@ -102,12 +110,13 @@ router.onError((error, to) => {
 
   // **只自动刷一次**。刷完还拿不到就不是「换了构建」，是服务端真的没了 ——
   // 再刷就是无限循环，页面会一直闪，比原来的静默失败更糟。
-  if (readFlag() === to.fullPath) {
+  // 标记**存不下**时同样不许刷：那时每次都判成「还没刷过」，就是那个无限循环
+  // （实测：禁用站点数据的浏览器上 8 秒整页导航 296 次，一个提示都没有）
+  if (readFlag() === to.fullPath || !writeFlag(to.fullPath)) {
     writeFlag('')
     useToast().add('页面资源加载失败，可能是后端服务已停止。请确认服务在运行后手动刷新', 'error', 0)
     return
   }
-  writeFlag(to.fullPath)
   window.location.assign(to.fullPath)
 })
 

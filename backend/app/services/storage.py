@@ -968,22 +968,50 @@ def merge_duplicate_posts() -> None:
             )
             repointed += cur.rowcount or 0
 
-        # 悬空 parent 就地提成主贴
+        # 悬空 parent：**先顺着别名表找规范父贴**，真找不到才就地提成主贴。
+        # 父指针指着的那个指纹往往只是被归并掉了 —— v1.10.1 的 upsert_posts 只把父指针过了
+        # canon、没过别名表，那一版运行期间落库的回复就这样指着一个已进 post_aliases 的指纹。
+        # 只查 posts 表的话，升级后的第一次启动就把它们提成主贴，而那一步不可逆（父指针被
+        # 清空），规范父贴明明一直在别名表里。别名可以成链（F3→F2 记下之后 F2 又被并进 F1），
+        # 所以要一路跟到活着的那一个；别名只在来源内有效，键必须带 source_id
         alive = set()
         for r in conn.execute("SELECT source_id, fingerprint FROM posts"):
             alive.add((r["source_id"], r["fingerprint"]))
+        aliases = {
+            (r["source_id"], r["fingerprint"]): r["canonical"]
+            for r in conn.execute("SELECT source_id, fingerprint, canonical FROM post_aliases")
+        }
+
+        def resolve(src: str, fp: str) -> Optional[str]:
+            hops = set()
+            while (src, fp) not in alive and (src, fp) in aliases and fp not in hops:
+                hops.add(fp)
+                fp = aliases[(src, fp)]
+            return fp if (src, fp) in alive else None
+
         orphans = 0
         for r in conn.execute(
             "SELECT source_id, fingerprint, parent_fingerprint FROM posts "
             "WHERE TRIM(COALESCE(parent_fingerprint, '')) <> ''"
         ).fetchall():
-            if (r["source_id"], r["parent_fingerprint"]) not in alive:
+            src, parent = r["source_id"], r["parent_fingerprint"]
+            if (src, parent) in alive:
+                continue
+            keep = resolve(src, parent)
+            # 解析回自己就不是父子关系了，挂上去 build_tree() 会得到一个环
+            if keep and keep != r["fingerprint"]:
                 conn.execute(
-                    "UPDATE posts SET parent_fingerprint=NULL, reply_level=0 "
-                    "WHERE source_id=? AND fingerprint=?",
-                    (r["source_id"], r["fingerprint"]),
+                    "UPDATE posts SET parent_fingerprint=? WHERE source_id=? AND fingerprint=?",
+                    (keep, src, r["fingerprint"]),
                 )
-                orphans += 1
+                repointed += 1
+                continue
+            conn.execute(
+                "UPDATE posts SET parent_fingerprint=NULL, reply_level=0 "
+                "WHERE source_id=? AND fingerprint=?",
+                (src, r["fingerprint"]),
+            )
+            orphans += 1
 
         conn.commit()
         if merged or repointed or orphans:

@@ -8,12 +8,16 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Dict, Optional
+from urllib.parse import quote
 
 from app.collectors.base import Collector
 from app.config import settings
 
 DEFAULT_BASE_URL = "https://www.facebook.com"
+# 原帖链接只接受 http(s) 的站点地址（见 post_url）
+_WEB_BASE = re.compile(r"^https?://[^/\s]", re.IGNORECASE)
 
 
 class FacebookGroupCollector(Collector):
@@ -65,13 +69,23 @@ class FacebookGroupCollector(Collector):
 
         `base_url` 取自数据源参数而不是写死常量：本地 fixture 验证时它指向测试站点，
         写死会让链接指到真站上去。
+
+        **这串会原样进 `<a :href>`，而 base_url / group_id 都是用户在数据源页填的**：
+          · base_url 不是 http(s) 就不给链接 —— 「javascript:alert(1)//x」拼出来是一段
+            合法脚本（后面全是注释），每条主贴的「🔗 原帖」都会变成它
+          · 非字符串（手工构造的 API 请求能存进来）同样不给，不能在这里抛 —— 链接是
+            逐条现算的，一条抛异常整页帖子列表就 500
+          · group_id / message_id 按单个路径段编码，带 / ? # 的值冲不出自己那一段
+        （以上三条都是发版前评审实测出来的）
         """
         params = source.get("params") or {}
         group_id = params.get("group_id")
-        if not group_id or not message_id:
+        base = params.get("base_url") or DEFAULT_BASE_URL
+        if not group_id or not message_id or not isinstance(base, str) \
+                or not _WEB_BASE.match(base):
             return None
-        base = (params.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
-        return f"{base}/groups/{group_id}/permalink/{message_id}/"
+        gid, mid = quote(str(group_id), safe=""), quote(str(message_id), safe="")
+        return f"{base.rstrip('/')}/groups/{gid}/permalink/{mid}/"
 
     def session_path(self, source: Dict[str, Any]) -> str:
         """会话按 source 隔离而不是按 collector —— 同一个采集器可能挂两个账号"""

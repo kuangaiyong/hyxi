@@ -5,10 +5,12 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.auth import require_api_key
 from app.config import settings
 from app.logging_config import get_logger
@@ -52,7 +54,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="HYXi 舆情分析 API",
     description="HYXi 舆情分析平台 — 论坛帖子抓取、翻译与情感分析服务",
-    version="1.10.1",
+    version="1.11.0",
     lifespan=lifespan,
     docs_url="/docs" if settings.enable_docs else None,
     redoc_url="/redoc" if settings.enable_docs else None,
@@ -113,7 +115,7 @@ async def health():
 async def version():
     return {
         "service": "HYXi 舆情分析 API",
-        "version": "1.10.1",
+        "version": "1.11.0",
         "docs": "/docs",
     }
 
@@ -159,11 +161,34 @@ def mount_frontend(target_app: FastAPI, web_dir: str) -> bool:
     return True
 
 
+DEV_FRONTEND_HINT = (
+    "这里是后端 API（源码开发态不提供页面）。页面请打开 http://localhost:5173 ；"
+    "若用的是便携包，页面和接口本该在同一个地址上，说明便携包没有在这个端口运行"
+)
+
+
 if not mount_frontend(app, os.path.join(settings.project_root, "web")):
     @app.get("/")
     async def root():
         return {
             "service": "HYXi 舆情分析 API",
-            "version": "1.10.1",
+            "version": "1.11.0",
             "docs": "/docs",
         }
+
+    @app.exception_handler(StarletteHTTPException)
+    async def point_to_frontend(request: Request, exc: StarletteHTTPException):
+        """开发态有人拿浏览器打开页面路径时，告诉他页面在哪。
+
+        同一个端口号在便携包里同时供页面和 API，所以用户打开 `127.0.0.1:8000/tasks`
+        完全合理 —— 开发态却只回一句 `{"detail":"Not Found"}`，没有任何一个字说
+        「页面在 5173」（用户实测反馈过）。
+
+        用异常处理器而不是再挂一条 catch-all 路由：catch-all 只收 GET，会把「对不存在
+        的路径发 POST」从 404 变成 405，开发态和测试的路由语义就跟着变了。
+        **`/api/` 开头的原样放行**：接口调用方要的是干净的 404，而接口自己抛的 404
+        带着业务含义（「任务不存在」），不能被一句统一的指路文案盖掉。
+        """
+        if exc.status_code == 404 and not request.url.path.startswith("/api/"):
+            return JSONResponse(status_code=404, content={"detail": DEV_FRONTEND_HINT})
+        return await http_exception_handler(request, exc)

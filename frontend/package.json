@@ -1,6 +1,6 @@
 {
   "name": "tweakers-scraper-frontend",
-  "version": "1.10.1",
+  "version": "1.11.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,7 +10,8 @@
     "e2e": "node e2e/results_filters.js",
     "e2e:sentiment": "node e2e/sentiment_time_column.js",
     "e2e:link": "node e2e/results_source_link.js",
-    "e2e:stale": "node e2e/stale_bundle_navigation.js"
+    "e2e:stale": "node e2e/stale_bundle_navigation.js",
+    "e2e:key": "node e2e/access_key_flow.js"
   },
   "dependencies": {
     "axios": "^1.7.0",

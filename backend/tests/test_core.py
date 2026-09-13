@@ -5018,12 +5018,12 @@ class TestFacebookLoginEndToEnd:
             data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
 
         assert data["complete"] is True, data.get("stop_reason")
-        assert len(data["posts"]) == 7          # 2 主贴 + 3 顶层评论 + 2 嵌套回复
+        assert len(data["posts"]) == 8          # 3 主贴 + 3 顶层评论 + 2 嵌套回复
         assert os.path.exists(self.state), "会话文件没有落盘，下一轮还得再输一次密码"
 
         roots = [p for p in data["posts"] if not p["parent_fingerprint"]]
         comments = [p for p in data["posts"] if p["parent_fingerprint"]]
-        assert len(roots) == 2 and len(comments) == 5
+        assert len(roots) == 3 and len(comments) == 5
         assert comments[0]["reply_level"] == 1
         import re
         assert re.match(r"^\d{2}-\d{2}-\d{4} \d{2}:\d{2}$", roots[0]["timestamp"])
@@ -5093,7 +5093,7 @@ class TestFacebookLoginEndToEnd:
         blank = [p for p in data["posts"]
                  if not p["message_id"] and not (p["content"] or "").strip()]
         assert blank == [], f"广告 article 被存成了空帖: {blank}"
-        assert len(data["posts"]) == 7, "丢空帖时把真帖子也带走了"
+        assert len(data["posts"]) == 8, "丢空帖时把真帖子也带走了"
 
     def test_multi_paragraph_comment_keeps_every_paragraph(self):
         """评论的多段正文必须全取，而且不能把嵌套回复的正文吞进来。
@@ -5184,6 +5184,32 @@ class TestFacebookLoginEndToEnd:
         )
         assert not c["content"].rstrip().endswith("…"), "截断省略号残留在正文末尾"
         assert "展开" not in c["content"] and "收起" not in c["content"]
+
+    def test_a_fold_that_opens_the_post_detail_does_not_swallow_the_feed(self):
+        """有的折叠按钮会把帖子详情整个打开（浮层 / 换 URL），必须退回信息流。
+
+        真站实测（v1.11.0~v1.11.3）：点开折叠之后「批次 1：提取 11 条（含评论）」——
+        正好是**一条主贴加它十来条评论**，紧接着「页面不再增长，已到底」，
+        而同一页不点任何东西能滚出 45 条主贴。也就是说这个「多采几条回复」的修复
+        **把整轮采集赔进去了**：每轮只剩一条帖子。信息流的完整性优先。
+
+        fixture 里 9004 那条的折叠按钮会弹浮层并把信息流藏起来。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+
+        with site.LoginSite() as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
+
+        got = {p["message_id"] for p in data["posts"]}
+        # 详情页上只有 9004 和它的一条评论 —— 不退回信息流的话，实测采到的就只有
+        # {'5601', '9004'}，另外两条主贴和信息流里的评论全没了
+        assert {"9001", "9002", "9004"} <= got, f"信息流被详情页吞了：{sorted(got)}"
+        assert {"5501", "5502"} <= got, f"信息流里的评论也跟着没了：{sorted(got)}"
+        # **代价要说清**：退回信息流会把这一批已经展开的折叠一起丢掉（页面重载了），
+        # 所以 5503/5505 这些折叠里的评论这一轮采不到。信息流的完整性优先 ——
+        # 少几条回复是「下一轮再补」，整个信息流没了是「这一轮白跑」
+        assert "5601" not in got, "详情页里的评论不该混进来 —— 那说明还留在详情页上"
 
     def test_lazy_loaded_second_screen_is_not_declared_the_end(self):
         """滚到底之后要等信息流把下一批插进来，别急着判「已到底」。
@@ -5338,7 +5364,7 @@ class TestFacebookLoginEndToEnd:
             data = self._run(base_url, site.GOOD_USER, "这个密码是错的")
 
         assert data["complete"] is True, data.get("stop_reason")
-        assert len(data["posts"]) == 7
+        assert len(data["posts"]) == 8
 
     def test_deleting_session_falls_back_to_credentials(self):
         """(b) 删掉会话重跑仍能成功"""

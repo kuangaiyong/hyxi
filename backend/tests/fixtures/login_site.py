@@ -130,6 +130,20 @@ _FEED_PAGE = """<html><head><meta charset="utf-8"><title>小组</title></head><b
   <div role="article">
     <div>Gesponsord</div>
   </div>
+  <!-- 真站上有的「查看更多评论」不是就地展开，而是把帖子详情整个打开：要么弹浮层、
+       要么直接换 URL。留在详情里的后果不是「少采几条」而是整轮报废 —— 这一批只提取得到
+       那一条帖子，信息流也滚不动，scrollOnce() 于是判「已到底」，后面的批次全没了。
+       实测：点开折叠后「批次 1：提取 11 条」（一条主贴加它十来条评论），紧接着
+       「页面不再增长，已到底」，而同一页不点任何东西能滚出 45 条主贴。
+       这条主贴的折叠按钮直接换 URL 走人，用来钉住「发现了要退回信息流」 -->
+  <div role="article">
+    <a href="/groups/2407063016436085/user/99/" aria-label="Sofie_M"></a>
+    <a href="/groups/2407063016436085/user/99/">Sofie_M</a>
+    <a href="/groups/2407063016436085/posts/9004/" aria-label="3天"
+       data-tip="2026年5月31日周日11:20"><span>3天</span></a>
+    <div data-ad-comet-preview="message">Iemand ervaring met de garantie-afhandeling?</div>
+    <div role="button" tabindex="0" onclick="openDetail()">查看更多评论</div>
+  </div>
   <div role="article">
     <a href="/groups/2407063016436085/user/33/" aria-label="TechNerd_NL"></a>
     <a href="/groups/2407063016436085/user/33/">TechNerd_NL</a>
@@ -218,6 +232,14 @@ window.addEventListener('scroll', function () {
       + '</div>');
   }, 4000);
 });
+// 弹出帖子详情浮层，并且**把信息流盖住** —— 复刻真站上那一幕：这一批只看得到
+// 浮层里那一条帖子，页面也滚不动了
+function openDetail() {
+  // 真的换页 —— 真站上点某些「查看更多评论」就是这样，信息流整个不在了。
+  // 只把信息流 display:none 是复刻不出来的：querySelectorAll 照样取得到隐藏元素，
+  // 不修也能通过（实测踩过）
+  location.href = '/groups/2407063016436085/posts/9004/';
+}
 function moreReplies() {
   var fold = document.getElementById('replyfold');
   fold.insertAdjacentHTML('beforebegin', newComment(
@@ -247,6 +269,25 @@ document.addEventListener('mouseout', function () {
 # 而轮询每 2 秒查一次 loggedIn —— 两者撞上时 Playwright 会抛「Execution context was
 # destroyed」。这页把那个窗口放到最大，用来钉死「轮询不能因为导航而把脚本搞挂」。
 # 导航挂在 load 上而不是解析期，否则 gotoPage 自己就会被打断，测的就不是轮询了。
+# 帖子详情页。**信息流不在这里** —— 真站上点某些「查看更多评论」就会走到这种页面，
+# 采集器要是留在这儿，这一批就只提取得到这一条帖子，滚动也没有下一批
+_DETAIL_PAGE = """<html><head><meta charset="utf-8"><title>帖子</title></head><body>
+<div role="article">
+  <a href="/groups/2407063016436085/user/99/" aria-label="Sofie_M"></a>
+  <a href="/groups/2407063016436085/user/99/">Sofie_M</a>
+  <a href="/groups/2407063016436085/posts/9004/" data-tip="2026年5月31日周日11:20">3天</a>
+  <div data-ad-comet-preview="message">Iemand ervaring met de garantie-afhandeling?</div>
+  <div role="article">
+    <a href="/groups/2407063016436085/user/12/">Bart_K</a>
+    <div dir="auto">Bij mij duurde het drie weken.</div>
+    <a href="/groups/2407063016436085/posts/9004/?comment_id=5601"
+       data-tip="2026年5月31日周日12:02">3天</a>
+  </div>
+</div>
+</body></html>"""
+
+_POST_RE = re.compile(r"^/groups/\d+/posts/\d+/?$")
+
 _CHURN_PAGE = """<html><head><meta charset="utf-8"><title>跳转中</title></head><body>
 <script>window.addEventListener('load', function () {
   setTimeout(function () { location.replace('/churn?n=' + Math.random()); }, 0);
@@ -303,6 +344,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/churn"):
             self._send(_CHURN_PAGE)
+            return
+        if _POST_RE.match(self.path) and self._has_session():
+            self._send(_DETAIL_PAGE)
             return
         if _GROUP_RE.match(self.path):
             # 未登录时 302 到 /login/?next=... —— 2026-08-03 实测真站就是这个行为，

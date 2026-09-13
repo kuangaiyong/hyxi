@@ -216,9 +216,62 @@ async function expandBodies(page) {
     }
 }
 
-// 评论折叠的点击轮次上限。评论是分页加载的，一轮只多出一页，热帖要点好几轮才见底；
-// 但也不能无上限，否则一条几百条评论的帖子会把整批时间耗光
-const COMMENT_FOLD_ROUNDS = 8;
+// 评论折叠的展开轮次上限。**一轮只展开一条主贴**（见 expandComments），评论又是分页
+// 加载的，一屏十来条主贴、热帖要翻好几页，所以给到 30；但也不能无上限，否则一条几百条
+// 评论的帖子会把整批时间耗光。撞上限要打日志
+const COMMENT_FOLD_ROUNDS = 30;
+// 两轮之间的间隔。点「查看更多评论」是页面内的轻动作，不是翻页，所以比 pacing 短 ——
+// 一条一条地展开，用翻页那种 4~11 秒的话一批就要好几分钟。仍然随机、仍然不为零
+const FOLD_CLICK_DELAY_MIN = 800;
+const FOLD_CLICK_DELAY_MAX = 2000;
+// 折叠会把页面带进帖子详情的主贴。**整轮共用一份，不能每批重建**：同一条帖子下一批还会
+// 出现在页面上，再点一次就再重载一次信息流，把滚动加载出来的后续内容一起冲掉 ——
+// 实测：第二屏那条帖子明明已经加载进来了，第二批点了同一个坏按钮，重载后就没了
+const detailPosts = new Set();
+
+/**
+ * 点完折叠之后，页面还在信息流上吗？被带进帖子详情就退回来，返回是否发生过。
+ *
+ * 两种形态都见过/都要挡：换 URL（进了 /posts/xxx）、弹浮层（`[role=dialog]` 盖住信息流）。
+ * 留在详情页里的后果不是「少采几条」而是**整轮采集报废**：这一批只提取得到那一条帖子，
+ * 而且信息流滚不动，`scrollOnce()` 会判「已到底」，后面的批次全没了。
+ */
+async function recoverFromDetailView(page, feedUrl) {
+    let url = page.url();
+    let dialog = false;
+    try {
+        // 点击可能正好触发一次导航。导航在飞的时候任何 page.$ 都会以
+        // 「Execution context was destroyed」抛出来 —— **那本身就是「被带走了」的证据**，
+        // 别让它把整轮采集炸掉（实测：不接住的话采集脚本直接以 code=1 退出）
+        await page.waitForTimeout(800);
+        url = page.url();
+        dialog = !!(await page.$('[role="dialog"]'));
+    } catch (e) {
+        if (/has been closed|target closed|crashed/i.test(e.message)) throw e;
+        url = '';   // 当作「已经不在信息流上」处理
+    }
+    if (url !== feedUrl) {
+        log('   ⚠️ 折叠按钮把页面带进了帖子详情，已退回信息流，本轮不再展开这条主贴');
+        // 先试后退：重新载入会把滚动加载出来的后续内容全部冲掉，后退（单页应用的路由回退
+        // 或浏览器的往返缓存）通常能保住。后退回不到信息流才重载
+        try {
+            await page.goBack({ waitUntil: 'domcontentloaded', timeout: CONFIG.timeout });
+        } catch (e) {
+            if (/has been closed|target closed|crashed/i.test(e.message)) throw e;
+        }
+        if (page.url() !== feedUrl) await gotoPage(page, feedUrl, CONFIG.timeout);
+        return true;
+    }
+    if (dialog) {
+        log('   ⚠️ 折叠按钮弹出了浮层，已关闭，本轮不再展开这条主贴');
+        await page.keyboard.press('Escape');
+        await page.waitForTimeout(500);
+        // Esc 关不掉就只能重新载入信息流：浮层盖着的话这一批只看得到那一条帖子
+        if (await page.$('[role="dialog"]')) await gotoPage(page, feedUrl, CONFIG.timeout);
+        return true;
+    }
+    return false;
+}
 
 /**
  * 提取前把评论区的折叠点开 —— 和 expandBodies() 点的**正文**折叠是两回事。
@@ -236,31 +289,63 @@ const COMMENT_FOLD_ROUNDS = 8;
  */
 async function expandComments(page) {
     const count = (sel) => document.querySelectorAll(sel.comment).length;
+    const feedUrl = page.url();
+    const stale = [];       // 本批点了却没多出评论的主贴：这一批到底了，下一批可能又有新的
     let total = 0;
+    let exhausted = true;   // 是否是撞了轮次上限才停的
     for (let round = 1; round <= COMMENT_FOLD_ROUNDS; round++) {
         const before = await page.evaluate(count, SELECTORS);
-        const clicked = await page.evaluate((sel) => {
+        // **一次只展开一条主贴的折叠**。一次点一整批的话，万一其中一个把页面带走了，
+        // 根本不知道是哪一个，只能整批放弃 —— 一个坏按钮就让同批所有帖子的折叠全泡汤
+        const post = await page.evaluate(([sel, done]) => {
             const re = new RegExp(`^(${sel.commentFoldText})$`, sel.commentFoldFlags);
-            const btns = [...document.querySelectorAll(`${sel.post} [role="button"]`)]
-                .filter((el) => re.test(el.textContent.replace(/\s+/g, ' ').trim()));
-            btns.forEach((b) => b.click());
-            return btns.length;
-        }, SELECTORS);
-        if (!clicked) return total;
-        total += clicked;
+            const txt = (el) => el.textContent.replace(/\s+/g, ' ').trim();
+            const roots = [...document.querySelectorAll(sel.post)]
+                .filter((a) => !a.parentElement.closest(sel.post));
+            for (const art of roots) {
+                const link = art.querySelector(sel.postTime);
+                const m = link && (link.getAttribute('href') || '').match(/\/posts\/([^/?#]+)/);
+                const id = m ? m[1] : '';
+                if (!id || done.includes(id)) continue;
+                const btns = [...art.querySelectorAll('[role="button"]')]
+                    .filter((el) => re.test(txt(el)));
+                if (!btns.length) continue;
+                btns.forEach((b) => b.click());
+                return { id, clicked: btns.length };
+            }
+            return null;
+        }, [SELECTORS, [...detailPosts, ...stale]]);
+        if (!post) {
+            exhausted = false;
+            break;
+        }
+        total += post.clicked;
+        // **有的折叠不是就地展开，而是把帖子详情整个打开**（浮层，或直接换 URL）。
+        // 那样这一批就只剩下这一条帖子，信息流也滚不动了 —— 真站实测：点开折叠之后
+        // 「批次 1：提取 11 条」（正好是一条主贴加它的十来条评论），紧接着
+        // 「页面不再增长，已到底」，而同一页不点任何东西能滚出 45 条主贴。
+        // **信息流的完整性优先于多采几条回复**：退回去，把这条主贴拉黑，接着展开别的
+        if (await recoverFromDetailView(page, feedUrl)) {
+            detailPosts.add(post.id);
+            continue;
+        }
         try {
-            // 等评论真的多出来。点了却没变多说明这一页的折叠已经到底（或那个按钮
-            // 压根不是「加载更多」），再点下去只是空转
+            // 等评论真的多出来。点了却没变多说明这条主贴的折叠已经到底（或那个按钮
+            // 压根不是「加载更多」），换下一条，别在它身上空转
             await page.waitForFunction(
                 ([sel, n]) => document.querySelectorAll(sel.comment).length > n,
                 [SELECTORS, before], { timeout: 5000 });
         } catch (e) {
             if (/has been closed|target closed|crashed/i.test(e.message)) throw e;
-            return total;
+            stale.push(post.id);
         }
-        await humanDelay(CONFIG.delayMin, CONFIG.delayMax);
+        // 点「查看更多评论」是页面内的轻动作，不是翻页，所以用比 pacing 短的间隔 ——
+        // 一条帖子一条帖子地展开，用 4~11 秒的话一批就要好几分钟
+        await humanDelay(FOLD_CLICK_DELAY_MIN, FOLD_CLICK_DELAY_MAX);
     }
-    log(`   ⚠️ 评论折叠点了 ${COMMENT_FOLD_ROUNDS} 轮仍未见底，这一批的回复可能不全`);
+    if (exhausted) {
+        log(`   ⚠️ 评论折叠展开了 ${COMMENT_FOLD_ROUNDS} 轮仍未见底，这一批的回复可能不全`);
+    }
     return total;
 }
 

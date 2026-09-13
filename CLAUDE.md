@@ -176,6 +176,14 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 submit 按钮、Arkose 人机验证）、小组页 DOM 实测结论，以及已排除、不要再试的三条路。
 照着猜再叠选择器会白费很长时间。
 
+> **⛔ 采集器里任何「点按钮」的改动，fixture 通过不算验证。**fixture 编码的是**我们对真站
+> 的假设**，测试只会替假设作证。v1.11.0 把「点评论折叠 = 就地展开」写进 fixture，测试全绿；
+> 真站上某个「查看更多评论」会把页面带进帖子详情，于是**整轮采集只剩一条帖子**，连发四个版本
+> 都没发现（经过见 `docs/fixes/2026-09-13-fold-click-swallows-feed.md`）。所以：
+> ① 交付报告里把**对真站行为的每条假设**都列成未验项，不只是「选择器 / 文案未核实」；
+> ② 第一次真站运行才是验证，看的是「那一批提取到几条」而不是「点开了几处」；
+> ③ 一个现象要用两个原因解释时，先怀疑是同一个原因；归因前先做只改一个变量的对照实验。
+
 ## 帖子数据模型
 
 ```json
@@ -249,7 +257,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 
 ## 测试
 
-**411 个测试，必须全部 PASSED**（本机实测 `411 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
+**412 个测试，必须全部 PASSED**（本机实测 `412 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v

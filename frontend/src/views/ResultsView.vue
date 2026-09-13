@@ -327,7 +327,16 @@ function getStatusText(): string {
           :class="{ hit: t.root.matched }"
         >
           <header class="thread-head">
-            <span class="badge-role">主贴</span>
+            <!-- 排在树根的不一定是主贴：父贴没采到的回复也显示在这里（存储层只清父指针、
+                 不再抹平 reply_level，见存储红线）。标成「主贴」会让人以为原帖就长这样，
+                 而它恰恰是**唯一没有「🔗 原帖」链接**的那种卡片 —— 徽标得说清为什么 -->
+            <span
+              class="badge-role"
+              :class="{ 'is-orphan': t.root.reply_level > 0 }"
+              :title="t.root.reply_level > 0
+                ? '这是一条回复，它的主贴没有采到，所以单独显示在这里；也因此没有原帖链接'
+                : ''"
+            >{{ t.root.reply_level > 0 ? '回复（主贴缺失）' : '主贴' }}</span>
             <span class="badge-source">{{ t.root.source_name }}</span>
             <strong class="root-user">{{ t.root.username }}</strong>
             <span class="text-sm text-secondary">{{ postTime(t.root) }}</span>
@@ -501,6 +510,10 @@ function getStatusText(): string {
   background: var(--primary);
   color: #fff;
   letter-spacing: 0.5px;
+}
+/* 父贴缺失的那种：换个不抢眼的底色，一眼能和真主贴区分开 */
+.badge-role.is-orphan {
+  background: var(--text-secondary);
 }
 .root-user {
   font-size: 15px;

@@ -141,6 +141,35 @@ async function main() {
         check('文案是「🔗 原帖」', shown.every(a => a.text.includes('原帖')),
             shown.map(a => a.text).slice(0, 3));
 
+        console.log('\n场景二之二：排在树根的不一定是主贴');
+        // 父贴没采到的回复也显示在树根（存储层只清父指针、不抹平 reply_level）。
+        // 它是唯一没有「🔗 原帖」链接的卡片 —— 徽标必须说清为什么，
+        // 否则用户只会看到「这条主贴怎么没有链接」
+        // **断言由出口数据驱动，不由徽标自己驱动**：按徽标筛出「回复」再断言它们，
+        // 在没有这种行时是恒真的 —— 实测过，改动前 3 条里 2 条就这么空转通过了
+        const strayRows = task.roots.filter(p => p.reply_level > 0);
+        const heads = await page.evaluate(() => [...document.querySelectorAll('.thread')].map(t => ({
+            idx: (t.querySelector('.thread-head')?.textContent || '').match(/#(\d+)/)?.[1] || '',
+            role: (t.querySelector('.badge-role')?.textContent || '').trim(),
+            hasLink: !!t.querySelector('.thread-head a[data-testid="source-link"]'),
+        })));
+        console.log(`       首页 ${heads.length} 张卡片，出口里 ${strayRows.length} 行是`
+            + `「排在树根但本身是回复」（reply_level > 0）`);
+        if (!strayRows.length) {
+            console.log('       ⚠️ 这份数据里没有这种行，本场景无法验证（不是通过）');
+        }
+        for (const p of strayRows) {
+            const card = heads.find(h => h.idx === String(p.index));
+            check(`#${p.index} 标成「回复（主贴缺失）」而不是「主贴」`,
+                !!card && card.role.includes('回复（主贴缺失）'), card || heads.slice(0, 3));
+            check(`#${p.index} 没有原帖链接`, !!card && !card.hasLink, card);
+        }
+        // 反向：标成主贴的必须真的是主贴
+        const realRoots = new Set(task.roots.filter(p => p.reply_level === 0).map(p => String(p.index)));
+        check('标「主贴」的卡片在出口里 reply_level 都是 0',
+            heads.filter(h => h.role === '主贴').every(h => realRoots.has(h.idx)),
+            heads.filter(h => h.role === '主贴' && !realRoots.has(h.idx)));
+
         console.log('\n场景三：新标签页打开 + 断掉 opener');
         check('target=_blank', shown.every(a => a.target === '_blank'));
         // noopener 断掉新页面对 window.opener 的引用；noreferrer 不把本机地址带出去

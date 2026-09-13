@@ -431,12 +431,34 @@ function flatten(rawPosts, displayBatch) {
 }
 
 /** 无限滚动：往下滚一屏并等新内容渲染，返回是否还有增长 */
+// 滚到底之后等下一批插进来的预算。**分成几次「推一把」而不是一次长等**：Facebook 的
+// 懒加载靠滚动位置触发，插入新内容后页面变长、原来的「底」就不在底了，得再推一次
+const SCROLL_NUDGES = 3;
+const SCROLL_GROWTH_MS = 4000;
+
+/**
+ * 往下滚一屏并等新内容渲染，返回是否还有增长。
+ *
+ * **不能滚一次、等 2.5 秒就下结论**：信息流是懒加载的，慢一点就会被判成「已到底」，
+ * 整轮采集只看得到首屏。真站实测（用户那份数据，force_full 一轮）：
+ * 「批次 1：提取 8 条（含评论）」之后立刻「页面不再增长，已到底」，而那个小组库里
+ * 已经攒了 115 条主贴 —— 后果是同一轮里点开的 12 处折叠只有 1 条主贴吃得到。
+ *
+ * 轮询而不是一次长等：真到底时不必白等满 12 秒。等待期间不发任何请求，
+ * 只是把「多久算没有下一批」放宽 —— 与「像一个有耐心的真实用户」的姿态一致。
+ */
 async function scrollOnce(page) {
-    const before = await page.evaluate(() => document.body.scrollHeight);
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await page.waitForTimeout(2500);
-    const after = await page.evaluate(() => document.body.scrollHeight);
-    return after > before;
+    const height = () => page.evaluate(() => document.body.scrollHeight);
+    const before = await height();
+    for (let nudge = 0; nudge < SCROLL_NUDGES; nudge++) {
+        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+        const until = Date.now() + SCROLL_GROWTH_MS;
+        while (Date.now() < until) {
+            await page.waitForTimeout(500);
+            if (await height() > before) return true;
+        }
+    }
+    return false;
 }
 
 async function main() {

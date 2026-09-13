@@ -4963,7 +4963,10 @@ class TestFacebookLoginEndToEnd:
     def _posts(self):
         return self.storage.load_posts(["fixture_fb"])
 
-    def _run(self, base_url, username, password, incremental=False, progress=None):
+    def _run(self, base_url, username, password, incremental=False, progress=None,
+             max_batches=1):
+        """max_batches 默认 1 —— 多数用例只看首屏，多滚一轮就多等一次懒加载预算。
+        要验「第二屏」的用例自己传 2。"""
         import asyncio
         from app.collectors import get_collector
         from app.services.collector_runner import CollectorRunner
@@ -4983,7 +4986,7 @@ class TestFacebookLoginEndToEnd:
                     "base_url": base_url,
                     "headless": True,
                     "incremental": incremental,
-                    "max_batches": 1,
+                    "max_batches": max_batches,
                 },
                 "state_file": self.state,
                 "media_dir": self.media,
@@ -5181,6 +5184,31 @@ class TestFacebookLoginEndToEnd:
         )
         assert not c["content"].rstrip().endswith("…"), "截断省略号残留在正文末尾"
         assert "展开" not in c["content"] and "收起" not in c["content"]
+
+    def test_lazy_loaded_second_screen_is_not_declared_the_end(self):
+        """滚到底之后要等信息流把下一批插进来，别急着判「已到底」。
+
+        `scrollOnce()` 曾经是「滚一次 + 等 2.5 秒 + 比高度」，慢一点的懒加载就会被判成
+        到底，整轮采集只看得到首屏。真站实测（用户那份数据，force_full 一轮）：
+        「批次 1：提取 8 条（含评论）」之后立刻「页面不再增长，已到底」—— 而那个小组
+        库里已经攒了 115 条主贴。后果是**这一轮的所有修复只对首屏那几条生效**：
+        同一轮里点开了 12 处折叠，却只有 1 条主贴的回复数突破了原来的上限。
+
+        fixture 里第二屏那条 4 秒后才出现（比旧的 2.5 秒晚），而且**只有真滚到底才触发** ——
+        每批开头的 humanRead() 会先滚几下，挂在任意一次 scroll 上的话新内容会在提取
+        过程中就插进来，等 scrollOnce() 去量高度时反而量不出增长。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+
+        with site.LoginSite() as base_url:
+            # 这条必须给 2：默认 1 的话滚完就到上限了，第二屏永远轮不到
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, max_batches=2)
+
+        got = {p["message_id"] for p in data["posts"]}
+        assert "9003" in got, (
+            f"第二屏的帖子没采到 —— 滚动之后过早判定「已到底」：{sorted(got)}"
+        )
 
     def test_nested_reply_keeps_its_own_id_and_time(self):
         """嵌套回复的链接是 comment_id=父&reply_comment_id=自己 时，id 和时间都要是它自己的。

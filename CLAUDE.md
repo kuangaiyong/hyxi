@@ -249,7 +249,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 
 ## 测试
 
-**410 个测试，必须全部 PASSED**（本机实测 `410 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
+**411 个测试，必须全部 PASSED**（本机实测 `411 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v

@@ -138,6 +138,12 @@ _FEED_PAGE = """<html><head><meta charset="utf-8"><title>小组</title></head><b
     <div data-ad-comet-preview="message" id="folded"><span>Firmware 2.4.1 heeft…
       <div role="button" tabindex="0" onclick="unfold()">展开</div></span></div>
   </div>
+  <!-- 撑高页面：真站的信息流很长，滚到底才会触发懒加载。两条都要满足：
+       ① 页面不够高的话 window.scrollTo() 压根不产生 scroll 事件；
+       ② **必须高过 humanRead() 能滚到的距离**（每批开头 2~4 次、每次 300~900px，
+       最多 3600px）—— 否则每批一开头就滚到底了，懒加载的内容会在提取过程中插进来，
+       scrollOnce() 反而量不出增长，测试就变成对旧代码也成立的空转（实测踩过） -->
+  <div id="spacer" style="height:8000px"></div>
 </div>
 <script>
 function unfold() {
@@ -190,6 +196,28 @@ function moreComments() {
 // 「自带 id」的形态，两种都要认。只认 comment_id 的话，回复拿到的是父评论的 id ——
 // message_id 撞车，入库时按 id 归并，父评论的作者和正文被回复覆盖；时间锚点的标记也
 // 由 id 派生，回复连时间都继承了父评论的
+// 信息流是懒加载的：滚到底之后，下一批要过一会儿才插进来。**真站上比 2.5 秒慢** ——
+// 实测一轮只提取到 8 条就宣布「页面不再增长，已到底」，而那个小组有一百多条帖子，
+// 于是每次采集都只看得到首屏。这里故意让它 4 秒后才出现，钉住「要等，别急着判到底」
+var lazyArmed = false;
+window.addEventListener('scroll', function () {
+  // **只有真滚到底才触发**，和真站一致。挂在任意一次 scroll 上是不对的：
+  // 每批开头的 humanRead() 会先滚几下，那样新内容会在提取过程中就插进来，
+  // 等 scrollOnce() 去量高度时它已经在里面了 —— 反而量不出「增长」
+  var atBottom = window.scrollY + window.innerHeight >= document.body.scrollHeight - 50;
+  if (lazyArmed || !atBottom) return;
+  lazyArmed = true;
+  setTimeout(function () {
+    document.querySelector('[role="feed"]').insertAdjacentHTML('beforeend',
+      '<div role="article">'
+      + '<a href="/groups/2407063016436085/user/88/" aria-label="Wouter_L"></a>'
+      + '<a href="/groups/2407063016436085/user/88/">Wouter_L</a>'
+      + '<a href="/groups/2407063016436085/posts/9003/" aria-label="2天"'
+      + ' data-tip="2026年6月1日周一09:12"><span>2天</span></a>'
+      + '<div data-ad-comet-preview="message">Tweede scherm vol, dit kwam pas na het scrollen.</div>'
+      + '</div>');
+  }, 4000);
+});
 function moreReplies() {
   var fold = document.getElementById('replyfold');
   fold.insertAdjacentHTML('beforebegin', newComment(

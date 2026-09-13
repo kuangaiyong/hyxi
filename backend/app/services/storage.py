@@ -1006,8 +1006,14 @@ def merge_duplicate_posts() -> None:
                 )
                 repointed += 1
                 continue
+            # **只清父指针，reply_level 保持原样**：它显示在树根，但它本身仍然是一条回复。
+            # 这两件事曾经被混为一谈，代价是出口再也分不出「真主贴」和「丢了父贴的回复」——
+            # 而后者的 message_id 是 comment_id，「🔗 原帖」给它拼出的
+            # /permalink/<comment_id>/ 点开既不是这条回复也不是它的主贴（评审在真实库上
+            # 实测：65 条带链接的主贴里 2 条是这样）。树位置由父指针决定（build_tree 只看
+            # 父指针），导出那条路的层级由 order_by_thread() 按深度重算，所以留着不影响呈现
             conn.execute(
-                "UPDATE posts SET parent_fingerprint=NULL, reply_level=0 "
+                "UPDATE posts SET parent_fingerprint=NULL "
                 "WHERE source_id=? AND fingerprint=?",
                 (src, r["fingerprint"]),
             )
@@ -1088,9 +1094,11 @@ def drop_empty_posts(posts: List[dict]) -> List[dict]:
         if post.get("fingerprint") in dropped:
             continue
         if post.get("parent_fingerprint") in dropped:
+            # 只清父指针，reply_level 保持 —— 理由同 merge_duplicate_posts() 那一处：
+            # 「显示在树根」和「它本身是主贴」是两回事，混为一谈会让「🔗 原帖」
+            # 给一条回复拼出用 comment_id 做的帖子链接
             post = dict(post)
             post["parent_fingerprint"] = None
-            post["reply_level"] = 0
         kept.append(post)
     logger.info("丢弃 %d 条无正文无配图的帖子，保留 %d 条", len(dropped), len(kept))
     return kept

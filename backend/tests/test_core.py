@@ -2549,7 +2549,14 @@ class TestStablePostIdentityEndToEnd:
         assert len(rows) == 1
         assert rows[0]["parent_fingerprint"] is None, \
             f"悬空 parent 还留着: {rows[0]['parent_fingerprint']}"
-        assert rows[0]["reply_level"] == 0, "提成主贴了，层级也要跟着回到 0"
+        # **层级保持 1**：它显示在树根，但它本身仍然是一条回复。
+        # 这两件事曾经被混为一谈（提升时把 reply_level 一起归 0），代价是
+        # 出口再也分不出「真主贴」和「丢了父贴的回复」—— 新加的「🔗 原帖」链接
+        # 于是给这类行拼出 /permalink/<comment_id>/，点开不是任何一条帖子。
+        # 树位置由父指针决定（build_tree 只看 parent），导出那条路的层级由
+        # order_by_thread() 按深度重算，所以留着 1 不影响任何呈现
+        assert rows[0]["reply_level"] == 1, \
+            "它是一条丢了父贴的回复，不是主贴 —— 层级不能跟着归 0"
 
     def test_the_merge_is_idempotent_and_source_agnostic(self):
         """两个来源各自合并、互不干扰；反复跑不该有任何动静。
@@ -2791,7 +2798,8 @@ class TestStablePostIdentityEndToEnd:
         self.storage.merge_duplicate_posts()
 
         r = {x["fingerprint"]: x for x in self._rows()}["R1"]
-        assert r["parent_fingerprint"] is None and r["reply_level"] == 0
+        # 父指针清掉（不留悬空），但 reply_level 保持 —— 它显示在树根，本身仍是回复
+        assert r["parent_fingerprint"] is None and r["reply_level"] == 1
 
     def test_an_alias_from_another_source_is_not_used(self):
         """别名只在来源内有效：指纹不含来源，别的来源里同名的别名不能拿来认亲"""

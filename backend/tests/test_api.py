@@ -1279,6 +1279,41 @@ class TestPostSourceUrlEndToEnd:
         finally:
             self.storage.save_source(self.fb)
 
+    def test_an_orphaned_reply_shown_at_root_gets_no_link(self):
+        """丢了父贴的回复会显示在树根，但**不能**给它「🔗 原帖」链接。
+
+        存储层的两处「提升」（`merge_duplicate_posts()` 的悬空 parent、
+        `drop_empty_posts()` 丢掉空父贴时）只清父指针，`message_id` 原样留着 ——
+        而那是它的 **comment_id**。出口若只凭「排在树根」就当它是主贴，拼出来的
+        `/permalink/<comment_id>/` 点开既不是这条回复、也不是它的主贴。
+        评审在开发库上实测：65 条带链接的主贴里有 2 条是这样。
+
+        判据是 `reply_level`：它显示在哪儿由父指针决定，它**是什么**由层级决定。
+        """
+        self.storage.upsert_posts(self.fb["id"], [
+            {"username": "Jean Charbon", "timestamp": "02-08-2026 23:29",
+             "content": "Foutclearing eens uitvoeren? Misschien helpt dat.",
+             "page_number": 2, "fingerprint": "orphanreply",
+             "message_id": "2496723817470004",          # 这是评论 id，不是帖子 id
+             "source": self.fb["id"], "parent_fingerprint": None, "reply_level": 1},
+        ])
+        try:
+            resp = self.client.get(f"/api/v1/tasks/{self.task_id}/posts")
+            assert resp.status_code == 200, resp.text
+            roots = resp.json()["posts"]
+            orphan = [p for p in roots if p["username"] == "Jean Charbon"]
+            assert orphan, "父指针为空的回复应当出现在树根（build_tree 只看父指针）"
+            assert orphan[0]["reply_level"] == 1, "它本身仍是回复，层级不该被抹平"
+            assert orphan[0]["source_url"] == "", (
+                f"给一条丢了父贴的回复拼出了主贴链接：{orphan[0]['source_url']}"
+            )
+        finally:
+            conn = self.storage._get_conn()
+            conn.execute("DELETE FROM posts WHERE source_id=? AND fingerprint=?",
+                         (self.fb["id"], "orphanreply"))
+            conn.commit()
+            conn.close()
+
     def test_post_url_is_not_stored_in_the_posts_table(self):
         """链接现算，不落库 —— 存一份就是双写，历史数据也不会凭空长出这一列"""
         conn = self.storage._get_conn()

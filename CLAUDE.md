@@ -10,11 +10,11 @@ HYXi 舆情分析平台 — 对荷兰 Tweakers.net 论坛的 HYXi Halo 家用储
 
 开发机是 **Windows**，Python 版本与 `C:\code\video_evaluation_new` 项目保持一致：**3.12**，依赖装在 `backend\.venv` 内，一律通过 venv 里的解释器调用。
 
-环境搭建 —— **`pytest` 不在 `requirements.txt` 里，跑测试必须单独装**：
+环境搭建 —— **`pytest` 及其并行 / 覆盖率插件都不在 `requirements.txt` 里，跑测试必须单独装**：
 
 ```powershell
 py -3.12 -m venv backend\.venv
-.\backend\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt pytest
+.\backend\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt pytest pytest-xdist pytest-cov
 npm ci
 cd frontend; npm install
 ```
@@ -259,11 +259,55 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 
 ## 测试
 
-**443 个测试，必须全部 PASSED**（本机实测 `443 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
+**473 个测试，交付前必须全部 PASSED**（本机实测 `473 passed`）。但**全量只在最后一次代码改动之后跑一次**
+—— 质量红线的另一半是：它之前的每一轮改动，都要跑到受影响的范围。
 
-```powershell
-.\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
-```
+### 什么时候跑什么（在仓库根目录）
+
+| 时机 | 跑什么 | 命令 | 本机实测 |
+|---|---|---|---|
+| 写用例、红 → 绿 → 反向验证 | 那一两条 | `pytest backend\tests\test_core.py::TestX::test_y` | 秒级~1 分钟 |
+| 一轮修改收尾 | 受影响的用例 | `python scripts\test_impact.py run` | 改舆情服务：151 条 **46 秒**；改采集脚本：82 条 9 分 40 秒（其中 54 条浏览器，省不掉） |
+| 想先要个快信号 | 快道（不起浏览器的 415 条） | `pytest backend\tests -m "not browser" -n 3 --dist loadgroup` | **48 秒**（当时 407 条） |
+| **交付前（最后一次代码改动之后）** | 全量 + 刷新映射 | `python scripts\test_impact.py build` | 约 12 分钟，全过才写映射，和代码一起提交 |
+| 只要全量结论、不刷映射 | 全量 | `pytest backend\tests -n 3 --dist loadgroup` | **10 分 30 秒左右**（连跑 3 轮 10:30 / 10:29 / 12:02；串行 31 分钟） |
+
+（`pytest` = `.\backend\.venv\Scripts\python.exe -m pytest`，`python` = `.\backend\.venv\Scripts\python.exe`）
+
+- **真站 / 打包验证排在最终全量之前**：它们可能逼出新改动，排在后面就得再跑一遍全量
+  （v1.12.0 实测：一个任务跑了 5 次 30 分钟的全量，其中至少 4 次可以省）
+- **版本号、文档、skill 改动不触发测试**；受影响范围拿不准，就全量
+- **并行里挂了先单独串行复跑那一条**分清是改动的问题还是并行的问题；**不许装失败重试插件糊过去**，
+  查到根因（多半是时序等待在 CPU 争抢下不够）。4 核 7.7 GB 本机 `-n 3`；真站采集在跑时别并行跑浏览器用例
+
+### 按改动精准选测（`scripts/test_impact.py`）
+
+`select` 只打印选中了哪些、为什么；`run` 选完直接并行跑；`--paths 文件…` 不看 git 直接指定。**宁多勿少**：
+
+- 查的是 `backend/tests/impact_map.json`（提交进仓库）：哪条用例执行过哪个文件。**改了映射里没有的源文件、测试地基
+  （`pytest.ini`、`conftest.py`、依赖清单、`config.py` / `paths.py`、脚本本身）→ 全量**；映射建好之后新增的用例一律跑；
+  改测试文件按改动行选（落在类的辅助方法上跑整类，落在模块顶层跑整个文件）；前端 / 打包只提示该跑哪条 E2E、验包
+- **重建映射**：`python scripts\test_impact.py build`（本机约 12 分钟，本身就是一次全量，全过才写映射，写完自动跑健康检查）。
+  **交付前那次全量就用它跑**，映射和代码一起提交 —— 映射里记着建它那一刻每个源文件、测试文件的内容哈希，
+  之后只要有文件改过却不在当次改动里（改了调用关系又提交了、没重建），选测就判映射过期、直接全量：
+  否则再改被新调用的那个文件时，按旧映射会静默漏跑，结论照样显示「选中 N 条」
+- **映射按进程归属，不按线程上下文记**：接口用例经 TestClient 调路由，路由跑在它自己开的线程里，pytest-cov 按用例切
+  覆盖率上下文只管当前线程 —— 实测那样建出来 93 条接口用例只有 8 条关联得上文件，改路由会漏跑全部接口用例。
+  现在按「有 setup_class 的类整类一个进程、其余每 5 条一个进程」跑；采集脚本在 node 子进程里，按进程设 `NODE_V8_COVERAGE`；
+  被当数据读的（fixture 的 HTML / JSON、塞给浏览器的采集脚本源码）按文本引用补
+- 回归见 `backend/tests/test_impact.py`：选测规则逐条钉住 + 两道护栏（没有源文件会被当成文档跳过；映射还认得
+  接口路由、采集脚本、fixture 数据这些关键依赖）。v1.12.0 那 8 处反向验证、35 条新增用例回放全部选中
+
+### 会话级护栏（`backend/tests/conftest.py`、仓库根 `pytest.ini`）
+
+- **测试会话默认指向临时数据目录**（`TWEAKERS_DATA_DIR` / `TASKS_DIR` / `EXPORTS_DIR`，在任何 app 模块导入之前设好）。
+  以前「测试不写真实库」靠的是 test_api.py 恰好排在最前面、`setup_class` 先改路径再导入 orchestrator，单跑某个类、
+  并行打乱顺序时就没了（`TestSuiteDataIsolation` 守）
+- `browser` 标记给起真 Chrome 的 5 个类（快慢分道用，漏标只影响快道快不快）；有 `setup_class` 的类打 `xdist_group`，
+  并行时整类留在一个进程。**标记钩子必须 `tryfirst`**：xdist 在 worker 里读分组的钩子按注册顺序会先跑，
+  那时标记还没打上，分组整个不生效（实测 `TestAPIEndpointsEndToEnd` 被拆到两个进程）
+- `pytest.ini` 只为钉住 rootdir：命令行里混进一个仓库外的路径（比如 `--cov-config 临时文件` 分开写），rootdir 会
+  漂到盘符根，nodeid 变成 `code/hyxi/backend/…`，`--deselect` 和选测映射全对不上（实测）
 
 **前端没有单元测试框架**（package.json 里无 vitest / jest / @vue/test-utils），
 六条前端回归靠真浏览器守，都在 `frontend/e2e/` 下：
@@ -294,7 +338,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\test_core.py::TestSearchFilteringEndToEnd -v
 ```
 
-测试文件自己做了 `sys.path.insert`，没有 conftest.py / pytest.ini。覆盖：任务生命周期持久化、舆情解析、摘要构建、时间戳归一化、Excel 生成、帖子 ID 提取、指纹去重、增量逻辑、LLM 工具函数、舆情 Excel、搜索过滤、原子写入、日志配置、API 端点集成（TestClient 真实请求）。
+测试文件自己做了 `sys.path.insert`；`conftest.py` / `pytest.ini` 只放上面那几道会话级护栏。覆盖：任务生命周期持久化、舆情解析、摘要构建、时间戳归一化、Excel 生成、帖子 ID 提取、指纹去重、增量逻辑、LLM 工具函数、舆情 Excel、搜索过滤、原子写入、日志配置、API 端点集成（TestClient 真实请求）。
 
 ## 前端
 

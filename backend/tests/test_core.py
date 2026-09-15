@@ -35,6 +35,70 @@ def _use_temp_db(tmpdir):
     return storage_module, restore
 
 
+class TestSuiteDataIsolation:
+    """测试会话默认就指向临时数据目录，不靠「哪个类恰好排在最前面、先改路径再 import」。
+
+    串行跑全量时，是 test_api.py 排第一、setup_class 先改 data_dir 再 import orchestrator 才没写进真实库；
+    单跑某个类、或并行打乱顺序时这层保护就没了 —— orchestrator 一导入就对当时的库 init_db / 迁移 / 归并
+    （test_api.py 里记着：实测往生产库里写进过 3 条测试任务）。tasks_dir / exports_dir 是类定义时从真实
+    数据目录算好的默认值，只盖 data_dir 管不到它们。
+    """
+
+    def test_session_defaults_point_at_a_temp_data_dir(self):
+        from app.config import settings
+        from app.paths import data_dir
+        from app.services import storage
+
+        real = os.path.normcase(os.path.realpath(data_dir()))
+        for name, path in (("data_dir", settings.data_dir), ("tasks_dir", settings.tasks_dir),
+                           ("exports_dir", settings.exports_dir), ("DB_PATH", storage.DB_PATH)):
+            p = os.path.normcase(os.path.realpath(path))
+            assert p != real and not p.startswith(real + os.sep), f"测试会话默认的 {name} 落在真实数据目录里：{path}"
+
+    def test_log_file_inside_the_session_dir_is_closed_before_the_dir_is_removed(self):
+        """应用的滚动日志写在会话临时目录里，收尾时句柄还开着 —— Windows 上删不掉，rmtree 的错误又被吞了，
+        每跑一次 pytest（并行时每个 worker、建映射时上百个进程）就留下一个目录（实测攒了 21 个）"""
+        import logging
+        import conftest
+
+        d = tempfile.mkdtemp(prefix="hyxi-handler-probe-")
+        handler = logging.FileHandler(os.path.join(d, "app.log"), encoding="utf-8")
+        logger = logging.getLogger("hyxi.session-dir-probe")
+        logger.addHandler(handler)
+        logger.warning("probe")
+        try:
+            conftest.close_file_handlers_under(d)
+            shutil.rmtree(d)
+            assert not os.path.exists(d)
+        finally:
+            logger.removeHandler(handler)
+            handler.close()
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_leftover_session_dirs_from_earlier_runs_are_cleared(self):
+        """以前删不掉留下的会话目录，下次开会话时清掉；正在跑的别的会话（并行的 worker）目录还新，不许动"""
+        import time
+        import conftest
+
+        root = tempfile.mkdtemp(prefix="hyxi-leftover-root-")
+        try:
+            old = os.path.join(root, "hyxi-test-data-old")
+            os.makedirs(os.path.join(old, "logs"))
+            fresh = os.path.join(root, "hyxi-test-data-fresh")
+            os.makedirs(fresh)
+            unrelated = os.path.join(root, "someone-elses-dir")
+            os.makedirs(unrelated)
+            past = time.time() - 3 * 3600
+            for path in (old, unrelated):
+                os.utime(path, (past, past))
+            conftest.remove_stale_session_dirs(root, max_age_seconds=2 * 3600)
+            assert not os.path.exists(old), "几小时前的会话目录没清掉"
+            assert os.path.exists(fresh), "还新的会话目录（可能是正在跑的 worker）被删了"
+            assert os.path.exists(unrelated), "删到了不是测试会话的目录"
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
 class TestTaskLifecycleEndToEnd:
     """任务生命周期：真实 JSON 文件持久化"""
 

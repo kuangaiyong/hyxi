@@ -109,6 +109,8 @@ class FacebookGroupCollector(Collector):
             "incremental": params.get("incremental", True),
             # 增量去重的锚点由 Python 下发。脚本不再读旧落盘文件 —— 那份文件已经不存在了
             "known_fingerprints": source.get("known_fingerprints") or [],
+            # 主贴 message_id → 库里已有的评论与回复条数，决定要不要打开帖子补齐
+            "known_comment_counts": source.get("known_comment_counts") or {},
             "output_path": output_path,
             "state_file": source.get("state_file") or self.session_path(source),
             # 正文图落盘根目录。脚本在下面按 source_id 分子目录，images 字段存

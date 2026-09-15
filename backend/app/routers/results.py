@@ -150,6 +150,7 @@ def _to_post_data(post: dict, index: int, names: dict, matched: bool = False,
         matched=matched,
         images=post.get("images") or [],
         image_desc=post.get("image_desc") or "",
+        site_comment_count=post.get("site_comment_count"),
     )
 
 

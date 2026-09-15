@@ -2848,6 +2848,199 @@ class TestStablePostIdentityEndToEnd:
             "把没有 id 也没有正文的空壳存进来了"
 
 
+class TestCommentThreadStorageEndToEnd:
+    """回复的层级、原帖评论数、浮层残留主贴 —— 真库、真 SQL（v1.12.0）"""
+
+    # 临时库与造数工具借用上一个类的；不用继承，否则它的用例会在这里再跑一遍
+    setup_method = TestStablePostIdentityEndToEnd.setup_method
+    teardown_method = TestStablePostIdentityEndToEnd.teardown_method
+    _post = staticmethod(TestStablePostIdentityEndToEnd._post)
+    _rows = TestStablePostIdentityEndToEnd._rows
+    _insert_raw = TestStablePostIdentityEndToEnd._insert_raw
+
+    def test_full_rerun_repairs_a_flattened_reply(self):
+        """历史上被压平挂在主贴下的回复，全量重跑时父指针与层级要被改写成对的。
+
+        v1.12.0 之前所有回复都存成「主贴下第 1 层」（真实库 306 行里第 2 层 0 条）。
+        层级只有重采才知道，所以不写迁移；靠的是重采时 UPDATE 把两列一起写回。
+        seq / 译文 / 舆情标记是花钱换来的，一个都不能动。
+        """
+        root = self._post("P1", "MP", content="主贴")
+        comment = self._post("C1", "MC", content="评论", parent_fingerprint="P1", reply_level=1)
+        flat = self._post("R1", "MR", content="回复的回复", parent_fingerprint="P1", reply_level=1)
+        self.storage.upsert_posts("src_x", [root, comment, flat])
+        conn = self.storage._get_conn()
+        conn.execute("UPDATE posts SET translation='译文', translated=1, sentiment_at='2026-09-01T10:00:00' "
+                     "WHERE source_id='src_x' AND fingerprint='R1'")
+        conn.commit()
+        conn.close()
+        before = {r["fingerprint"]: r for r in self._rows()}["R1"]
+
+        fixed = self._post("R1", "MR", content="回复的回复", parent_fingerprint="C1", reply_level=2)
+        self.storage.upsert_posts("src_x", [fixed])
+
+        after = {r["fingerprint"]: r for r in self._rows()}["R1"]
+        assert (after["parent_fingerprint"], after["reply_level"]) == ("C1", 2), after
+        for col in ("seq", "translation", "translated", "sentiment_at"):
+            assert after[col] == before[col], f"{col} 被重采冲掉了"
+
+    def test_site_comment_count_survives_a_round_that_cannot_read_it(self):
+        """原帖评论数这一轮读不到（按钮没渲染出来）时，库里上一轮读到的不许被冲成空。"""
+        self.storage.upsert_posts("src_x", [self._post("P1", "MP", site_comment_count=6)])
+        assert self.storage.load_posts(["src_x"])[0]["site_comment_count"] == 6
+
+        self.storage.upsert_posts("src_x", [self._post("P1", "MP")])
+        assert self.storage.load_posts(["src_x"])[0].get("site_comment_count") == 6, "空值冲掉了原帖评论数"
+
+        self.storage.upsert_posts("src_x", [self._post("P1", "MP", site_comment_count=7)])
+        assert self.storage.load_posts(["src_x"])[0]["site_comment_count"] == 7, "读到的新数没写进去"
+
+    def test_an_existing_database_gains_the_comment_count_columns(self):
+        """升级上来的老库没有这两列，启动时必须补上，否则读写都报 no such column"""
+        conn = self.storage._get_conn()
+        conn.execute("ALTER TABLE posts DROP COLUMN site_comment_count")
+        conn.execute("ALTER TABLE posts DROP COLUMN harvested_site_count")
+        conn.commit()
+        conn.close()
+
+        self.storage.init_db()
+        self.storage.upsert_posts("src_x", [self._post("P1", "MP", site_comment_count=3)])
+        assert self.storage.load_posts(["src_x"])[0]["site_comment_count"] == 3
+        self.storage.record_thread_counts("src_x", {"MP": {"harvested_site_count": 4}})
+        assert self.storage.known_comment_counts("src_x") == {"MP": 4}
+
+    def test_thread_counts_refresh_a_root_the_collector_does_not_send_again(self):
+        """增量运行时老主贴不会再作为帖子下发，原帖评论数只能靠 thread_counts 刷新。
+
+        不刷新的话「已采 X · 原帖 Y」的 Y 永远停在第一次采到时：原帖从 6 条涨到 8 条、
+        这一轮又没补齐，页面上照样是「6 · 6」不标黄 —— 正好把不全藏起来。
+        """
+        self.storage.upsert_posts("src_x", [
+            self._post("P1", "MP", site_comment_count=6),
+            # 丢了父贴的回复：父指针空但层级不为 0，message_id 是评论 id，不是主贴
+            self._post("O1", "MO", content="父贴没采到的回复", reply_level=1),
+        ])
+        self.storage.upsert_posts("src_y", [self._post("Q1", "MP", site_comment_count=2)])
+
+        self.storage.record_thread_counts("src_x", {
+            "MP": {"site_comment_count": 8, "harvested_site_count": 8},
+            "MO": {"site_comment_count": 5},
+        })
+        by = {p["fingerprint"]: p for p in self.storage.load_posts(["src_x", "src_y"])}
+        assert by["P1"]["site_comment_count"] == 8, "老主贴的原帖评论数没有刷新"
+        assert by["O1"].get("site_comment_count") is None, "回复不该带原帖评论数"
+        assert by["Q1"]["site_comment_count"] == 2, "别的来源里同一个 id 的帖子被改了"
+
+        # 这一轮读不到数（按钮没渲染出来）不许冲掉上一轮读到的
+        self.storage.record_thread_counts("src_x", {"MP": {"site_comment_count": None}})
+        assert self.storage.load_posts(["src_x"])[0]["site_comment_count"] == 8
+        assert self.storage.known_comment_counts("src_x")["MP"] == 8, "整串读完时的原帖数被空值冲掉了"
+
+    def test_known_comment_counts_take_the_count_a_thread_was_fully_read_at(self):
+        """整串读完过、原帖数却永远对不上的主贴（被「最相关」藏掉的、删了没减数的），
+        「库里已有」取整串读完时原帖显示的数：原帖数没涨就不再打开，涨了才开。
+        没读完过的只算子树条数 —— 拿原帖数顶上去的话，上一轮没补成的这一轮也不补了。"""
+        self.storage.upsert_posts("src_x", [
+            self._post("P1", "MP1", content="读完过、差 1 条"),
+            self._post("C1", "MC1", content="评论", parent_fingerprint="P1", reply_level=1),
+            self._post("C2", "MC2", content="评论", parent_fingerprint="P1", reply_level=1),
+            self._post("P2", "MP2", content="没读完过", site_comment_count=6),
+            self._post("C3", "MC3", content="评论", parent_fingerprint="P2", reply_level=1),
+            self._post("P3", "MP3", content="读完时比现在少"),
+            self._post("C4", "MC4", content="评论", parent_fingerprint="P3", reply_level=1),
+            self._post("C5", "MC5", content="评论", parent_fingerprint="P3", reply_level=1),
+        ])
+        self.storage.record_thread_counts("src_x", {
+            "MP1": {"site_comment_count": 3, "harvested_site_count": 3},
+            "MP3": {"site_comment_count": 1, "harvested_site_count": 1},
+        })
+
+        assert self.storage.known_comment_counts("src_x") == {"MP1": 3, "MP2": 1, "MP3": 2}
+
+    def test_merging_duplicates_keeps_the_thread_counts(self):
+        """同一条主贴的重复行合并时，原帖评论数与整串读完时的原帖数跟着规范身份走"""
+        self.storage.upsert_posts("src_x", [self._post("P1", "MP")], merge_by_message_id=False)
+        self.storage.upsert_posts("src_x", [self._post("P2", "MP", content="编辑过")],
+                                  merge_by_message_id=False)
+        conn = self.storage._get_conn()
+        conn.execute("UPDATE posts SET site_comment_count=7, harvested_site_count=7 "
+                     "WHERE source_id='src_x' AND fingerprint='P2'")
+        conn.commit()
+        conn.close()
+
+        self.storage.merge_duplicate_posts()
+
+        rows = self._rows()
+        assert [r["fingerprint"] for r in rows] == ["P1"]
+        assert (rows[0]["site_comment_count"], rows[0]["harvested_site_count"]) == (7, 7)
+
+    def test_known_comment_counts_count_every_reply_under_its_root(self):
+        """「库里已有几条」按主贴 message_id 数整棵子树 —— 原帖那个数字同样含回复的回复。"""
+        self.storage.upsert_posts("src_x", [
+            self._post("P1", "MP1", content="主贴一"),
+            self._post("C1", "MC1", content="评论", parent_fingerprint="P1", reply_level=1),
+            self._post("R1", "MR1", content="回复", parent_fingerprint="C1", reply_level=2),
+            self._post("R2", "MR2", content="回复的回复", parent_fingerprint="R1", reply_level=3),
+            self._post("P2", "MP2", content="主贴二"),
+            self._post("P3", "", content="没 id 的主贴"),
+            self._post("C3", "MC3", content="挂在没 id 主贴下", parent_fingerprint="P3", reply_level=1),
+            # 丢了父贴的回复：显示在树根，但 message_id 是评论 id，不是帖子
+            self._post("O1", "MO1", content="父贴没采到的回复", reply_level=1),
+        ])
+        self.storage.upsert_posts("src_y", [self._post("Q1", "MP1", content="别的来源同一个 id")])
+
+        assert self.storage.known_comment_counts("src_x") == {"MP1": 3, "MP2": 0}
+
+    def _raw_root(self, fp, seq, mid, username, timestamp, content, src="src_x"):
+        conn = self.storage._get_conn()
+        conn.execute(
+            """INSERT INTO posts (source_id, fingerprint, seq, username, timestamp,
+               content, page_number, message_id, parent_fingerprint, reply_level)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (src, fp, seq, username, timestamp, content, 1, mid, None, 0),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_a_leftover_dialog_root_is_merged_into_its_real_post(self):
+        """浮层残留：没 id、没时间的主贴，作者和正文与一条带 id 的主贴逐字相同 → 并过去。
+
+        浮层里的主贴头部没有 /posts/ 链接，旧版本在浮层开着时提取信息流，就把它存成了
+        一条没 id、没 hover 到时间的「新主贴」，浮层里的评论全挂在它下面。真实库里
+        「Hugo van Touw」那条就是：有 id 的一行挂 1 条评论，没 id 的一行挂 5 条。
+        """
+        self._raw_root("REAL", 10, "M1", "Hugo van Touw", "12-09-2026 08:00", "Wie heeft ervaring?")
+        self._raw_root("LEFT", 50, "", "Hugo van Touw", "", "Wie heeft ervaring?")
+        self._insert_raw("K1", parent="LEFT", seq=51, mid="MK1")
+        self._insert_raw("K2", parent="REAL", seq=11, mid="MK2")
+        conn = self.storage._get_conn()
+        conn.execute("UPDATE posts SET translation='谁有经验？', translated=1 "
+                     "WHERE source_id='src_x' AND fingerprint='LEFT'")
+        conn.commit()
+        conn.close()
+
+        self.storage.merge_duplicate_posts()
+
+        rows = {r["fingerprint"]: r for r in self._rows()}
+        assert "LEFT" not in rows, "浮层残留的主贴还在"
+        assert rows["K1"]["parent_fingerprint"] == "REAL", "残留主贴下的评论没挂回真主贴"
+        assert rows["REAL"]["translation"] == "谁有经验？", "只在残留行上的译文跟着删掉了"
+        assert "LEFT" in self.storage.known_fingerprints("src_x"), "被并掉的指纹要进别名表"
+
+    def test_a_leftover_root_that_matches_nothing_is_kept(self):
+        """对不上的只留着、不删 —— 没 id 没时间不等于是垃圾，可能只是那一轮没读到"""
+        self._raw_root("REAL", 10, "M1", "Hugo van Touw", "12-09-2026 08:00", "Wie heeft ervaring?")
+        self._raw_root("LONE", 20, "", "匿名", "", "Olá pessoal, alguém tem o inversor?")
+        # 两条带 id 的主贴都对得上时说不清是哪一条，也不并
+        self._raw_root("TWIN1", 30, "M2", "Jan", "01-09-2026 10:00", "Zelfde tekst")
+        self._raw_root("TWIN2", 31, "M3", "Jan", "02-09-2026 10:00", "Zelfde tekst")
+        self._raw_root("AMBI", 40, "", "Jan", "", "Zelfde tekst")
+
+        self.storage.merge_duplicate_posts()
+
+        assert {"LONE", "AMBI"} <= {r["fingerprint"] for r in self._rows()}
+
+
 class TestPostsStorageEndToEnd:
     """posts 表：seq 是全链路的顺序锚点，upsert 不能碰已处理标记"""
 
@@ -4363,6 +4556,30 @@ class TestStartPageReachesCollectorJobEndToEnd(_ScraperTmpRoot):
         })["job"]
         assert job["pacing"] == {"delay_min": 4000, "delay_max": 11000}
 
+    def test_job_carries_a_deadline_ahead_of_the_kill(self):
+        """job 里要有采集时限，而且早于 runner 杀进程的那一刻。
+
+        超时是直接杀进程：交接文件还没写，整轮一条都不入库。脚本只有知道「几点前收尾」
+        才能按退出码 2 把已采到的交出来（facebook_group.js 读它）。
+        """
+        if not _HAS_NODE:
+            import pytest
+            pytest.skip("未安装 node")
+        import time
+
+        before = time.time()
+        job = self._execute()["job"]
+        timeout = self.mod.SUBPROCESS_TIMEOUT
+        assert isinstance(job.get("deadline_at"), int), job.get("deadline_at")
+        assert (before + timeout * 0.8) * 1000 - 1000 <= job["deadline_at"] < (time.time() + timeout) * 1000
+
+    def test_deadline_margin(self):
+        """默认 30 分钟提前 3 分钟收尾；超时调得很短时最多让出 20%，别一启动就过点"""
+        from app.services.collector_runner import collect_deadline_ms
+
+        assert collect_deadline_ms(1000.0, 1800) == (1000 + 1620) * 1000
+        assert collect_deadline_ms(1000.0, 300) == (1000 + 240) * 1000
+
     def test_llm_cannot_reach_collector_params_at_all(self):
         """collect 步骤只把 source_id 交给编排层，LLM 给的其它参数一律不进 job。
 
@@ -4887,11 +5104,14 @@ class TestCommentFoldPatternsEndToEnd:
         "2 Replies", "Jan replied · 2 replies", "View More Replies",
         "Meer reacties weergeven", "Alle 3 antwoorden bekijken", "2 antwoorden bekijken",
         "Meer antwoorden weergeven", "Jan heeft gereageerd · 3 antwoorden",
+        # 2026-09-13 真站实测：那条原帖 6 条、只采到 1 条的主贴，折叠就叫「查看更多回答」
+        "查看更多回答", "查看之前的回答", "查看全部回答",
+        "View more answers", "View previous answers", "View all answers",
     ]
     # 误点的后果：「分享」弹对话框、「回复/评论」打开输入框、计数标签可能跳去帖子详情页
     NEVER = [
-        "回复", "赞", "分享", "评论", "发送", "展开", "收起", "最相关", "12 条评论", "12",
-        "Reply", "Like", "Share", "Comment", "See more", "Most relevant", "3 comments",
+        "回复", "回答", "赞", "分享", "评论", "发送", "展开", "收起", "最相关", "12 条评论", "12",
+        "Reply", "Answer", "Like", "Share", "Comment", "See more", "Most relevant", "3 comments",
         "Reageren", "Vind ik leuk", "Delen", "Beantwoorden", "Meer weergeven", "3 reacties",
     ]
 
@@ -4929,6 +5149,104 @@ class TestCommentFoldPatternsEndToEnd:
         assert res["wrong"] == [], f"这些动作按钮会被误点：{res['wrong']}"
 
 
+class TestThreadDialogExtractionEndToEnd:
+    """帖子浮层开着的时候提取信息流，浮层里的 article 一条都不许算进来 —— 真 Chrome 打真 fixture
+
+    采集流程保证点开的浮层都会被关掉（关不掉就重新载入），所以在完整跑一轮的用例里
+    「浮层开着时提取」这件事根本发生不了，那条排除规则写错了也测不出来。这里直接把页面
+    摆成那个状态，调脚本里**原样取出**的提取函数。
+
+    浮层里的主贴头部没有 /posts/ 链接（2026-09-13 真站实测），旧版本在浮层开着时提取，
+    它就成了一条没 id、没时间的新主贴 —— 真实库里「Hugo van Touw」那条的来路。
+    """
+
+    def _extract(self, scope, prep=""):
+        """prep：浮层打开后、提取之前在页面里执行的一段 JS，用来把 DOM 摆成要测的形态"""
+        import pytest
+        import subprocess
+        from app.config import settings
+
+        if not _HAS_NODE:
+            pytest.skip("未安装 node")
+        if not os.path.exists(os.path.join(settings.project_root, "node_modules", "playwright")):
+            pytest.skip("项目根目录未安装 playwright")
+        sys.path.insert(0, _FIXTURES_DIR)
+        import login_site
+
+        src = open(os.path.join(settings.project_root, "collectors", "facebook_group.js"),
+                   encoding="utf-8").read()
+        start = src.index("const SELECTORS = {") + len("const SELECTORS = ")
+        selectors = src[start:src.index("\n};", start) + 2]
+        fn_start = src.index("function extractInPage(")
+        fn = src[fn_start:src.index("\nasync function extractBatch", fn_start)]
+        js = r"""
+const { chromium } = require('playwright');
+const vm = require('vm');
+(async () => {
+  const S = vm.runInNewContext('(' + process.env.SEL + ')');
+  const extract = vm.runInNewContext('(' + process.env.FN + ')');
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const context = await browser.newContext();
+    await context.addCookies([{ name: process.env.COOKIE, value: '1', url: process.env.BASE }]);
+    const page = await context.newPage();
+    await page.goto(process.env.BASE + '/groups/2407063016436085');
+    await page.evaluate(() => openThread('9004'));
+    await page.waitForSelector('[role="dialog"] [role="article"] [role="article"]');
+    if (process.env.PREP) await page.evaluate(process.env.PREP);
+    const got = await page.evaluate(extract, { sel: S, scope: process.env.SCOPE });
+    // 没 id 也没正文的（广告卡片）由 flatten() 里的 isNotAPost() 丢掉，这里按同一个口径先滤掉
+    const posts = got.posts.filter((p) => p.message_id || (p.content || '').trim());
+    console.log(JSON.stringify(posts.map((p) => ({
+      id: p.message_id, user: p.username, comments: p.comments.map((c) => c.message_id),
+      parents: p.comments.map((c) => (c.parent >= 0 ? p.comments[c.parent].message_id : null)),
+    }))));
+  } finally {
+    await browser.close();
+  }
+})().catch((e) => { console.error(e); process.exit(1); });
+"""
+        with login_site.LoginSite() as base_url:
+            env = dict(os.environ, SEL=selectors, FN=fn, BASE=base_url, SCOPE=scope,
+                       COOKIE=login_site.SESSION_COOKIE, PREP=prep)
+            out = subprocess.run(["node", "-e", js], env=env, cwd=settings.project_root,
+                                 capture_output=True, text=True, encoding="utf-8", timeout=120)
+        assert out.returncode == 0, out.stderr
+        return json.loads(out.stdout.strip().splitlines()[-1])
+
+    def test_feed_extraction_skips_the_open_dialog(self):
+        posts = self._extract("feed")
+        assert [p for p in posts if not p["id"]] == [], f"浮层里的主贴被当成了信息流主贴：{posts}"
+        assert [p["id"] for p in posts] == ["9001", "9004", "9002", "9005", "9007", "9006"], posts
+        card = [p for p in posts if p["id"] == "9004"][0]
+        assert card["comments"] == ["5606"], f"浮层里的评论混进了卡片：{card}"
+
+    def test_dialog_extraction_takes_only_the_dialog(self):
+        posts = self._extract("dialog")
+        assert len(posts) == 1 and posts[0]["user"] == "Sofie_M", posts
+        # 「查看更多回复」还没点：浮层里此刻是 5 条
+        assert posts[0]["comments"] == ["5601", "5602", "5603", "5604", "5606"], posts
+
+    def test_reply_whose_top_comment_is_missing_is_not_hung_under_a_guess(self):
+        """回复的链接说它属于 5601，5601 却不在浮层里（折叠没点完、被「最相关」藏掉）：
+        按缩进它会挂到排在前面的 5606 下 —— 那是「回复挂错人」，比挂主贴糟，所以挂主贴。
+        挂了主贴的那条回复，它自己的回复照样挂它，不能跟着被拍平。
+        """
+        # 把 5606 那一行挪到 5601 的位置、5601 拿掉
+        prep = """(() => {
+          const dlg = document.getElementById('thread-dialog');
+          const own = (id) => [...dlg.querySelectorAll('a[href]')]
+            .find((a) => a.getAttribute('href').endsWith('?comment_id=' + id)).closest('[role="article"]');
+          own('5601').parentElement.replaceWith(own('5606').parentElement);
+        })()"""
+        posts = self._extract("dialog", prep)
+        root = posts[0]
+        assert root["comments"] == ["5606", "5602", "5603", "5604"], root
+        assert root["parents"] == [None, None, "5602", "5602"], (
+            f"找不到链接指向的顶层评论时，回复挂到了按缩进猜的那条下：{root}"
+        )
+
+
 class TestFacebookLoginEndToEnd:
     """登录 / 会话复用 / 两步验证退出路径 —— 真 Chrome 打真带登录门的本地站点。
 
@@ -4964,9 +5282,9 @@ class TestFacebookLoginEndToEnd:
         return self.storage.load_posts(["fixture_fb"])
 
     def _run(self, base_url, username, password, incremental=False, progress=None,
-             max_batches=1):
+             max_batches=1, deadline_at=None):
         """max_batches 默认 1 —— 多数用例只看首屏，多滚一轮就多等一次懒加载预算。
-        要验「第二屏」的用例自己传 2。"""
+        要验「第二屏」的用例自己传 2。deadline_at（毫秒时间戳）不给就由 runner 按任务超时算。"""
         import asyncio
         from app.collectors import get_collector
         from app.services.collector_runner import CollectorRunner
@@ -4992,6 +5310,8 @@ class TestFacebookLoginEndToEnd:
                 "media_dir": self.media,
                 "pacing": {"delay_min": 200, "delay_max": 400},
             }
+            if deadline_at is not None:
+                source["deadline_at"] = deadline_at
             loop = asyncio.new_event_loop()
             try:
                 return loop.run_until_complete(
@@ -5018,12 +5338,13 @@ class TestFacebookLoginEndToEnd:
             data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
 
         assert data["complete"] is True, data.get("stop_reason")
-        assert len(data["posts"]) == 8          # 3 主贴 + 3 顶层评论 + 2 嵌套回复
+        # 6 主贴 + 评论与回复：9001 的 5 条 + 9004 浮层里的 6 条 + 9005 固定链接补齐的 4 条
+        assert len(data["posts"]) == 21
         assert os.path.exists(self.state), "会话文件没有落盘，下一轮还得再输一次密码"
 
         roots = [p for p in data["posts"] if not p["parent_fingerprint"]]
         comments = [p for p in data["posts"] if p["parent_fingerprint"]]
-        assert len(roots) == 3 and len(comments) == 5
+        assert len(roots) == 6 and len(comments) == 15
         assert comments[0]["reply_level"] == 1
         import re
         assert re.match(r"^\d{2}-\d{2}-\d{4} \d{2}:\d{2}$", roots[0]["timestamp"])
@@ -5093,7 +5414,7 @@ class TestFacebookLoginEndToEnd:
         blank = [p for p in data["posts"]
                  if not p["message_id"] and not (p["content"] or "").strip()]
         assert blank == [], f"广告 article 被存成了空帖: {blank}"
-        assert len(data["posts"]) == 8, "丢空帖时把真帖子也带走了"
+        assert len(data["posts"]) == 21, "丢空帖时把真帖子也带走了"
 
     def test_multi_paragraph_comment_keeps_every_paragraph(self):
         """评论的多段正文必须全取，而且不能把嵌套回复的正文吞进来。
@@ -5148,15 +5469,19 @@ class TestFacebookLoginEndToEnd:
 
         root = [p for p in data["posts"] if p["message_id"] == "9001"][0]
         folded = [p for p in data["posts"] if p["message_id"] in ("5503", "5505")]
-        nested = [p for p in data["posts"] if p["message_id"] == "5504"][0]
+        parent = [p for p in data["posts"] if p["message_id"] == "5501"][0]
         # 折叠出来的评论必须是**完整的一条帖子**，不能是只有 id 的空壳
         for p in folded:
             assert p["parent_fingerprint"] == root["fingerprint"], "折叠评论挂错了主贴"
             assert p["reply_level"] == 1 and p["username"] and p["content"]
             assert p["timestamp"], "折叠出来的评论没取到时间（tooltip 没 hover 到）"
-        assert nested["parent_fingerprint"] == root["fingerprint"], (
-            "嵌套回复必须挂在主贴上 —— 存储层是扁平的，嵌套只在出口组装"
-        )
+        # 嵌在 5501 里的回复挂 5501、第 2 层。这里曾经断言「挂主贴」，理由写的是「存储层是扁平的」
+        # —— 那句误读了红线：扁平说的是一张表 + 父指针，不是父指针只能指主贴。页面上
+        # 「回复的回复」于是全被压成了评论（真实库 306 行里第 2 层 0 条）
+        for mid in ("5502", "5504"):
+            nested = [p for p in data["posts"] if p["message_id"] == mid][0]
+            assert nested["parent_fingerprint"] == parent["fingerprint"], f"{mid} 没挂到它回复的 5501 下"
+            assert nested["reply_level"] == 2, f"{mid} 的层级被压平了：{nested['reply_level']}"
         # 按钮文字不许进正文：它们是界面文案，而 content 前 100 字进指纹
         for p in data["posts"]:
             for ui in ("查看更多评论", "查看 1 条回复", "条回复"):
@@ -5185,15 +5510,16 @@ class TestFacebookLoginEndToEnd:
         assert not c["content"].rstrip().endswith("…"), "截断省略号残留在正文末尾"
         assert "展开" not in c["content"] and "收起" not in c["content"]
 
-    def test_a_fold_that_opens_the_post_detail_does_not_swallow_the_feed(self):
-        """有的折叠按钮会把帖子详情整个打开（浮层 / 换 URL），必须退回信息流。
+    def test_a_fold_that_navigates_away_does_not_swallow_the_feed(self):
+        """折叠按钮要是把整页带走了（不是浮层），必须退回信息流，而且不能在别的页面上提取。
 
         真站实测（v1.11.0~v1.11.3）：点开折叠之后「批次 1：提取 11 条（含评论）」——
         正好是**一条主贴加它十来条评论**，紧接着「页面不再增长，已到底」，
-        而同一页不点任何东西能滚出 45 条主贴。也就是说这个「多采几条回复」的修复
-        **把整轮采集赔进去了**：每轮只剩一条帖子。信息流的完整性优先。
+        而同一页不点任何东西能滚出 45 条主贴。整轮采集只剩一条帖子。
+        （后来查明真站那是浮层，见浮层那几条用例；整页跳走没在真站见过，但点完不检查的
+        后果是整轮报废，所以这条退路一直要有人守着。）
 
-        fixture 里 9004 那条的折叠按钮会弹浮层并把信息流藏起来。
+        fixture 里 9006 的折叠一点就整页跳到详情页，5801 只在那一页上有。
         """
         self._skip_unless_ready()
         site = self._login_site()
@@ -5202,14 +5528,489 @@ class TestFacebookLoginEndToEnd:
             data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
 
         got = {p["message_id"] for p in data["posts"]}
-        # 详情页上只有 9004 和它的一条评论 —— 不退回信息流的话，实测采到的就只有
-        # {'5601', '9004'}，另外两条主贴和信息流里的评论全没了
-        assert {"9001", "9002", "9004"} <= got, f"信息流被详情页吞了：{sorted(got)}"
-        assert {"5501", "5502"} <= got, f"信息流里的评论也跟着没了：{sorted(got)}"
-        # **代价要说清**：退回信息流会把这一批已经展开的折叠一起丢掉（页面重载了），
-        # 所以 5503/5505 这些折叠里的评论这一轮采不到。信息流的完整性优先 ——
-        # 少几条回复是「下一轮再补」，整个信息流没了是「这一轮白跑」
-        assert "5601" not in got, "详情页里的评论不该混进来 —— 那说明还留在详情页上"
+        assert {"9001", "9002", "9004", "9005", "9006", "9007"} <= got, f"信息流被详情页吞了：{sorted(got)}"
+        assert "5801" not in got, "详情页上的评论混进来了 —— 说明是在详情页上提取的"
+        # 退回来是重新载入：9001 已经就地展开的折叠会一起丢掉。v1.11.4 那一版的说法是
+        # 「这一轮采不到、下一轮再补」—— 下一轮是同样的结果。退回来之后要接着展开
+        assert {"5501", "5502", "5503", "5504", "5505"} <= got, (
+            f"退回信息流后没有把丢掉的折叠重新展开：{sorted(got)}"
+        )
+
+    def test_thread_dialog_is_harvested_with_the_original_structure(self):
+        """点「查看更多回答」弹出的浮层要就地收割：评论与回复全部入库，层级和原帖一样。
+
+        真站那条主贴（2534929036982815）原帖 6 条，v1.11.4 只采到卡片上露出来的 1 条：
+        折叠文案叫「回答」，模式里只有「评论 / 回复」，按钮从来没被点过；认得出的折叠点下去
+        弹浮层，v1.11.4 又把它当事故退回来并整轮拉黑。浮层里的回复是兄弟节点、只有缩进
+        看得出层级，提取器却一律写成「主贴下第 1 层」。
+
+        顺带钉住浮层确实被关掉了：浮层盖着信息流时，排在后面的主贴 hover 不到时间。
+        同一轮顺带验原帖评论数（R3-S1），省一次浏览器。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+        server = site.LoginSite()
+        progress = _RecordingProgress()
+
+        with server as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, progress=progress)
+
+        assert data["complete"] is True, data.get("stop_reason")
+        by = {p["message_id"]: p for p in data["posts"] if p["message_id"]}
+        want = {
+            "5601": ("9004", 1), "5602": ("5601", 2), "5603": ("5602", 3),
+            "5604": ("5602", 3), "5605": ("5601", 2), "5606": ("9004", 1),
+        }
+        missing = sorted(set(want) - set(by))
+        assert not missing, f"浮层里的评论 / 回复没采到：{missing}"
+        for mid, (parent, level) in want.items():
+            got = (by[mid]["parent_fingerprint"], by[mid]["reply_level"])
+            assert got == (by[parent]["fingerprint"], level), (
+                f"{mid} 应挂 {parent}、第 {level} 层，实际挂 "
+                f"{[k for k, v in by.items() if v['fingerprint'] == got[0]]}、第 {got[1]} 层"
+            )
+        assert by["5603"]["timestamp"] == "31-05-2026 12:41", "浮层里的回复没 hover 到时间"
+        assert len(by["5601"].get("images") or []) == 1, "浮层里评论的配图没存下来"
+        assert server.thread_requests.count("dialog:9004") == 1, server.thread_requests
+        assert "more:9004" in server.thread_requests, "浮层里的「查看更多回复」没点"
+
+        # 浮层关掉了、信息流还能用：后面的主贴照常采到，时间照常 hover 得到
+        assert by["9005"]["timestamp"] == "29-05-2026 08:15", "浮层没关，后面的主贴 hover 不到时间"
+        assert by["9006"]["timestamp"] == "30-05-2026 14:05"
+        # 浮层里的主贴头部没有 /posts/ 链接，被当成信息流主贴收进来就是一行没 id 的重复
+        orphan_roots = [p for p in data["posts"] if not p["parent_fingerprint"] and not p["message_id"]]
+        assert orphan_roots == [], f"浮层里的主贴被当成了一条新主贴：{orphan_roots}"
+
+        counts = {mid: by[mid].get("site_comment_count") for mid in ("9001", "9004", "9005", "9002", "9006")}
+        assert counts == {"9001": 5, "9004": 6, "9005": 4, "9002": None, "9006": None}, counts
+        assert by["5601"].get("site_comment_count") is None, "评论不该带原帖评论数"
+
+        # 9007 的折叠打开的是 9008 的浮层：地址对不上就不收，9008 的评论绝不能挂到 9007 下
+        assert "dialog:9008" in server.thread_requests, "前置条件：9007 的折叠没被点，这一条等于没测"
+        stolen = [p["message_id"] for p in data["posts"] if p["parent_fingerprint"] == by["9007"]["fingerprint"]]
+        assert stolen == [], f"别的帖子的评论挂到了 9007 下：{stolen}"
+        assert not {"5901", "5902"} & set(by), "别的帖子浮层里的评论被收进来了"
+        assert any("对不上主贴 9007" in m for m in progress.messages), progress.messages
+
+    def test_post_without_a_fold_is_completed_from_its_permalink(self):
+        """原帖评论数对不上、卡片上又没有折叠可点的主贴，本轮信息流滚完后按固定链接补齐。
+
+        固定链接整页打开是**首页信息流上盖一层浮层**（2026-09-13 真站实测），背景里是别的
+        小组的帖子：只能从浮层里取。
+        5704 的链接说它回的是 5701，位置却排在 5703 后面、缩进和回复一样 —— 按缩进会挂到
+        5703 下。链接是 Facebook 自己给的关系，以它为准，并在日志里报出不一致。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+        server = site.LoginSite()
+        progress = _RecordingProgress()
+
+        with server as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, progress=progress)
+
+        assert data["complete"] is True, data.get("stop_reason")
+        assert "permalink:9005" in server.thread_requests, server.thread_requests
+        by = {p["message_id"]: p for p in data["posts"] if p["message_id"]}
+        want = {"5701": ("9005", 1), "5702": ("5701", 2), "5703": ("9005", 1), "5704": ("5701", 2)}
+        missing = sorted(set(want) - set(by))
+        assert not missing, f"固定链接补齐没补上：{missing}"
+        for mid, (parent, level) in want.items():
+            assert (by[mid]["parent_fingerprint"], by[mid]["reply_level"]) == (
+                by[parent]["fingerprint"], level), f"{mid} 应挂 {parent}、第 {level} 层"
+        assert by["5702"]["timestamp"] == "29-05-2026 09:20"
+        assert not {"9999", "9998"} & set(by), "固定链接页背景里别的小组的帖子被收进来了"
+        assert any("不一致" in m for m in progress.messages), (
+            f"层级与链接对不上却没在日志里说：{progress.messages}"
+        )
+
+    def test_permalink_that_fails_to_load_is_skipped_without_failing_the_run(self):
+        """固定链接补齐只是兜底：某一条打不开（网络类失败）只跳过这一条并说出来，整轮照样完整。
+
+        放在主流程的 try 里不单独兜的话，一条补齐失败就把整轮判成残缺（退出码 2），
+        任务显示「异常退出」，stop_reason 还是一段 Playwright 的原始报错 —— 而信息流明明滚完了，
+        少的只是那一条的几条回复，结果页的「已采 X · 原帖 Y」本来就会把它标黄。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+        server = site.LoginSite(permalink_failure="network")
+        progress = _RecordingProgress()
+
+        with server as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, progress=progress)
+
+        assert "permalink:9005" in server.thread_requests, "前置条件：没去打开固定链接，这一条等于没测"
+        assert data["complete"] is True, data.get("stop_reason")
+        assert any("9005" in m and "跳过" in m for m in progress.messages), progress.messages
+        got = {p["message_id"] for p in data["posts"]}
+        assert {"5601", "5605", "5701"} <= got, f"补齐失败连累了已经采到的：{sorted(got)}"
+        assert not {"5702", "5703", "5704"} & got
+
+    def test_permalink_refused_by_the_site_still_stops_the_run(self):
+        """补齐时站点明确拒绝访问（限流），照样停下 —— 对方说停就停，兜底不许吞掉它。
+
+        已经采到的先入库（退出码 2 的约定）。
+        """
+        self._skip_unless_ready()
+        import pytest
+        site = self._login_site()
+        server = site.LoginSite(permalink_failure="blocked")
+
+        with server as base_url:
+            with pytest.raises(Exception) as e:
+                self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
+
+        assert "code=2" in str(e.value) and "拒绝访问" in str(e.value), str(e.value)
+        assert server.thread_requests.count("permalink:9005") == 2, (
+            f"限流应当退让一次、再被拒就停：{server.thread_requests}"
+        )
+        got = {p["message_id"] for p in self._posts()}
+        assert {"9001", "9004", "5601", "9005"} <= got, f"已经采到的没有入库：{sorted(got)}"
+
+    def test_rate_limit_backoff_that_would_run_past_the_deadline_stops_right_away(self):
+        """被限流、而对方要求的退让会越过采集时限：当场停下交出已采到的，不去睡那一觉。
+
+        时限只比任务超时早 3 分钟，退让却最多睡 5 分钟 —— 睡醒之前 runner 已经按超时把进程杀了，
+        交接文件没写，整轮一条不剩（D5 要防的正是这个）。
+        """
+        self._skip_unless_ready()
+        import pytest
+        import time
+        site = self._login_site()
+        server = site.LoginSite(permalink_failure="blocked")
+        server.permalink_retry_after = 600
+        started = time.time()
+
+        with server as base_url:
+            with pytest.raises(Exception) as e:
+                self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD,
+                          deadline_at=int((started + 120) * 1000))
+        elapsed = time.time() - started
+
+        assert "permalink:9005" in server.thread_requests, (
+            f"前置条件：时限前没走到固定链接补齐，这一条等于没测：{server.thread_requests}"
+        )
+        assert "code=2" in str(e.value) and "拒绝访问" in str(e.value), str(e.value)
+        assert server.thread_requests.count("permalink:9005") == 1, (
+            f"退让会越过时限，还是睡完又打了一次：{server.thread_requests}"
+        )
+        assert elapsed < 120, f"退让睡过了采集时限：整轮用了 {elapsed:.0f} 秒"
+        got = {p["message_id"] for p in self._posts()}
+        assert {"9001", "9004", "5601", "9005"} <= got, f"已经采到的没有入库：{sorted(got)}"
+
+    def test_dialog_that_will_not_close_falls_back_to_reloading_the_feed(self):
+        """浮层用关闭按钮 / Esc / 后退都关不掉时，重新载入信息流，并在日志里说清。
+
+        留在浮层上的后果见 v1.11.0 那次：整轮只剩一条帖子。浮层开着时提取信息流，
+        浮层里那条头部没有 /posts/ 链接的主贴还会被当成一条没 id 的新主贴收进来。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+        progress = _RecordingProgress()
+
+        with site.LoginSite(sticky_dialog=True) as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, progress=progress)
+
+        assert data["complete"] is True, data.get("stop_reason")
+        assert any("重新载入" in m for m in progress.messages), progress.messages
+        by = {p["message_id"]: p for p in data["posts"] if p["message_id"]}
+        # 关不掉之前已经收割到的不能丢；重新载入冲掉的就地折叠要重新展开
+        assert {"5601", "5602", "5603", "5604", "5605", "5606"} <= set(by), sorted(by)
+        assert {"5503", "5504", "5505"} <= set(by), sorted(by)
+        assert by["9005"]["timestamp"] and by["9006"]["timestamp"], "重新载入后信息流还是被盖着"
+        orphan_roots = [p for p in data["posts"] if not p["parent_fingerprint"] and not p["message_id"]]
+        assert orphan_roots == [], f"在浮层上提取了信息流：{orphan_roots}"
+
+    def test_dialog_whose_harvest_fails_is_skipped_without_failing_the_run(self):
+        """浮层收割到一半页面调用失败：只放弃这一串、关掉浮层接着采，信息流后面的照样要。
+
+        真站上可能是浮层里点了什么触发整页跳转、页面上下文被销毁；fixture 让 9004 浮层里的 article
+        查询直接抛错来稳定复现。不兜的话异常一路冒到 main —— 首轮一条都还没交出去，整轮按退出码 1
+        硬失败，而这条主贴每轮都会再点、再失败。固定链接那条路早就逐条兜住了，信息流这条漏了。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+        server = site.LoginSite(broken_dialog=True)
+        progress = _RecordingProgress()
+
+        with server as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, progress=progress)
+
+        assert "dialog:9004" in server.thread_requests, "前置条件：9004 的浮层没打开，这一条等于没测"
+        assert data["complete"] is True, data.get("stop_reason")
+        assert any("9004" in m and "出错" in m for m in progress.messages), progress.messages
+        got = {p["message_id"] for p in data["posts"]}
+        # 5606 是 9004 卡片上露的那条；5702 只在 9005 的固定链接页上有：出错之后信息流滚完、补齐也照常走了
+        assert {"9001", "9004", "5606", "9002", "9005", "5702"} <= got, f"一串收割失败连累了整轮：{sorted(got)}"
+        orphan_roots = [p for p in data["posts"] if not p["parent_fingerprint"] and not p["message_id"]]
+        assert orphan_roots == [], f"浮层没关就提取了信息流：{orphan_roots}"
+
+    def test_dialog_whose_address_has_no_trailing_slash_is_harvested(self):
+        """浮层地址不带末尾斜杠（2026-09-15 真站实测 /permalink/2476737042802015）照样是这条主贴的，要收。
+
+        拿 `/<id>/` 去比会判成「地址对不上、这一串不收」，只能等信息流滚完按固定链接整页补 ——
+        到了时限就补不上，还白开了一次浮层。**评论最后齐不齐断不出这个 bug**：固定链接补齐会把它
+        补回来，所以断言「没退到固定链接」。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+        server = site.LoginSite(slashless_thread_url=True)
+        progress = _RecordingProgress()
+
+        with server as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, progress=progress)
+
+        assert "dialog:9004" in server.thread_requests, "前置条件：9004 的浮层没打开，这一条等于没测"
+        assert "permalink:9004" not in server.thread_requests, (
+            f"浮层地址没带末尾斜杠就不收，退到了固定链接整页补：{server.thread_requests}"
+        )
+        assert not any("对不上主贴 9004" in m for m in progress.messages), progress.messages
+        got = {p["message_id"] for p in data["posts"]}
+        assert {"5601", "5602", "5603", "5604", "5605"} <= got, sorted(got)
+
+    def test_dialog_whose_comments_arrive_after_the_post_is_harvested_in_full(self):
+        """浮层先出主贴、评论随后才取回来时，要等评论到了再收割。
+
+        一出现主贴就收的话，浮层里一个折叠都还没渲染出来，这一串被当成「整串读完」记下原帖数 ——
+        原帖数不涨就再也不打开，差的评论永远采不到；收到的空串还把卡片上露出来的那条顶掉。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+        server = site.LoginSite(deferred_thread_comments=2000)
+
+        with server as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
+
+        assert "items:9004" in server.thread_requests, "前置条件：浮层的评论区没去取，这一条等于没测"
+        got = {p["message_id"] for p in data["posts"]}
+        missing = sorted({"5601", "5602", "5603", "5604", "5605", "5606"} - got)
+        assert not missing, f"评论还没取回来就收割了浮层：{missing}"
+
+    def test_dialog_whose_comments_never_arrive_is_completed_from_the_permalink(self):
+        """浮层里评论一直没加载出来、卡片上却露过评论：这一串不收，信息流滚完后按固定链接补。
+
+        当成「浮层里确实没有评论」收一个空串的话，卡片上那条被顶掉，还被记成整串读完 —— 原帖数不涨就再也不补。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+        server = site.LoginSite(deferred_thread_comments=-1)
+
+        with server as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
+
+        assert "dialog:9004" in server.thread_requests, "前置条件：9004 的浮层没打开，这一条等于没测"
+        assert "permalink:9004" in server.thread_requests, (
+            f"浮层里评论没加载出来，却没有按固定链接补：{server.thread_requests}"
+        )
+        got = {p["message_id"] for p in data["posts"]}
+        missing = sorted({"5601", "5602", "5603", "5604", "5605", "5606"} - got)
+        assert not missing, f"评论没加载出来的浮层被当成了空串：{missing}"
+
+    def test_a_hidden_leftover_dialog_does_not_take_the_clicks(self):
+        """页面上藏着一个关掉后没拿走的旧浮层（排在文档前面）时，展开折叠、关浮层都要认开着的那个。
+
+        认错的话「查看更多回复」点在旧浮层上，开着的浮层被判成折叠已经点完、按整串读完记账，
+        后面那几条回复这一轮采不到、以后原帖数不涨也不会再来补。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+        server = site.LoginSite(hidden_stale_dialog=True)
+
+        with server as base_url:
+            data = self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
+
+        got = {p["message_id"] for p in data["posts"]}
+        assert "more:9004" in server.thread_requests and "5605" in got, (
+            f"浮层里的「查看更多回复」点到了藏着的旧浮层上：{server.thread_requests}"
+        )
+        # 关闭按钮点空了的话要等 3 秒再按 Esc 才关得掉（真站上 Esc 不灵就一路退到重新载入信息流）
+        closes = [r for r in server.thread_requests if r.startswith("close:")]
+        assert "close:button" in closes and "close:esc" not in closes, f"关闭按钮点到了藏着的旧浮层上：{closes}"
+
+    def test_a_fold_that_only_makes_the_feed_grow_is_not_clicked_again(self):
+        """点完折叠后页面上 article 变多了，得是这条主贴自己多出了评论才算「就地展开了」。
+
+        数整页的话，信息流恰好懒加载进一条新帖就被当成展开成功，同一个没用的折叠被反复点到
+        轮次上限（30 轮），这一批别的主贴的折叠轮不到，日志还报「仍未见底」。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+        server = site.LoginSite(dead_fold_card=True)
+
+        with server as base_url:
+            self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD)
+
+        assert server.thread_requests.count("fold:9010") == 1, (
+            f"只让信息流变长的折叠被反复点了：{server.thread_requests.count('fold:9010')} 次"
+        )
+
+    def test_incremental_run_does_not_reopen_threads_that_are_complete(self):
+        """增量运行时，原帖评论数不比库里多的主贴不再打开；全量重跑照样全部打开。
+
+        浮层和固定链接都是真实的请求。日常定时增量每轮都把老帖再开一遍，访问量翻几倍，
+        和「像一个有耐心的真实用户」的姿态冲突。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+        server = site.LoginSite()
+
+        # 只看 9004 / 9005 自己的：9007 读不到原帖评论数，按规矩每轮都会点它的折叠
+        mine = ("dialog:9004", "more:9004", "permalink:9005")
+        with server as base_url:
+            self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, incremental=False)
+            first = [r for r in server.thread_requests if r in mine]
+            self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, incremental=True)
+            after_incremental = [r for r in server.thread_requests if r in mine]
+            self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, incremental=False)
+
+        assert first.count("dialog:9004") == 1 and first.count("permalink:9005") == 1, first
+        assert after_incremental == first, (
+            f"增量运行又去打开了评论数已经对得上的帖子：{after_incremental[len(first):]}"
+        )
+        again = [r for r in server.thread_requests if r in mine][len(after_incremental):]
+        assert again.count("dialog:9004") == 1 and again.count("permalink:9005") == 1, (
+            f"全量重跑没有忽略库里已有的数：{again}"
+        )
+
+    def test_thread_whose_count_never_matches_is_reopened_only_when_the_count_grows(self):
+        """原帖评论数永远比浮层里看得到的多（被「最相关」藏掉的、删了没减数的），这种主贴
+        整串读过一次、原帖数没变就不再打开；原帖数涨了才再开。
+
+        只拿「库里已有几条」比的话，差的那条永远采不到，每一轮增量都把它再开一遍 ——
+        日常定时任务里访问量白白翻倍。顺带钉住老主贴的原帖数要跟着刷新：增量运行时它们
+        不会再作为帖子下发，Y 停在第一次采到时，涨了之后采不全也不标黄。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+        server = site.LoginSite()
+        mine = ("dialog:9004", "permalink:9005")
+
+        def opened():
+            return [r for r in server.thread_requests if r in mine]
+
+        with server as base_url:
+            self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, incremental=False)
+            first = opened()
+            # 原帖各多出 1 条，浮层里却看不到
+            server.hidden_comments = 1
+            self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, incremental=True)
+            second = opened()[len(first):]
+            counts = {p["message_id"]: p.get("site_comment_count") for p in self._posts()
+                      if p["message_id"] in ("9004", "9005")}
+            self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, incremental=True)
+            third = opened()[len(first) + len(second):]
+
+        assert first == ["dialog:9004", "permalink:9005"], first
+        assert sorted(second) == ["dialog:9004", "permalink:9005"], f"原帖数涨了却没有再打开：{second}"
+        assert counts == {"9004": 7, "9005": 5}, f"增量运行没有刷新老主贴的原帖评论数：{counts}"
+        assert third == [], f"整串读过、原帖数没变，增量运行还是又打开了：{third}"
+
+    def test_thread_cut_short_by_the_deadline_is_reopened_in_the_next_incremental_run(self):
+        """上一轮没补成（到了时限没来得及开）的主贴，下一轮增量要接着补。
+
+        「不再打开」只能认「整串读完过」，不能认「库里记着原帖数」：后者上一轮没补成也有。
+        """
+        self._skip_unless_ready()
+        import time
+        import pytest
+        site = self._login_site()
+        server = site.LoginSite()
+
+        with server as base_url:
+            with pytest.raises(Exception):
+                self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD,
+                          deadline_at=int(time.time() * 1000) - 1000)
+            assert server.thread_requests == [], "前置条件：第一轮就打开了帖子，这一条等于没测"
+            self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, incremental=True)
+
+        assert "dialog:9004" in server.thread_requests and "permalink:9005" in server.thread_requests, (
+            f"上一轮没补成的主贴，这一轮增量没有接着补：{server.thread_requests}"
+        )
+        got = {p["message_id"] for p in self._posts()}
+        assert {"5601", "5605", "5702", "5704"} <= got, sorted(got)
+
+    def test_thread_whose_folds_did_not_all_open_is_reopened_in_the_next_incremental_run(self):
+        """浮层里的折叠点了没反应（加载慢、或按钮根本不加载东西）就不算整串读完，下一轮增量照样打开。
+
+        算成读完的话，原帖数没涨就再也不来：折叠后面那几条回复从此采不到，只能等全量重跑。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+        server = site.LoginSite(stale_dialog_fold=True)
+
+        with server as base_url:
+            self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, incremental=False)
+            assert "more:9004" in server.thread_requests, "前置条件：浮层里的折叠没被点，这一条等于没测"
+            self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, incremental=True)
+
+        assert server.thread_requests.count("dialog:9004") == 2, (
+            f"折叠没点开的主贴被当成读完了，下一轮增量没有再打开：{server.thread_requests}"
+        )
+
+    def test_thread_whose_reply_time_could_not_be_read_is_reopened_in_the_next_incremental_run(self):
+        """浮层里有回复没取到时间（tooltip 没出来）也不算整串读完：原帖数对不上时下一轮增量照样打开。
+
+        算成读完的话原帖数不涨就再也不来，这条回复的时间永远是空的 —— 而时间要进指纹、要排序。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+        server = site.LoginSite(tipless_reply=True)
+        # 原帖多出一条看不到的：条数永远对不上，只有「读完」记下原帖数才会不再打开
+        server.hidden_comments = 1
+
+        with server as base_url:
+            self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, incremental=False)
+            untimed = [p["message_id"] for p in self._posts() if p["message_id"] == "5603" and not p["timestamp"]]
+            assert untimed == ["5603"], "前置条件：5603 取到了时间，这一条等于没测"
+            self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, incremental=True)
+
+        assert server.thread_requests.count("dialog:9004") == 2, (
+            f"有回复没取到时间的主贴被当成读完了，下一轮增量没有再打开：{server.thread_requests}"
+        )
+
+    def test_thread_with_no_visible_comment_is_not_reopened_every_run(self):
+        """原帖显示 1 条评论、卡片上和浮层里却一条都看不到（删了没减数、被「最相关」藏掉）：
+        打开一次、确认浮层里确实只有主贴，就算读完，原帖数不涨就不再打开。
+
+        「等不到评论加载出来就不收」一刀切的话，这类主贴每轮增量都要整页打开一次、再白等 10 秒。
+        卡片上露过评论、浮层里却一条都没有的，才是评论还没加载出来（见浮层评论晚到那条）。
+        """
+        self._skip_unless_ready()
+        site = self._login_site()
+        server = site.LoginSite(ghost_comment_card=True)
+
+        with server as base_url:
+            self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, incremental=False)
+            assert "permalink:9011" in server.thread_requests, "前置条件：没去打开 9011，这一条等于没测"
+            self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, incremental=True)
+
+        assert server.thread_requests.count("permalink:9011") == 1, (
+            f"浮层里确实没有评论的主贴，每轮增量都又打开了一次：{server.thread_requests}"
+        )
+
+    def test_collector_wraps_up_before_the_task_deadline(self):
+        """接近任务时限时主动收尾：不再开浮层、不再滚动、不做补齐，按退出码 2 交出已采到的。
+
+        补齐让一轮变长，而任务超时是直接杀进程 —— 交接文件还没写，**整轮一条都不入库**。
+        """
+        self._skip_unless_ready()
+        import time
+        import pytest
+        site = self._login_site()
+        server = site.LoginSite()
+
+        with server as base_url:
+            with pytest.raises(Exception) as e:
+                self._run(base_url, site.GOOD_USER, site.GOOD_PASSWORD, max_batches=2,
+                          deadline_at=int(time.time() * 1000) - 1000)
+
+        assert "code=2" in str(e.value) and "时限" in str(e.value), str(e.value)
+        got = {p["message_id"] for p in self._posts()}
+        assert {"9001", "9004", "9002"} <= got, f"已经采到的没有入库：{sorted(got)}"
+        assert "9003" not in got, "过了时限还在往下滚"
+        assert server.thread_requests == [], f"过了时限还在打开帖子：{server.thread_requests}"
+        # 时间只能逐条 hover 取，一条最多等好几秒：几百条回复的一串能把 3 分钟余量耗光
+        timed = [p["message_id"] for p in self._posts() if p["timestamp"]]
+        assert timed == [], f"过了时限还在逐条 hover 取时间：{timed}"
 
     def test_lazy_loaded_second_screen_is_not_declared_the_end(self):
         """滚到底之后要等信息流把下一批插进来，别急着判「已到底」。
@@ -5268,7 +6069,8 @@ class TestFacebookLoginEndToEnd:
         assert reply["timestamp"] == "28-05-2026 19:22", (
             f"嵌套回复继承了父评论的时间：{reply['timestamp']}"
         )
-        assert len(comments) == 5, f"应有 3 条顶层评论 + 2 条嵌套回复，实际 {len(comments)}"
+        mine = [p for p in comments if p["message_id"].startswith("55")]
+        assert len(mine) == 5, f"9001 下应有 3 条顶层评论 + 2 条嵌套回复，实际 {len(mine)}"
 
     def test_body_images_are_downloaded_and_decoys_ignored(self):
         """正文图要下载到本地，头像 / emoji / 非 scontent 的图都不能混进来。
@@ -5330,9 +6132,12 @@ class TestFacebookLoginEndToEnd:
         assert os.path.getsize(saved) > 0, "文件落盘了但是空的"
 
         # 必须是从浏览器响应里取的。若这里显示 0 张走缓存，说明 502 那条路
-        # 其实没被触发，这个用例就什么都没测到
+        # 其实没被触发，这个用例就什么都没测到。首屏除了 9001 的正文图，
+        # 还有 9004 浮层里那条评论的配图，所以按「保存几张就有几张取自缓存」断言
+        import re
         line = [m for m in progress.messages if "取自浏览器缓存" in m]
-        assert line and "1 张取自浏览器缓存" in line[0], progress.messages
+        got = re.search(r"保存 (\d+)/\d+ 张（(\d+) 张取自浏览器缓存）", line[0]) if line else None
+        assert got and int(got.group(2)) == int(got.group(1)) >= 1, progress.messages
 
     def test_image_stage_is_never_silent(self):
         """提取和下载两个阶段都必须报数，否则远端出问题只能靠猜。
@@ -5364,7 +6169,7 @@ class TestFacebookLoginEndToEnd:
             data = self._run(base_url, site.GOOD_USER, "这个密码是错的")
 
         assert data["complete"] is True, data.get("stop_reason")
-        assert len(data["posts"]) == 8
+        assert len(data["posts"]) == 21
 
     def test_deleting_session_falls_back_to_credentials(self):
         """(b) 删掉会话重跑仍能成功"""
@@ -6218,67 +7023,6 @@ class TestFreshReplyExportEndToEnd:
         text = "\n".join(str(c.value or "") for row in ws.iter_rows() for c in row)
         assert "近 7 天老帖新回复" in text, text[:500]
         assert "2026-08-19 04:35" in text, "基准时间没写进报告"
-
-
-class TestResultsViewRevealsFreshRepliesEndToEnd:
-    """结果页默认只展开每个主贴的前 3 条回复。
-
-    「老帖新回复」正是因为排序被埋才做的功能，结果又被这条预览规则截掉的话，
-    卡片上一个橙色标记都看不到 —— 用户还得先猜到要点展开。搜索命中早就为同一个
-    问题开了豁免，这里必须一样。
-    """
-
-    def _visible(self, replies):
-        """把 ResultsView.vue 里的 visibleReplies 抠出来用真 Node 跑一遍。
-
-        不抄一份实现进测试 —— 那样测的是抄件，源文件改了这里照样绿。
-        """
-        import json
-        import re
-        import subprocess
-
-        vue = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-            "frontend", "src", "views", "ResultsView.vue")
-        src = open(vue, encoding="utf-8").read()
-        body = re.search(
-            r"function visibleReplies\(t: \{[^}]*\}\): PostData\[\] \{(.*?)\n\}",
-            src, re.S)
-        assert body, "visibleReplies 没找到，函数签名改了就要同步这里"
-        js = body.group(1)
-        # 去掉 TS 标注与外部依赖，只保留判据本身
-        js = js.replace("openThreads.value.has(threadKey(t.root))", "false")
-        script = (
-            "const REPLY_PREVIEW = 3;\n"
-            "function visibleReplies(t) {" + js + "\n}\n"
-            "const t = { root: {}, replies: " + json.dumps(replies) + " };\n"
-            "console.log(JSON.stringify(visibleReplies(t).length));"
-        )
-        out = subprocess.run(["node", "-e", script], capture_output=True, text=True)
-        assert out.returncode == 0, out.stderr
-        return json.loads(out.stdout.strip())
-
-    def _replies(self, n, fresh_at=None, matched_at=None):
-        return [{"matched": i == matched_at, "fresh_reply": i == fresh_at} for i in range(n)]
-
-    def test_long_thread_is_truncated_by_default(self):
-        if not _HAS_NODE:
-            import pytest
-            pytest.skip("未安装 node")
-        assert self._visible(self._replies(10)) == 3
-
-    def test_a_fresh_reply_beyond_the_preview_still_shows(self):
-        """第 9 条才是新回复时，默认状态下也必须露出来"""
-        if not _HAS_NODE:
-            import pytest
-            pytest.skip("未安装 node")
-        assert self._visible(self._replies(10, fresh_at=8)) == 10
-
-    def test_search_hit_exemption_still_works(self):
-        if not _HAS_NODE:
-            import pytest
-            pytest.skip("未安装 node")
-        assert self._visible(self._replies(10, matched_at=8)) == 10
 
 
 class TestPortableDataSurvivesUpgradeEndToEnd:

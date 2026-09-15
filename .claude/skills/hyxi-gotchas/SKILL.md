@@ -1,6 +1,6 @@
 ---
 name: hyxi-gotchas
-description: hyxi 的 26 条已知陷阱，逐条绑定具体文件与函数：result 可能为 None、INSERT OR REPLACE 触发级联删除、422 回显明文密码、storage.DB_PATH 是 import 时常量、爬虫退出码契约、增量抓取起点、舆情结果对齐等。改后端 API / 存储层 / 采集脚本 / 前端视图之前扫一遍。
+description: hyxi 的 29 条已知陷阱，逐条绑定具体文件与函数：result 可能为 None、INSERT OR REPLACE 触发级联删除、422 回显明文密码、storage.DB_PATH 是 import 时常量、爬虫退出码契约、增量抓取起点、舆情结果对齐等。改后端 API / 存储层 / 采集脚本 / 前端视图之前扫一遍。
 ---
 
 ## 常见陷阱
@@ -32,3 +32,11 @@ description: hyxi 的 26 条已知陷阱，逐条绑定具体文件与函数：r
 - **日志有两套命名空间**：`logging_config.get_logger()` 用全局 `_logger` 缓存，**第一个调用者的 name 定死了整个 logger**（实际是 orchestrator 的 `app.services.orchestrator`）；其余 service 用 `logging.getLogger("hyxi.xxx")`，拿不到那些 handler。加日志时注意实际输出去向
 - **`TaskInputView.vue` 是死代码**（未注册路由，全项目零引用，功能已并入 `TaskManagementView`）
 - **`Bash` 工具不保持 CWD**，每条命令都要自己 `cd` 到正确目录
+- **前端 E2E 脚本里别在刚用完 `fetch` 时调 `process.exit()`**：Windows 上 Node 24 会撞 libuv 的断言，
+  进程以**退出码 127** 结束 —— 「没有可验证的数据」该给的 2、失败该给的 1 全变成 127，退出码契约失效
+  （写 `e2e:thread` 时实测）。设 `process.exitCode` 让进程自然退出。老脚本在关掉浏览器之后才
+  `process.exit()`，没撞上；预检失败那几条路径（刚 `fetch` 完就退出码 2）没验过，可能有同样问题
+- **Git Bash 里 `cmd /c mklink /J` 必须加 `MSYS_NO_PATHCONV=1`**：MSYS 会把 `/J`、`/c` 当成路径转换掉，
+  报「无效开关」。给前端做「旧 UI 上先红」时要建旧提交的 worktree 并把 `node_modules` 联接过去，就会用到；
+  清理时**先删联接再** `git worktree remove --force` —— 反过来会不会顺着联接删到主仓库的 `node_modules`
+  没验过，别拿它试

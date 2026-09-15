@@ -1314,6 +1314,21 @@ class TestPostSourceUrlEndToEnd:
             conn.commit()
             conn.close()
 
+    def test_root_carries_the_site_comment_count_and_replies_do_not(self):
+        """原帖评论数只挂主贴：结果页拿它和子树条数比，对不上标「已采 X · 原帖 Y」"""
+        self.storage.upsert_posts(self.fb["id"], [
+            {"username": "Dries Boink", "timestamp": "31-07-2026 17:47",
+             "content": "Iemand enig idee hoe ik een account aanmaak?",
+             "page_number": 2, "fingerprint": "fbroot", "message_id": self.MESSAGE_ID,
+             "source": self.fb["id"], "parent_fingerprint": None, "reply_level": 0,
+             "site_comment_count": 6},
+        ])
+        by_source, posts = self._posts()
+        assert by_source[self.fb["id"]]["site_comment_count"] == 6
+        replies = [r for p in posts for r in p["replies"]]
+        assert replies and all(r["site_comment_count"] is None for r in replies), replies
+        assert by_source[self.tw["id"]]["site_comment_count"] is None, "没读到数的主贴该是 null"
+
     def test_post_url_is_not_stored_in_the_posts_table(self):
         """链接现算，不落库 —— 存一份就是双写，历史数据也不会凭空长出这一列"""
         conn = self.storage._get_conn()

@@ -26,12 +26,7 @@ const isSearching = ref(false)
 
 /** 双语 / 只看译文 / 只看原文 */
 const viewMode = ref<'bilingual' | 'zh' | 'orig'>('bilingual')
-/** 展开了全部回复的主贴（按 source+index 记） */
-const openThreads = ref<Set<string>>(new Set())
 const zoomUrl = ref('')
-
-// 一个主贴默认只展开这么多条回复，其余折叠 —— 十几条回复平铺会把整页撑开
-const REPLY_PREVIEW = 3
 
 const totalPages = computed(() =>
   Math.ceil(taskStore.postsTotal / taskStore.pageSize)
@@ -77,16 +72,23 @@ function viewSentiment(p: PostData) {
 }
 
 /**
- * 后端按主贴分页、评论挂在 replies 里。这里把每个主贴的后代**展平成带层级的列表**，
- * 卡片内用缩进渲染 —— 比递归组件简单，而嵌套最多也就两三层。
+ * 后端按主贴分页、评论挂在 replies 里。这里把每个主贴的后代**按原帖顺序展平成带层级的列表**
+ * （先序：评论 → 它的回复 → 回复的回复 → 下一条评论），卡片内用缩进渲染 —— 和 Facebook
+ * 浮层里的样子一致，比递归组件简单。
+ *
+ * **全部展开，不折叠**（v1.12.0 用户定的口径）：用户是拿原帖对着看「采全了没有」的，
+ * 藏掉一截就对不上了。以前「只显示前 3 条」还先后为搜索命中、老帖新回复各开过一次豁免。
  */
 const threads = computed(() =>
   taskStore.posts.map((root) => {
-    const replies: PostData[] = []
+    const replies: { post: PostData; parentName: string; descendants: number }[] = []
     const walk = (p: PostData) => {
       ;(p.replies || []).forEach((c) => {
-        replies.push(c)
+        const row = { post: c, parentName: p.username, descendants: 0 }
+        replies.push(row)
+        const before = replies.length
         walk(c)
+        row.descendants = replies.length - before
       })
     }
     walk(root)
@@ -94,23 +96,9 @@ const threads = computed(() =>
   })
 )
 
-function visibleReplies(t: { root: PostData; replies: PostData[] }): PostData[] {
-  if (openThreads.value.has(threadKey(t.root))) return t.replies
-  // 搜索命中的评论必须露出来，否则用户搜到了却看不见
-  if (t.replies.some((r) => r.matched)) return t.replies
-  // 老主贴上的新回复同理，而且更该露出来：它正是因为排序被埋才做的这个功能，
-  // 结果又被这里的「只显示前 3 条」截掉，卡片上一个橙色标记都看不到 ——
-  // 用户还得先猜到要点展开
-  if (t.replies.some((r) => r.fresh_reply)) return t.replies
-  return t.replies.slice(0, REPLY_PREVIEW)
-}
-
-function toggleThread(root: PostData) {
-  const key = threadKey(root)
-  const next = new Set(openThreads.value)
-  next.has(key) ? next.delete(key) : next.add(key)
-  openThreads.value = next
-}
+/** 原帖上的评论数（含回复的回复）比采到的多 —— 可能没采全 */
+const isShort = (t: { root: PostData; replies: unknown[] }) =>
+  t.root.site_comment_count != null && t.replies.length < t.root.site_comment_count
 
 onMounted(async () => {
   taskStore.currentTaskId = taskId.value
@@ -365,7 +353,19 @@ function getStatusText(): string {
               data-testid="source-link"
             >🔗 原帖</a>
             <span class="text-sm text-secondary">#{{ t.root.index }}</span>
-            <span v-if="t.replies.length" class="reply-count">💬 {{ t.replies.length }}</span>
+            <!-- 采集时读到了原帖上的评论数，就摆出来对账：用户判断「采全了没有」靠的就是它。
+                 对不上标黄，但只说「可能不全」—— 原帖那个数字也算已删除 / 被隐藏的评论 -->
+            <span
+              v-if="t.root.site_comment_count != null"
+              class="reply-count completeness"
+              :class="{ short: isShort(t) }"
+              :title="isShort(t)
+                ? `原帖显示 ${t.root.site_comment_count} 条评论与回复，这里采到 ${t.replies.length} 条，可能不全`
+                  + '（原帖的数字也算已删除或被隐藏的评论；账号的评论排序是「最相关」时，疑似垃圾评论也看不到）'
+                : `原帖显示 ${t.root.site_comment_count} 条评论与回复，已全部采到`"
+              data-testid="completeness"
+            >已采 {{ t.replies.length }} · 原帖 {{ t.root.site_comment_count }}</span>
+            <span v-else-if="t.replies.length" class="reply-count">💬 {{ t.replies.length }}</span>
             <!-- 这条主贴很旧，但下面有新回复。按主贴时间倒序排的话它会沉到下面去，
                  徽标是用户在列表里唯一能看出「这里有新动静」的东西 -->
             <span
@@ -378,9 +378,10 @@ function getStatusText(): string {
           <PostContent :post="t.root" :mode="viewMode" @zoom="zoomUrl = $event" />
 
           <div v-if="t.replies.length" class="replies">
-            <div class="replies-label">💬 {{ t.replies.length }} 条回复</div>
+            <div class="replies-label">💬 {{ t.replies.length }} 条评论与回复</div>
+            <!-- 缩进随层级递增：评论一层，回复挂在它回复的那条下面再缩一层，和原帖浮层一样 -->
             <div
-              v-for="r in visibleReplies(t)"
+              v-for="{ post: r, parentName, descendants } in t.replies"
               :key="threadKey(r)"
               class="reply"
               :class="{ hit: r.matched, fresh: r.fresh_reply }"
@@ -389,6 +390,8 @@ function getStatusText(): string {
               <div class="reply-head">
                 <span class="reply-arrow" aria-hidden="true">↳</span>
                 <span class="reply-user">{{ r.username }}</span>
+                <!-- 第 2 层起写明回的是谁 —— 缩进一深，光靠对齐很难看出挂在哪条下面 -->
+                <span v-if="r.reply_level >= 2" class="reply-to" data-testid="reply-to">回复 {{ parentName }}</span>
                 <span
                   v-if="r.fresh_reply"
                   class="fresh-tag"
@@ -396,6 +399,7 @@ function getStatusText(): string {
                 >🔥 新回复 · 主贴 {{ r.days_since_root }} 天前</span>
                 <span class="text-sm text-secondary">{{ postTime(r) }}</span>
                 <span class="grow" />
+                <span v-if="r.reply_level === 1 && descendants" class="reply-count">{{ descendants }} 条回复</span>
                 <button
                   v-if="sentimentOf(r)"
                   class="sentiment-chip"
@@ -409,16 +413,6 @@ function getStatusText(): string {
               </div>
               <PostContent :post="r" :mode="viewMode" @zoom="zoomUrl = $event" />
             </div>
-
-            <button
-              v-if="t.replies.length > REPLY_PREVIEW && !t.replies.some((r) => r.matched)"
-              class="more-replies"
-              @click="toggleThread(t.root)"
-            >
-              {{ openThreads.has(threadKey(t.root))
-                ? '收起回复 ▴'
-                : `展开其余 ${t.replies.length - REPLY_PREVIEW} 条回复 ▾` }}
-            </button>
           </div>
         </article>
       </div>
@@ -530,6 +524,22 @@ function getStatusText(): string {
   font-size: 12px;
   color: var(--text-secondary);
 }
+/* 已采 X · 原帖 Y。对不上时用和「老帖新回复」同一套暖色：要人多看一眼，但不是报错 */
+.completeness {
+  padding: 1px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.completeness.short {
+  background: #FEF3C7;
+  border-color: #F59E0B;
+  color: #92400E;
+}
+.reply-to {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
 /* 原帖链接。做成和舆情徽标同一个量级的小胶囊，而不是一眼就抢注意力的主按钮 ——
    它是「需要时点一下」的辅助入口，不是这一页的主操作 */
 .source-link {
@@ -601,14 +611,6 @@ function getStatusText(): string {
 [data-theme="dark"] .thread.hit,
 [data-theme="dark"] .reply.hit {
   background: #4A3A12;
-}
-.more-replies {
-  border: none;
-  background: none;
-  padding: 4px 0 0 10px;
-  cursor: pointer;
-  font-size: 12px;
-  color: var(--primary);
 }
 .mode-switch {
   display: inline-flex;

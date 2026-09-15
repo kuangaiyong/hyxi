@@ -130,6 +130,13 @@ CREATE TABLE IF NOT EXISTS posts (
     image_desc         TEXT NOT NULL DEFAULT '',
     translated         INTEGER NOT NULL DEFAULT 0,
     sentiment_at       TEXT,
+    -- 原帖上显示的评论数（含回复的回复），只有主贴有，读不到是 NULL。结果页拿它和
+    -- 采到的子树条数比，对不上标「已采 X · 原帖 Y」
+    site_comment_count INTEGER,
+    -- 上一次把整串评论读完（浮层 / 固定链接里的折叠全部点开）时原帖显示的评论数。
+    -- 原帖数不比它多就不必再打开：差的那几条是被「最相关」藏掉的、删了没减数的，
+    -- 再开也看不到（见 known_comment_counts）
+    harvested_site_count INTEGER,
     PRIMARY KEY (source_id, fingerprint)
 );
 
@@ -169,6 +176,7 @@ def init_db():
         _rekey_sentiment_results(conn)
         _drop_stored_summary(conn)
         _ensure_posts_image_desc(conn)
+        _ensure_posts_comment_counts(conn)
         _ensure_tasks_force_full(conn)
         conn.close()
         logger.info("SQLite 数据库初始化完成: %s", DB_PATH)
@@ -191,6 +199,20 @@ def _ensure_posts_image_desc(conn) -> None:
         logger.info("posts.image_desc 已补齐")
     except Exception as e:
         logger.error("补 posts.image_desc 列失败: %s", e)
+
+
+def _ensure_posts_comment_counts(conn) -> None:
+    """给既有库补上 posts.site_comment_count / harvested_site_count 两列。理由同 _ensure_posts_image_desc。"""
+    cols = [d[1] for d in conn.execute("PRAGMA table_info(posts)")]
+    for col in ("site_comment_count", "harvested_site_count"):
+        if col in cols:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE posts ADD COLUMN {col} INTEGER")
+            conn.commit()
+            logger.info("posts.%s 已补齐", col)
+        except Exception as e:
+            logger.error("补 posts.%s 列失败: %s", col, e)
 
 
 def _ensure_tasks_force_full(conn) -> None:
@@ -788,6 +810,8 @@ def _row_to_post(row) -> dict:
         post["images"] = images
     if row["image_desc"]:
         post["image_desc"] = row["image_desc"]
+    if row["site_comment_count"] is not None:
+        post["site_comment_count"] = row["site_comment_count"]
     # 只放已置位的键：新采到的帖子本来就没有 _processed，凭空补一个空壳会让
     # 「这条处理过没有」多出一种表示形态
     processed = {}
@@ -848,6 +872,73 @@ def known_fingerprints(source_id: str) -> List[str]:
         conn.close()
 
 
+def known_comment_counts(source_id: str) -> Dict[str, int]:
+    """每条主贴（按 message_id）不必再打开补齐的门槛：库里已有几条评论与回复（整棵子树都算），
+    与上一次整串读完时原帖显示的评论数，取大的。
+
+    采集器拿它和原帖上的评论数比，原帖数更大才打开帖子浮层补齐 —— 原帖那个数字同样
+    含回复的回复。**只数子树不够**：被「最相关」藏掉的、删了没减数的评论，浮层里永远看
+    不到，条数永远对不上，每一轮增量都会把这串再开一遍。**也不能拿 site_comment_count
+    顶上去**：上一轮没补成（到了时限、浮层没弹出来）的主贴同样记着原帖数，那样就再也
+    不补了 —— 只有 harvested_site_count 说明「这个数的时候整串读完过」。
+
+    只收有 message_id 的真主贴：采集器按 id 认主贴，丢了父贴的回复
+    （父指针空、层级不为 0）的 message_id 是评论 id，不是帖子。
+    """
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT fingerprint, parent_fingerprint, message_id, reply_level, harvested_site_count "
+            "FROM posts WHERE source_id = ?", (source_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    parent = {r["fingerprint"]: r["parent_fingerprint"] for r in rows}
+    roots = [
+        r for r in rows
+        if not r["parent_fingerprint"] and not r["reply_level"] and (r["message_id"] or "").strip()
+    ]
+    root_mid = {r["fingerprint"]: r["message_id"] for r in roots}
+    counts = {mid: 0 for mid in root_mid.values()}
+    for r in rows:
+        cur, seen = r["parent_fingerprint"], set()
+        if not cur:
+            continue
+        while parent.get(cur) and cur not in seen:
+            seen.add(cur)
+            cur = parent[cur]
+        if cur in root_mid:
+            counts[root_mid[cur]] += 1
+    for r in roots:
+        counts[r["message_id"]] = max(counts[r["message_id"]], r["harvested_site_count"] or 0)
+    return counts
+
+
+def record_thread_counts(source_id: str, counts: Dict[str, dict]) -> None:
+    """按主贴 message_id 写原帖评论数与整串读完时的原帖数（采集脚本输出里的 thread_counts）。
+
+    **增量运行时老主贴不会再作为帖子下发**（指纹见过就不输出），而这两个数恰恰是每轮都
+    可能变的：只靠帖子里带的 site_comment_count，原帖从 6 条涨到 8 条之后库里还是 6，
+    这一轮又没补齐时结果页照样「已采 6 · 原帖 6」不标黄 —— 正好把不全藏起来。
+    读不到（None）不覆盖，理由同 upsert_posts。只改真主贴，口径同 known_comment_counts。
+    """
+    if not counts:
+        return
+    conn = _get_conn()
+    try:
+        for mid, c in counts.items():
+            conn.execute(
+                """UPDATE posts SET site_comment_count=COALESCE(?, site_comment_count),
+                   harvested_site_count=COALESCE(?, harvested_site_count)
+                   WHERE source_id=? AND message_id=?
+                   AND TRIM(COALESCE(parent_fingerprint, '')) = '' AND reply_level = 0""",
+                (c.get("site_comment_count"), c.get("harvested_site_count"), source_id, mid),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def max_page_number(source_id: str) -> int:
     """page 型增量（Tweakers）的续抓点。信息流类来源没有页的含义，用不到"""
     conn = _get_conn()
@@ -900,6 +991,35 @@ def merge_duplicate_posts() -> None:
 
         merged = 0
         remap: Dict[tuple, str] = {}      # (source_id, 被删指纹) → 规范指纹
+
+        def absorb(src: str, dead: str, keep: str) -> None:
+            """把 dead 这一行并进 keep：记别名、搬舆情结论、删行。父指针最后统一改写"""
+            remap[(src, dead)] = keep
+            # 记号同 upsert_posts：这些指纹马上就要从 posts 表消失，
+            # 不留下来采集器会把它们当成新帖，每轮重新回源下载配图
+            conn.execute(
+                "INSERT OR REPLACE INTO post_aliases (source_id, fingerprint, canonical)"
+                " VALUES (?,?,?)", (src, dead, keep),
+            )
+            # 舆情结论可能只算在要删的那一行上。规范身份没有结论就把它搬过来，
+            # 有就丢掉重复的那份 —— 主键是 (source_id, fingerprint)，两条并存不了
+            has = conn.execute(
+                "SELECT 1 FROM sentiment_results WHERE source_id=? AND fingerprint=?",
+                (src, keep),
+            ).fetchone()
+            if has:
+                conn.execute(
+                    "DELETE FROM sentiment_results WHERE source_id=? AND fingerprint=?",
+                    (src, dead),
+                )
+            else:
+                conn.execute(
+                    "UPDATE sentiment_results SET fingerprint=? "
+                    "WHERE source_id=? AND fingerprint=?",
+                    (keep, src, dead),
+                )
+            conn.execute("DELETE FROM posts WHERE source_id=? AND fingerprint=?", (src, dead))
+
         for (src, _mid), members in groups.items():
             if len(members) < 2:
                 continue
@@ -917,7 +1037,8 @@ def merge_duplicate_posts() -> None:
             conn.execute(
                 """UPDATE posts SET username=?, timestamp=?, content=?, page_number=?,
                    parent_fingerprint=?, reply_level=?, images_json=?, image_desc=?,
-                   translation=?, translated=?, sentiment_at=?
+                   translation=?, translated=?, sentiment_at=?, site_comment_count=?,
+                   harvested_site_count=?
                    WHERE source_id=? AND fingerprint=?""",
                 (
                     pick("username"), pick("timestamp"), pick("content"),
@@ -925,39 +1046,47 @@ def merge_duplicate_posts() -> None:
                     (pick("reply_level") or 0) if parent else 0,
                     pick("images_json") or "[]", pick("image_desc") or "",
                     pick("translation") or "", 1 if pick("translated") else 0,
-                    pick("sentiment_at"),
+                    pick("sentiment_at"), pick("site_comment_count"),
+                    pick("harvested_site_count"),
                     src, canonical["fingerprint"],
                 ),
             )
             for extra in extras:
-                remap[(src, extra["fingerprint"])] = canonical["fingerprint"]
-                # 记号同 upsert_posts：这些指纹马上就要从 posts 表消失，
-                # 不留下来采集器会把它们当成新帖，每轮重新回源下载配图
-                conn.execute(
-                    "INSERT OR REPLACE INTO post_aliases (source_id, fingerprint, canonical)"
-                    " VALUES (?,?,?)",
-                    (src, extra["fingerprint"], canonical["fingerprint"]),
-                )
-                # 舆情结论可能只算在要删的那一行上。规范身份没有结论就把它搬过来，
-                # 有就丢掉重复的那份 —— 主键是 (source_id, fingerprint)，两条并存不了
-                has = conn.execute(
-                    "SELECT 1 FROM sentiment_results WHERE source_id=? AND fingerprint=?",
-                    (src, canonical["fingerprint"]),
-                ).fetchone()
-                if has:
-                    conn.execute(
-                        "DELETE FROM sentiment_results WHERE source_id=? AND fingerprint=?",
-                        (src, extra["fingerprint"]),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE sentiment_results SET fingerprint=? "
-                        "WHERE source_id=? AND fingerprint=?",
-                        (canonical["fingerprint"], src, extra["fingerprint"]),
-                    )
-                conn.execute("DELETE FROM posts WHERE source_id=? AND fingerprint=?",
-                             (src, extra["fingerprint"]))
+                absorb(src, extra["fingerprint"], canonical["fingerprint"])
                 merged += 1
+
+        # 浮层残留的主贴：没 message_id、没时间，作者和正文与一条带 id 的主贴逐字相同。
+        # 帖子浮层里的主贴头部没有 /posts/ 链接（2026-09-13 真站实测），旧版本在浮层开着时
+        # 提取信息流，就把它存成了一条没 id、没 hover 到时间的「新主贴」，浮层里的评论全挂
+        # 在它下面 —— 真实库里同一条主贴一行挂 1 条评论、另一行挂 5 条。
+        # 对得上**唯一一条**才并；对不上或对上好几条的留着不动：没 id 没时间不等于是垃圾
+        roots = [dict(r) for r in conn.execute(
+            "SELECT * FROM posts WHERE TRIM(COALESCE(parent_fingerprint, '')) = '' "
+            "AND reply_level = 0 ORDER BY source_id, seq")]
+        with_id: Dict[tuple, List[dict]] = {}
+        for r in roots:
+            if (r["message_id"] or "").strip() and (r["content"] or "").strip():
+                with_id.setdefault((r["source_id"], r["username"], r["content"]), []).append(r)
+        for r in roots:
+            if (r["message_id"] or "").strip() or (r["timestamp"] or "").strip():
+                continue
+            matches = with_id.get((r["source_id"], r["username"], r["content"]), [])
+            if len(matches) != 1:
+                continue
+            keep = matches[0]["fingerprint"]
+            # 译文、舆情标记、图片理解都是花钱换来的，只落在残留行上的要搬过来
+            conn.execute(
+                """UPDATE posts SET
+                   translated = CASE WHEN translation = '' THEN ? ELSE translated END,
+                   translation = CASE WHEN translation = '' THEN ? ELSE translation END,
+                   sentiment_at = COALESCE(sentiment_at, ?),
+                   image_desc = CASE WHEN image_desc = '' THEN ? ELSE image_desc END
+                   WHERE source_id=? AND fingerprint=?""",
+                (r["translated"], r["translation"], r["sentiment_at"], r["image_desc"],
+                 r["source_id"], keep),
+            )
+            absorb(r["source_id"], r["fingerprint"], keep)
+            merged += 1
 
         # 回复挂回规范父贴
         repointed = 0
@@ -1223,16 +1352,21 @@ def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True,
                     # timestamp / content 本来就可能不同，而「这轮没读到时间戳」正是
                     # 制造重复的三个原因之一 —— 照搬的话好数据不是多一行重复，是被销毁。
                     # 与旁边 images / translation「采集不得把已有值冲回空」同一条规矩
+                    # 原帖评论数同理：这一轮按钮没渲染出来（读不到）不许冲掉上一轮读到的。
+                    # parent_fingerprint / reply_level 则**照写**：全量重跑靠这一步把
+                    # 历史上被压平的回复改回正确的层级
                     """UPDATE posts SET username=COALESCE(NULLIF(?,''), username),
                        timestamp=COALESCE(NULLIF(?,''), timestamp),
                        content=COALESCE(NULLIF(?,''), content), page_number=?,
-                       message_id=?, parent_fingerprint=?, reply_level=?
+                       message_id=?, parent_fingerprint=?, reply_level=?,
+                       site_comment_count=COALESCE(?, site_comment_count)
                        WHERE source_id=? AND fingerprint=?""",
                     (
                         post.get("username", ""), post.get("timestamp", ""),
                         post.get("content", ""), int(post.get("page_number", 1) or 1),
                         post.get("message_id", ""), parent_fp,
                         int(post.get("reply_level", 0) or 0),
+                        post.get("site_comment_count"),
                         source_id, fp,
                     ),
                 )
@@ -1241,8 +1375,9 @@ def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True,
             conn.execute(
                 """INSERT INTO posts (source_id, fingerprint, seq, username, timestamp,
                    content, translation, page_number, message_id, parent_fingerprint,
-                   reply_level, images_json, image_desc, translated, sentiment_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   reply_level, images_json, image_desc, translated, sentiment_at,
+                   site_comment_count)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     source_id, fp, next_seq, post.get("username", ""),
                     post.get("timestamp", ""), post.get("content", ""),
@@ -1253,6 +1388,7 @@ def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True,
                     post.get("image_desc", ""),
                     1 if processed.get("translated") else 0,
                     processed.get("sentiment_at"),
+                    post.get("site_comment_count"),
                 ),
             )
             existing[fp] = next_seq

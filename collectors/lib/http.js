@@ -41,7 +41,10 @@ async function gotoTolerant(page, url, timeout, retries) {
 // 同理，站点一旦说过一次「别打了」，退让后的那一次就不再容忍网络抖动（retries 传 0）：
 // 连不上就是连不上，不该再对它多打几次。于是限流路径上最多 4 个请求、其中真正拿到
 // 响应的仍然只有 2 个，「退让一次即停」这条约束一个字没松。
-async function gotoPage(page, url, timeout) {
+//
+// deadlineAt（毫秒时间戳，可省）：退让要睡过这个点就不睡，当场按拒绝访问停下。调用方的时限只比
+// 任务超时早几分钟，退让却最多睡 5 分钟 —— 睡醒之前进程已经被按超时杀掉，交接文件没写，一条都交不出去
+async function gotoPage(page, url, timeout, deadlineAt = 0) {
     let throttled = false;
     for (let attempt = 0; attempt < 2; attempt++) {
         const resp = await gotoTolerant(page, url, timeout, throttled ? 0 : NETWORK_RETRIES);
@@ -57,6 +60,12 @@ async function gotoPage(page, url, timeout) {
         }
         const retryAfter = parseInt(resp.headers()['retry-after'], 10);
         const waitMs = Math.min(Number.isFinite(retryAfter) ? retryAfter * 1000 : 60000, 300000);
+        if (deadlineAt && Date.now() + waitMs > deadlineAt) {
+            const err = new Error(`目标站拒绝访问 (HTTP ${status})，要求等待 ${Math.round(waitMs / 1000)}s`
+                + '，会越过任务时限，已主动停止抓取');
+            err.blocked = true;
+            throw err;
+        }
         log(`  ⏸️ 收到 HTTP ${status}，等待 ${Math.round(waitMs / 1000)}s 后重试一次`);
         await sleep(waitMs);
     }

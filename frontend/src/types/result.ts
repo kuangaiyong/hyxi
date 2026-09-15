@@ -30,6 +30,11 @@ export interface PostData {
   days_since_root: number
   /** 主贴专用：整棵子树里有几条这样的新回复，用来做徽标 */
   fresh_reply_count: number
+  /**
+   * 主贴专用：原帖上显示的评论数（含回复的回复），采集时没读到就是 null。
+   * 和子树条数比，对不上标「已采 X · 原帖 Y」
+   */
+  site_comment_count: number | null
   replies: PostData[]
 }
 

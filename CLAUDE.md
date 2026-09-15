@@ -208,6 +208,8 @@ submit 按钮、Arkose 人机验证）、小组页 DOM 实测结论，以及已�
 
 **评论嵌套只在出口组装，存储层永远是扁平数组。** 整条处理链有 8 处假设 posts 是扁平的（增量过滤、`_merge_by_fingerprint`、翻译的下标一一对应、舆情的绝对索引、Excel、`results.py` 切片、Node 端合并）。物理嵌套要给每一处写一对展平/回填函数，且会破坏「顺序以源 JSON 为准」的保证。`post_tree.build_tree()` / `order_by_thread()` 是唯一的组树入口，父贴不在本批数据里的评论按主贴处理，不会被丢掉。
 
+**「扁平」说的是一张表 + 父指针，不是父指针只能指主贴。** 回复的 `parent_fingerprint` 指向它回复的**那一条**、`reply_level` 沿父指针数，任意深度（出口两个组树函数本来就支持）。这句曾被误读成「回复一律挂主贴、第 1 层」，还写进了测试断言当成正确行为，于是 Facebook 上「回复的回复」连续几个版本全被压成评论（真实库 306 行里第 2 层 0 条，v1.12.0 修）。
+
 **出口一律「主贴按发表时间从新到旧、评论跟着自己的主贴走」**，页面（`/posts`）和导出（`/export`）用同一条规则，所以两边看到的顺序逐条一致。规则落在 `post_tree.order_by_thread()` 里，没有开关 —— 两个出口各排各的，迟早分家。`/posts` 因为直接用 `build_tree()` 分页，自己调一次 `sort_time()`，**必须排在切片之前**：一页只有 50 个主贴，只排页内的话后面更新的帖子永远出不了第二页。排序键先经 `normalize_timestamp()` 转 ISO（理由见「常见陷阱」）；解析不出时间的主贴沉到最后，靠稳定排序保持采集顺序。**存储层的 `seq` 和响应里的 `index` 都不动**，舆情结论按它们对齐。
 
 `page_number` 对信息流类来源没有页的含义，`group_feed` 填的是**滚动批次序号**，保证字段非空；它的增量走时间水位线（`incremental_strategy = "watermark"`）而不是页码。
@@ -257,14 +259,14 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 
 ## 测试
 
-**412 个测试，必须全部 PASSED**（本机实测 `412 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
+**443 个测试，必须全部 PASSED**（本机实测 `443 passed`）。修改任何核心逻辑后必须在仓库根目录运行：
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\ -v
 ```
 
 **前端没有单元测试框架**（package.json 里无 vitest / jest / @vue/test-utils），
-五条前端回归靠真浏览器守，都在 `frontend/e2e/` 下：
+六条前端回归靠真浏览器守，都在 `frontend/e2e/` 下：
 
 | 脚本 | 命令 | 守的是 |
 |---|---|---|
@@ -273,6 +275,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 | `results_source_link.js` | `npm run e2e:link` | 主贴【🔗 原帖】链接：形态、只挂主贴、rel/target |
 | `stale_bundle_navigation.js` | `npm run e2e:stale` | 服务端换了构建后点导航必须有反馈，不许静默失败 |
 | `access_key_flow.js` | `npm run e2e:key` | 被 401 挡住后照提示填服务访问密钥：找得到、首屏可见、填错明说、填对当场生效 |
+| `results_thread_structure.js` | `npm run e2e:thread` | 回复全部展开且顺序同原帖、层级缩进与「回复 某某」、「已采 X · 原帖 Y」对账（没有第 2 层回复的数据时退出码 2） |
 
 真 Chrome、真前后端、无 mock，**要求两个服务都起着**（先跑 `.\start.ps1`），所以它们
 进不了 pytest。都自己从 `/tasks` 里挑任务，不写死任何 ID；密钥从项目根 `.env` 读。
@@ -373,7 +376,7 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 
 ## 常见陷阱
 
-26 条已知陷阱（逐条绑定具体文件与函数）已搬进 `Skill(hyxi-gotchas)`。
+29 条已知陷阱（逐条绑定具体文件与函数）已搬进 `Skill(hyxi-gotchas)`。
 **改后端 API / 存储层 / 采集脚本 / 前端视图之前扫一遍**，其中几条是静默错误：
 `INSERT OR REPLACE` 会触发级联删除、422 报文默认回显明文密码、
 `storage.DB_PATH` 是 import 时算好的常量（测试会写进真实库）。

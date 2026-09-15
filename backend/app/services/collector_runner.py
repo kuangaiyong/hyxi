@@ -7,6 +7,7 @@ job 指定。超时控制、进程树清理、退出码契约沿用已验证的�
 import os
 import re
 import json
+import time
 import uuid
 import asyncio
 import logging
@@ -33,6 +34,16 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 # Node 告警的两行样板，都不是中断原因
 _NOISE_PREFIXES = ("(node:", "(Use ")
+
+
+def collect_deadline_ms(now: float, timeout: float) -> int:
+    """采集脚本该在几点前收尾（毫秒时间戳），随 job 下发。
+
+    runner 到了超时是直接杀进程的：交接文件还没写，整轮一条都不入库。脚本提前收尾就能
+    按退出码 2 把已采到的交出来。余量 3 分钟（写交接文件 + 关浏览器实测秒级）；
+    超时本身很短时最多让出 20%，别一启动就过点。
+    """
+    return int((now + timeout - min(180, timeout * 0.2)) * 1000)
 
 
 def _stderr_reason(stderr_text: str) -> str:
@@ -142,8 +153,16 @@ class CollectorRunner:
             source["max_page_number"] = (
                 storage.max_page_number(source_id) if incremental else 0
             )
+            # 每条主贴库里已有几条评论：原帖评论数不比它多就不必再打开帖子补齐。
+            # 全量重跑同样清空 —— 要的就是全部重来
+            source["known_comment_counts"] = (
+                storage.known_comment_counts(source_id) if incremental else {}
+            )
 
         job = collector.build_job(source, output_path)
+        # source 里给了就用：测试要一个已经过去的时刻
+        job["deadline_at"] = source.get("deadline_at") or collect_deadline_ms(
+            time.time(), SUBPROCESS_TIMEOUT)
 
         script_path = collector.script_path()
         if not os.path.exists(script_path):
@@ -347,6 +366,8 @@ class CollectorRunner:
                 for p in posts:
                     p["source"] = source_id
                 added = storage.upsert_posts(source_id, posts)
+                # 必须排在 upsert 之后：本轮新出现的主贴得先有行才改得到
+                storage.record_thread_counts(source_id, data.get("thread_counts") or {})
                 data["posts"] = storage.load_posts([source_id])
                 data["total_posts"] = len(data["posts"])
 

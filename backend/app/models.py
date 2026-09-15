@@ -175,6 +175,9 @@ class PostData(BaseModel):
     # 标出来才看得见（判据见 post_tree.mark_fresh_replies）
     fresh_reply: bool = False
     days_since_root: int = 0   # 距其主贴的天数，只在 fresh_reply 为真时有意义
+    # 原帖上显示的评论数（含回复的回复），只有主贴有；采集时没读到就是 null。
+    # 前端拿它和子树条数比，对不上标「已采 X · 原帖 Y」
+    site_comment_count: Optional[int] = None
     # 主贴专用：它名下有几条这样的新回复，供列表页做徽标
     fresh_reply_count: int = 0
     replies: List["PostData"] = Field(default_factory=list)

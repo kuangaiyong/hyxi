@@ -123,7 +123,13 @@ foreach ($f in Get-ChildItem (Join-Path $stage 'collectors') -Filter *.js -File)
         $problems += "$($f.Name) 与源码逐字节相同，压缩没生效"
     }
     if ($text -match "require\('\./lib/") { $problems += "$($f.Name) 没有 bundle，还在 require ./lib/" }
-    if (($text -split "`n").Count -gt 200) { $problems += "$($f.Name) 有 $(($text -split "`n").Count) 行，不像压缩过的" }
+    # 行数要明显少于源码，不能写死上限：压缩限了行宽（lineLimit），产物行数随体积涨 ——
+    # 写死 200 行时 v1.12.0 的 facebook_group.js 压缩后 248 行（源码一千多行）被误拦。
+    # 源码按 UTF-8 数：PS 5.1 默认按 ANSI 读，中文会吞掉换行，一千一百多行只数出九百多
+    $lines = ($text -split "`n").Count
+    if ((Test-Path $src) -and $lines * 2 -gt (Get-Content $src -Encoding UTF8).Count) {
+        $problems += "$($f.Name) 有 $lines 行，不像压缩过的"
+    }
 }
 if (Test-Path (Join-Path $stage 'collectors\lib')) { $problems += 'collectors\lib 源码目录被拷进来了' }
 

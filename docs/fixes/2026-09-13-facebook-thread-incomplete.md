@@ -229,6 +229,8 @@ v1.11.4 的 `recoverFromDetailView()` 退回信息流后把这条主贴加进 `d
   `test_dialog_whose_address_has_no_trailing_slash_is_harvested`（fixture `slashless_thread_url`）
 - 紧接着那个浮层用关闭按钮 / Esc / 后退都关不掉，重新载入信息流 1 次（78 个浮层里唯一一次），**原因没查明**；
   重载后已采的整批重滚回来（第 6~13 批新增 0，每批约 10 秒），本轮照常跑完
+- 随后又跑了一轮**增量**（任务 `56757f1c`，重打的包，滚动批次上限 25）：43 秒，滚 2 批就「已翻到历史数据」停下；
+  新增 1 条是几分钟前刚发的新主贴，读完的串一个都没重开（R4-S1 / S3），新增没有 message_id 的主贴 0 条
 
 ## 顺带发现
 

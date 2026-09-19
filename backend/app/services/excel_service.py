@@ -68,6 +68,7 @@ SENTIMENT_STYLE = {
 
 EXPORT_WIDTHS = {
     "index": 6, "source": 16, "level": 6, "username": 14, "timestamp": 17, "fresh": 22,
+    "quote": 46,
     "content": 50, "translation": 50, "image_desc": 34, "images": 24,
     "sentiment": 8, "intensity": 11, "reason": 40, "dimensions": 24,
 }
@@ -89,6 +90,25 @@ EXPORT_COLUMNS = [
     ("sentiment", "情感"), ("intensity", "强度"),
     ("reason", "分析理由"), ("dimensions", "涉及维度"),
 ]
+
+# 「引用」列。**不在 EXPORT_COLUMNS 里**，只有报告里真有引用时才由 export_columns()
+# 插进去 —— 拿它当恒定列的话，Facebook 那些一条引用都没有的报告会凭空多出一列全空，
+# 而「不影响 Facebook 数据源的正常使用」是这次改动的红线：列集合一模一样，
+# 导出文件才可能逐字节相同。插在「更新提醒」与「原文」之间，读的时候是
+# 引用 → 正文 的顺序（和页面上的引用框在上、正文在下一致）
+QUOTE_COLUMN = ("quote", "引用")
+
+
+def export_columns(rows: List[dict]) -> List[tuple]:
+    """这次导出实际用哪几列。没有引用就返回原样的 `EXPORT_COLUMNS`（同一个对象）。
+
+    值在 `results._export_rows()` 一处产出，「有值没值」只按有没有非空字符串判 ——
+    列里全是空串就等于没有引用，没必要多一列。
+    """
+    if not any((r.get("quote") or "").strip() for r in rows):
+        return EXPORT_COLUMNS
+    at = [k for k, _ in EXPORT_COLUMNS].index("content")
+    return EXPORT_COLUMNS[:at] + [QUOTE_COLUMN] + EXPORT_COLUMNS[at:]
 
 # ===== 配图 =====
 

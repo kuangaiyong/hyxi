@@ -1113,6 +1113,198 @@ class TestExportEndpointEndToEnd:
             assert resp.status_code == 404, f"{path} 仍然可用（{resp.status_code}）"
 
 
+class TestQuoteApiEndToEnd:
+    """引用在出口的形状：真 HTTP → 真 SQLite → 真导出。
+
+    采集侧只给一份快照（引用块的原文 + 被引用楼层的 id）。出口要拿这个 id 去本任务的
+    帖子里找那条楼层，**用那条楼层自己的正文、译文和配图** —— 只有这条路拿得到全文
+    （原站长引用被服务端截断成 `[...]`，点不开），也只有这条路能保证引用图不缺不错：
+    那些图本来就是那条楼层自己的。找不到才退回快照，并标 `resolved=false`。
+    """
+
+    @classmethod
+    def setup_class(cls):
+        import app.config as cfg
+
+        cls.cfg = cfg
+        cls.tmpdir = tempfile.mkdtemp()
+        cls._old_key = cfg.settings.api_key
+        cls._old_dir = cfg.settings.data_dir
+        cfg.settings.api_key = ""
+        cfg.settings.data_dir = cls.tmpdir
+
+        from main import app
+        from app.services import storage
+        cls.storage = storage
+        cls._old_db = storage.DB_PATH
+        storage.DB_PATH = os.path.join(cls.tmpdir, "hyxi.db")
+        storage.init_db()
+        cls.client = TestClient(app)
+
+        # 一源一串（Tweakers）：一条主题 + 三条回复，三种引用形态各一条
+        cls.forum = [
+            {"username": "楼主", "timestamp": "22-05-2026 17:06", "content": "主题正文",
+             "translation": "主题译文", "page_number": 1, "message_id": "1001",
+             "fingerprint": "t1", "source": "src_thread",
+             "parent_fingerprint": None, "reply_level": 0},
+            {"username": "回复甲", "timestamp": "22-05-2026 18:41", "content": "我同意 @楼主",
+             "translation": "我同意译文", "page_number": 1, "message_id": "1002",
+             "fingerprint": "r1", "source": "src_thread",
+             "parent_fingerprint": "t1", "reply_level": 1,
+             # 引用了主题，带的图是引用块里那些 —— 出口要用主题自己那份
+             "quote": {"message_id": "1001", "cite": "楼主 schreef op vrijdag 22 mei 2026 @ 17:06",
+                       "username": "楼主", "content": "被截断的主题正文 [...]",
+                       "truncated": True, "images": ["src_thread/r1_q0.png"]}},
+            {"username": "回复乙", "timestamp": "23-05-2026 09:12", "content": "补充一句",
+             "translation": "补充译文", "page_number": 1, "message_id": "1003",
+             "fingerprint": "r2", "source": "src_thread",
+             "parent_fingerprint": "t1", "reply_level": 1,
+             # 引用了一条**没采到**的楼层（或者已被删）
+             "quote": {"message_id": "9999", "cite": "老张 schreef op vrijdag 1 mei 2026 @ 10:00",
+                       "username": "老张", "content": "那段没采到的正文",
+                       "truncated": False, "images": ["src_thread/r2_q0.png"]}},
+            {"username": "回复丙", "timestamp": "24-05-2026 09:12", "content": "没有引用",
+             "translation": "", "page_number": 1, "message_id": "1004",
+             "fingerprint": "r3", "source": "src_thread",
+             "parent_fingerprint": "t1", "reply_level": 1},
+        ]
+        # 一源多主贴（Facebook）：一条引用都没有
+        cls.group = [
+            {"username": "楼主G", "timestamp": "02-06-2026 09:00", "content": "小组主贴",
+             "translation": "小组译文", "page_number": 1, "message_id": "9001",
+             "fingerprint": "g1", "source": "src_feed",
+             "parent_fingerprint": None, "reply_level": 0},
+        ]
+        storage.upsert_posts("src_thread", cls.forum)
+        storage.upsert_posts("src_feed", cls.group)
+
+        cls.task_id = "quote-e2e"
+        from app.services.orchestrator import orchestrator
+        orchestrator.tasks[cls.task_id] = {
+            "id": cls.task_id, "status": "completed", "description": "引用出口",
+            "plan": [], "logs": [], "progress": 1.0, "current_step": None,
+            "result": {
+                "total_posts": len(cls.forum) + len(cls.group),
+                "sources": [
+                    {"id": "src_thread", "name": "论坛串", "collector_id": "tweakers"},
+                    {"id": "src_feed", "name": "小组", "collector_id": "facebook_group"},
+                ],
+            },
+        }
+        cls.orchestrator = orchestrator
+
+    @classmethod
+    def teardown_class(cls):
+        cls.cfg.settings.api_key = cls._old_key
+        cls.cfg.settings.data_dir = cls._old_dir
+        cls.storage.DB_PATH = cls._old_db
+        cls.orchestrator.tasks.pop(cls.task_id, None)
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _flat(self):
+        """{index: PostData}，把 replies 展开 —— 回复挂在主贴的 replies 下。
+
+        用 index 不用 message_id：出口一直没暴露 message_id（那是采集期的字段），
+        而 index 是扁平数组里的绝对位置，正好用来对「被引用的是第几条」。
+        """
+        data = self.client.get(
+            f"/api/v1/tasks/{self.task_id}/posts", params={"page_size": 200}).json()
+        out = {}
+
+        def walk(p):
+            out[p["index"]] = p
+            for r in p.get("replies") or []:
+                walk(r)
+
+        for p in data["posts"]:
+            walk(p)
+        return out
+
+    def test_a_quote_survives_the_round_trip(self):
+        """quote_json 落库再读回来逐字段相等，且没有引用的帖子连键都没有"""
+        posts = self.storage.load_posts(["src_thread"])
+        by_fp = {p["fingerprint"]: p for p in posts}
+        quote = by_fp["r1"]["quote"]
+        assert quote["message_id"] == "1001"
+        assert quote["cite"].startswith("楼主 schreef op")
+        assert quote["images"] == ["src_thread/r1_q0.png"]
+        assert quote["truncated"] is True
+        assert "quote" not in by_fp["r3"], "没有引用的帖子凭空多了一个空对象"
+
+    def test_a_resolved_quote_uses_the_quoted_floors_own_content(self):
+        """被引用楼层在库里 → 用**它自己**的正文、译文与配图，全文不缺、图不错配"""
+        quoted = self._flat()[2]["quote"]
+        assert quoted["resolved"] is True
+        assert quoted["message_id"] == "1001"
+        assert quoted["username"] == "楼主"
+        assert quoted["content"] == "主题正文", "用了快照里那段被截断的正文"
+        assert quoted["translation"] == "主题译文", "只看译文时引用框里会冒出一段荷兰语"
+        assert quoted["index"] == 1
+        # 截断是原站那一段快照的属性，全文在手就跟我们无关了
+        assert quoted["truncated"] is False
+
+    def test_an_unresolved_quote_falls_back_to_the_snapshot(self):
+        """被引用楼层没采到 → 快照兜底，并**明说**它可能只有一截"""
+        quoted = self._flat()[3]["quote"]
+        assert quoted["resolved"] is False
+        assert quoted["message_id"] == "9999"
+        assert quoted["username"] == "老张"
+        assert quoted["content"] == "那段没采到的正文"
+        assert quoted["index"] is None
+        # 快照自己带的图也得留着 —— 那是这条引用里唯一的图
+        assert quoted["images"] == ["src_thread/r2_q0.png"]
+
+    def test_a_post_without_a_quote_reports_null(self):
+        assert self._flat()[4]["quote"] is None
+
+    def test_thread_kind_comes_from_the_collector_declaration(self):
+        """一源一串 / 一源多主贴由采集器声明给出，前端不认 collector_id"""
+        flat = self._flat()
+        assert flat[1]["thread_kind"] == "thread"
+        assert flat[5]["thread_kind"] == "feed"
+
+    def test_search_reaches_the_quoted_text(self):
+        """搜一个说法时，「正在回它的人」应该和被引用的人一起出现"""
+        data = self.client.get(
+            f"/api/v1/tasks/{self.task_id}/posts",
+            params={"search": "老张", "page_size": 200}).json()
+        hit = [p for p in data["posts"] if p["index"] == 1]
+        assert hit, "引用里出现的名字搜不到"
+        assert any(r["matched"] for r in hit[0]["replies"]), "命中项没标出来"
+
+    def test_the_export_gains_a_quote_column_only_when_there_are_quotes(self):
+        resp = self.client.get(f"/api/v1/tasks/{self.task_id}/export", params={"format": "csv"})
+        assert resp.status_code == 200
+        header = resp.content.decode("utf-8-sig").splitlines()[0]
+        assert "引用" in header, f"报告里看不出在回复谁: {header}"
+
+    def test_a_report_without_quotes_has_exactly_the_old_columns(self):
+        """**红线**：Facebook 那种一条引用都没有的报告，列集合与改动前完全一致。
+
+        导出是两种格式共用的，凭空多一列全空会让既有报告的下游解析全变 ——
+        「不影响 Facebook 数据源的正常使用」这条要求在这里落地。
+        """
+        from app.routers.results import _export_rows
+        from app.services.excel_service import EXPORT_COLUMNS
+
+        rows = _export_rows({"description": "只有小组"}, self.group, [], 7)
+        from app.services.excel_service import export_columns
+
+        assert [k for k, _ in export_columns(rows)] == [k for k, _ in EXPORT_COLUMNS]
+
+    def test_the_quote_column_carries_who_and_what(self):
+        from app.routers.results import _export_rows
+
+        rows = _export_rows({"description": "论坛串"}, self.forum, [], 7)
+        by_index = {r["index"]: r for r in rows}
+        # 明细表按「主题 → 它的回复」排，主题是第 1 行
+        assert by_index[1]["quote"] == ""
+        resolved = by_index[2]["quote"]
+        assert resolved.startswith("引用 @楼主（#1）：主题正文"), resolved
+        fallback = by_index[3]["quote"]
+        assert "原楼未采集" in fallback and "那段没采到的正文" in fallback, fallback
+
+
 class TestPostSourceUrlEndToEnd:
     """主贴要带原帖固定链接 —— 真 HTTP → 真 SQLite → 真数据源记录
 
@@ -1218,10 +1410,43 @@ class TestPostSourceUrlEndToEnd:
             f"回复贴也挂上了链接: {[r['source_url'] for r in replies]}"
         )
 
-    def test_a_source_without_a_url_shape_stays_empty(self):
-        """Tweakers 没有覆写 post_url，就该是空串而不是一个拼错的链接或 500"""
+    def test_tweakers_root_floor_carries_its_permalink(self):
+        """Tweakers 的**主题**（树根那一条）也要有「🔗 原帖」。
+
+        形态用的是站点自己的那个：楼层头部那个日期就指向
+        `/forum/list_message/<id>#<id>`（2026 真站实测）。改造前 Tweakers 没覆写
+        `post_url()`，一条链接都给不出来 —— 结果页上 Tweakers 的主题卡是唯一
+        没有原帖入口的卡片。
+        """
         by_source, _ = self._posts()
-        assert by_source[self.tw["id"]]["source_url"] == ""
+        root = by_source[self.tw["id"]]
+        mid = "77123456"
+        assert root["source_url"] == (
+            f"https://gathering.tweakers.net/forum/list_message/{mid}#{mid}"
+        ), "链接形态和站点自己用的那个对不上"
+
+    def test_a_source_without_a_url_shape_stays_empty(self):
+        """没有覆写 post_url() 的来源仍然是空串 —— 不是拼一个错的，也不许 500。
+
+        `group_feed` 就是这种（只服务本地 fixture，没有真实的 URL 形态）。
+        """
+        from app.collectors import get_collector
+
+        assert get_collector("group_feed").post_url({"params": {}}, "123") is None
+
+    def test_tweakers_also_refuses_a_non_web_base_url(self):
+        """新增的 post_url() 必须和 Facebook 那条一样守住 `http(s)` —— 它会原样进 `<a :href>`"""
+        original = dict(self.tw)
+        try:
+            for bad in ("javascript:alert(document.domain)//x", "//evil.example", 5, True):
+                src = dict(self.tw)
+                src["params"] = {**self.tw["params"], "base_url": bad}
+                self.storage.save_source(src)
+                by_source, _ = self._posts()
+                assert by_source[self.tw["id"]]["source_url"] == "", f"{bad!r} 进了链接"
+                assert by_source[self.tw["id"]]["content"], "帖子本身不该受影响"
+        finally:
+            self.storage.save_source(original)
 
     def test_url_survives_deleting_the_source(self):
         """数据源删掉后历史任务照旧能看，只是没链接 —— 不许 500、不许整页空白"""

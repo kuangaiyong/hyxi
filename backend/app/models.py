@@ -144,6 +144,39 @@ class TaskListResponse(BaseModel):
 
 # ===== 帖子/结果相关 =====
 
+class QuoteData(BaseModel):
+    """一条楼层引用了哪一段内容（Tweakers 论坛的引用块）。
+
+    **引用绝不许并进 `content`** —— 指纹吃 `用户名|时间戳|正文前100字`，并进去全部
+    历史数据失配、已翻译的帖子会被判成新帖重新付费翻译。原站本来也是「引用框 + 正文」两块。
+
+    `message_id` 是被引用楼层的 id（真站就写在引用块的 `a.messagelink` 上）。出口拿它
+    去本任务的帖子里找那一条：找得到就**用那条楼层自己的用户名、时间、正文、配图**，
+    也就能拿到全文 —— 原站的长引用被服务端截断成 `[...]`，点 `toon volledige bericht`
+    文本一个字符都不变（实测），快照拿不到全文。找不到（引用了没采到的楼层）才退回快照。
+
+    解析只在出口做、**不落库**：落一份指纹就是双写，而且指纹会被 post_aliases 归并。
+    """
+    message_id: str = ""
+    # 引用行原文（「Storms schreef op zaterdag 23 mei 2026 @ 12:01」）。
+    # 未被引用楼层采到时，UI 直接显示它 —— 荷兰语日期不在这里解析
+    cite: str = ""
+    username: str = ""
+    timestamp: str = ""
+    content: str = ""
+    # 被引用楼层采到时，它的译文也一起带出来 —— 否则「只看译文」下引用框里会冒出一段
+    # 荷兰语原文，而它明明早就翻过了。快照兜底那条路没有译文（那一段没送去翻译）
+    translation: str = ""
+    # 原站的长引用是**服务端**截断的，正文里留一个字面量 [...]。转发给用户，别假装是全文
+    truncated: bool = False
+    # 引用块里的图，相对 data/media 的路径。**和被引用者的图分开存**：
+    # 引用者的配图在 PostData.images 里，两者混一起就是张冠李戴
+    images: List[str] = Field(default_factory=list)
+    # 被引用的楼层在本任务里找得到吗；找得到时下面这个 index 是它在扁平数组里的位置
+    resolved: bool = False
+    index: Optional[int] = None
+
+
 class PostData(BaseModel):
     """单条帖子数据。
 
@@ -180,6 +213,13 @@ class PostData(BaseModel):
     site_comment_count: Optional[int] = None
     # 主贴专用：它名下有几条这样的新回复，供列表页做徽标
     fresh_reply_count: int = 0
+    # 这条楼层引用了哪一段内容；没有引用就是 null（不是空对象）。
+    # **永远不进 content** —— 那是指纹的一部分
+    quote: Optional[QuoteData] = None
+    # 这个来源装的是什么：「feed」= 一源多主贴，每条主贴带自己的评论与回复（Facebook 小组）；
+    # 「thread」= 一源一串，一条主题 + 平铺的回复（Tweakers 论坛）。
+    # 前端只按它选措辞，不认 collector_id —— 站点知识留在采集器声明里
+    thread_kind: str = "feed"
     replies: List["PostData"] = Field(default_factory=list)
 
 

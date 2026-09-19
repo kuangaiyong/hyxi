@@ -5,14 +5,15 @@ import csv
 from io import StringIO
 from collections import Counter
 from datetime import datetime
+from typing import Optional
 from urllib.parse import quote
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 from app.collectors import get_collector
-from app.models import PostsResponse, PostData, TaskStats, TaskStatus
+from app.models import PostsResponse, PostData, QuoteData, TaskStats, TaskStatus
 from app.services import source_service, storage
 from app.services.excel_service import (
-    ExcelService, EXPORT_COLUMNS, SENTIMENT_CN, UNANALYZED,
+    ExcelService, EXPORT_COLUMNS, SENTIMENT_CN, UNANALYZED, export_columns,
 )
 from app.services.post_tree import (
     FRESH_DAYS_CHOICES, FRESH_DAYS_DEFAULT, baseline_time, build_tree,
@@ -40,13 +41,41 @@ def _get_task_or_404(task_id: str):
     return task
 
 
+def _thread_kind_of(collector_id: str) -> str:
+    """采集器声明里的一源一串 / 一源多主贴。认不出来（采集器被下掉了）按 feed ——
+    改造前所有来源都是 feed，历史数据也是那么呈现的，退回默认口径最不容易出错。"""
+    try:
+        return getattr(get_collector(collector_id), "thread_kind", "feed") or "feed"
+    except ValueError:
+        return "feed"
+
+
+def _source_meta(task: dict = None) -> dict:
+    """来源 id → {"name": 显示名, "thread_kind": …}。
+
+    名字照旧以还注册着的来源为准，任务里记过的兜底 —— 来源被删掉后历史任务结果
+    照样能看（见 CLAUDE.md「删数据源不能让历史任务结果变空白」）。
+    `thread_kind` 从任务记过的 collector_id 也能算出来，所以删源之后措辞不会突然变了。
+    """
+    meta = {}
+    for s in source_service.list_sources():
+        meta[s["id"]] = {
+            "name": s["name"],
+            "thread_kind": _thread_kind_of(s.get("collector_id", "")),
+        }
+    for entry in ((task or {}).get("result") or {}).get("sources", []):
+        if not entry.get("id"):
+            continue
+        meta.setdefault(entry["id"], {
+            "name": entry.get("name") or entry["id"],
+            "thread_kind": _thread_kind_of(entry.get("collector_id", "")),
+        })
+    return meta
+
+
 def _source_names(task: dict = None) -> dict:
     """来源 id → 显示名。任务里记过的名字兜底，来源被删掉后列名不至于退成一串 id"""
-    names = {s["id"]: s["name"] for s in source_service.list_sources()}
-    for entry in ((task or {}).get("result") or {}).get("sources", []):
-        if entry.get("id"):
-            names.setdefault(entry["id"], entry.get("name") or entry["id"])
-    return names
+    return {sid: m["name"] for sid, m in _source_meta(task).items()}
 
 
 _FILENAME_BAD = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
@@ -134,8 +163,56 @@ def _post_url(post: dict, url_sources: dict) -> str:
     return collector.post_url(source, message_id) or ""
 
 
-def _to_post_data(post: dict, index: int, names: dict, matched: bool = False,
-                  fresh_days_gap: int = None, url_sources: dict = None) -> PostData:
+def _resolve_quote(post: dict, by_mid: dict, index_of: dict) -> Optional[QuoteData]:
+    """把这条楼层的引用（`post["quote"]` 快照）解析成出口结构；没有引用返回 None。
+
+    **被引用楼层在本任务里找得到时，一律用它自己那一份**（用户名、时间、正文、译文、配图）。
+    这不是优化，是唯一正确的做法：
+      · 原站的长引用是**服务端截断**的（正文里留一个字面量 `[...]`），点 `toon volledige
+        bericht` 文本一个字符都不变（实测），只有读那条楼层自己才拿得到全文
+      · 引用图也只有这条路才不缺不错 —— 那些图本来就是那条楼层自己的 `images`
+
+    找不到（引用了没采到的楼层 / 楼层已删）才退回快照，并标 `resolved=false`：
+    快照的正文可能只有一截，UI 要如实说出来。
+
+    解析**只在出口做、不落库**：落一份指纹就是双写，而且指纹会被 `post_aliases` 归并。
+    """
+    raw = post.get("quote") or {}
+    if not raw:
+        return None
+    mid = (raw.get("message_id") or "").strip()
+    quoted = by_mid.get((post.get("source", ""), mid)) if mid else None
+
+    if quoted is None:
+        return QuoteData(
+            message_id=mid,
+            cite=raw.get("cite", ""),
+            username=raw.get("username", ""),
+            timestamp="",
+            content=raw.get("content", ""),
+            truncated=bool(raw.get("truncated")),
+            images=list(raw.get("images") or []),
+            resolved=False,
+            index=None,
+        )
+    return QuoteData(
+        message_id=mid,
+        cite=raw.get("cite", ""),
+        username=quoted.get("username", ""),
+        timestamp=normalize_timestamp(quoted.get("timestamp", "")),
+        content=quoted.get("content", ""),
+        translation=quoted.get("translation", ""),
+        # 全文在手，原站那截断就与我们无关了
+        truncated=False,
+        images=list(quoted.get("images") or []),
+        resolved=True,
+        index=index_of.get(post_key(quoted), 0),
+    )
+
+
+def _to_post_data(post: dict, index: int, meta: dict, matched: bool = False,
+                  fresh_days_gap: int = None, url_sources: dict = None,
+                  by_mid: dict = None, index_of: dict = None) -> PostData:
     return PostData(
         source_url=_post_url(post, url_sources or {}),
         fresh_reply=fresh_days_gap is not None,
@@ -147,7 +224,10 @@ def _to_post_data(post: dict, index: int, names: dict, matched: bool = False,
         translation=post.get("translation", ""),
         page_number=post.get("page_number", 1),
         source=post.get("source", ""),
-        source_name=names.get(post.get("source", ""), post.get("source", "")),
+        source_name=meta.get(post.get("source", ""), {}).get(
+            "name", post.get("source", "")),
+        thread_kind=meta.get(post.get("source", ""), {}).get("thread_kind", "feed"),
+        quote=_resolve_quote(post, by_mid or {}, index_of or {}),
         reply_level=int(post.get("reply_level", 0) or 0),
         matched=matched,
         images=post.get("images") or [],
@@ -209,9 +289,14 @@ async def get_posts(
         kw = search.strip().lower()
 
         def is_hit(p):
+            q = p.get("quote") or {}
             return (kw in (p.get("username", "") or "").lower()
                     or kw in (p.get("content", "") or "").lower()
-                    or kw in (p.get("translation", "") or "").lower())
+                    or kw in (p.get("translation", "") or "").lower()
+                    # 引用别人的那一段也要能搜到：用户搜一个说法时，正在回它的人
+                    # 和被引用的人应该一起出现，否则「谁在回应这件事」搜不出来
+                    or kw in (q.get("content", "") or "").lower()
+                    or kw in (q.get("username", "") or "").lower())
 
         hit_keys = {post_key(p) for p in posts if is_hit(p)}
         # 命中评论时保留整棵子树
@@ -238,16 +323,24 @@ async def get_posts(
     # 详情弹窗于是显示错帖子。
     index_of = {post_key(p): i + 1 for i, p in enumerate(posts)}
 
-    names = _source_names(task)
+    # 被引用楼层的索引：引用要靠它解析成「那条楼层自己」的正文与配图。
+    # 键带 source —— message_id 只在来源内唯一，两个平台的数字 id 撞上会把引用挂错人
+    by_mid = {
+        (p.get("source", ""), (p.get("message_id") or "").strip()): p
+        for p in posts if (p.get("message_id") or "").strip()
+    }
+
+    meta = _source_meta(task)
     # 一次查完所有来源：链接是逐条现算的，放在 build() 里会变成每条帖子查一次库
     url_sources = _url_sources()
 
     def build(post) -> PostData:
         item = _to_post_data(
-            post, index_of.get(post_key(post), 0), names,
+            post, index_of.get(post_key(post), 0), meta,
             matched=bool(hit_keys) and post_key(post) in hit_keys,
             fresh_days_gap=fresh.get(post_key(post)),
             url_sources=url_sources,
+            by_mid=by_mid, index_of=index_of,
         )
         item.replies = [build(c) for c in children.get(post_key(post), [])]
         # 整棵子树里有几条新回复，主贴上挂个数好做徽标（嵌套回复也算进来）
@@ -272,8 +365,9 @@ async def get_post_detail(task_id: str, post_index: int):
     if post_index < 0 or post_index >= len(posts):
         raise HTTPException(status_code=404, detail="帖子不存在")
 
-    return _to_post_data(posts[post_index], post_index + 1, _source_names(task),
-                         url_sources=_url_sources())
+    index_of = {post_key(p): i + 1 for i, p in enumerate(posts)}
+    return _to_post_data(posts[post_index], post_index + 1, _source_meta(task),
+                         url_sources=_url_sources(), index_of=index_of) 
 
 
 @router.get("/stats", response_model=TaskStats)
@@ -417,6 +511,12 @@ def _export_rows(task: dict, posts: list, results: list,
         if i < len(results) and results[i]
     }
     names = _source_names(task)
+    # 引用同样要解析到「那条楼层自己」才拿得到全文与配图（见 _resolve_quote）
+    index_of = {post_key(p): i + 1 for i, p in enumerate(posts)}
+    by_mid = {
+        (p.get("source", ""), (p.get("message_id") or "").strip()): p
+        for p in posts if (p.get("message_id") or "").strip()
+    }
     # 标记基于**全量 posts**，且必须在 order_by_thread 之前算 —— 判据看的是
     # 「回复 vs 它的顶层主贴」的时间关系，与呈现次序无关
     fresh = mark_fresh_replies(posts, fresh_days)
@@ -435,6 +535,7 @@ def _export_rows(task: dict, posts: list, results: list,
             "level": int(p.get("reply_level", 0) or 0),
             "username": p.get("username", ""),
             "timestamp": normalize_timestamp(p.get("timestamp", "")),
+            "quote": _export_quote(p, by_mid, index_of),
             "content": p.get("content", ""),
             "translation": p.get("translation", ""),
             # 多模态读出来的图片内容。纯图帖的全部信息都在这里 —— 报告里少了它，
@@ -448,6 +549,25 @@ def _export_rows(task: dict, posts: list, results: list,
             "dimensions": "、".join(r.get("dimensions") or []),
         })
     return rows
+
+
+def _export_quote(post: dict, by_mid: dict, index_of: dict) -> str:
+    """明细表「引用」列的值：这条楼层在回复谁、基于哪一段内容。没有引用就是空串。
+
+    解析规则与 `/posts` 完全共用（`_resolve_quote`），不另写一份 —— 报告和页面各算各的
+    迟早会分家。未解析到楼层时明说「引用片段，原楼未采集」：那段正文可能被原站截断过，
+    假装是全文会让读报告的人以为被引用的人就说了这么多。
+    """
+    quoted = _resolve_quote(post, by_mid, index_of)
+    if quoted is None:
+        return ""
+    body = (quoted.content or "").strip().replace("\n", " ")
+    if len(body) > 200:
+        body = body[:200] + "…"
+    who = quoted.username or "匿名"
+    head = f"引用 @{who}（#{quoted.index}）：" if quoted.resolved else \
+        f"引用 @{who}（引用片段，原楼未采集）："
+    return head + body
 
 
 def _export_meta(task: dict, rows: list, sentiment: dict, posts: list = None,
@@ -498,23 +618,26 @@ async def export_report(
     days = _validate_fresh_days(fresh_days)
     sentiment = _task_sentiment(task_id, posts)
     rows = _export_rows(task, posts, sentiment.get("results") or [], days)
+    # 「引用」列只在报告里真有引用时才出现 —— Facebook 的报告一条都没有，
+    # 列集合与改动前完全一致（导出的字节都能对上）
+    columns = export_columns(rows)
 
     if fmt == "csv":
         output = StringIO()
         writer = csv.writer(output)
-        writer.writerow([label for _, label in EXPORT_COLUMNS])
+        writer.writerow([label for _, label in columns])
         for row in rows:
             # CSV 放不下图，「配图」列给相对路径 —— 用户照着能在 media 目录里找到原图
             writer.writerow([
                 "、".join(row[key]) if key == "images" else row[key]
-                for key, _ in EXPORT_COLUMNS
+                for key, _ in columns
             ])
         # utf-8-sig：没有 BOM 时 Excel 会按本地代码页打开，中文全是乱码
         content = output.getvalue().encode("utf-8-sig")
         media_type = "text/csv; charset=utf-8"
     else:
         content = ExcelService.build_export(
-            rows, _export_meta(task, rows, sentiment, posts, days), EXPORT_COLUMNS
+            rows, _export_meta(task, rows, sentiment, posts, days), columns
         )
         media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 

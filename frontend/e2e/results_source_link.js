@@ -2,8 +2,9 @@
  * 结果页主贴【🔗 原帖】链接的冒烟测试 —— 真 Chrome、真前端、真后端，无 mock。
  *
  * 钉住四件事：
- *   1. Facebook 主贴上真的渲染出了链接
- *   2. href 是 Facebook 自己的 permalink 形态，且末尾那串数字就是这条帖子的 message_id
+ *   1. 主贴上真的渲染出了链接
+ *   2. href 是**它那个来源**的 permalink 形态（Facebook 小组 `/groups/<gid>/permalink/<mid>/`、
+ *      Tweakers `/forum/list_message/<mid>#<mid>`），且末尾那串数字就是这条帖子的 message_id
  *   3. **回复贴一条都不许有** —— 用户明确只要主贴
  *   4. target=_blank + rel 里同时有 noopener 和 noreferrer
  *
@@ -75,8 +76,7 @@ async function pickTask() {
         }
         const roots = data.posts || [];
         const withUrl = roots.filter(p => p.source_url);
-        if (withUrl.length) return { id: t.id, roots, withUrl };
-    }
+        if (withUrl.length) return { id: t.id, roots, withUrl };    }
     return null;
 }
 
@@ -100,10 +100,23 @@ async function main() {
         + `${task.withUrl.length} 条带链接）`);
 
     console.log('\n场景一：后端出口的链接形态');
+    // **按来源的采集器判形态**，不是一律 Facebook 那种。`Collector.post_url()` 是唯一产地，
+    // 每个来源有自己的 URL 形态：Facebook 小组是 `/groups/<gid>/permalink/<mid>/`，
+    // Tweakers 是站点自己在用的 `/forum/list_message/<mid>#<mid>`。
+    // 这条以前只认 Facebook —— 那时 Tweakers 一条链接都给不出来（基类返回 None），
+    // v1.13.0 补上之后，写死 Facebook 形态就会把正确的 Tweakers 链接判成失败
+    const collectors = {};
+    for (const s of await api('/api/v1/sources')) collectors[s.id] = s.collector_id;
+    const SHAPES = {
+        facebook_group: /^https?:\/\/[^/]+\/groups\/\d+\/permalink\/\d+\/$/,
+        tweakers: /^https?:\/\/[^/]+\/forum\/list_message\/\d+#\d+$/,
+    };
     for (const p of task.withUrl.slice(0, 3)) {
-        check(`#${p.index} 是 permalink 形态且带自己的 message_id`,
-            /^https?:\/\/[^/]+\/groups\/\d+\/permalink\/\d+\/$/.test(p.source_url),
-            p.source_url);
+        const cid = collectors[p.source] || '';
+        const shape = SHAPES[cid];
+        check(`#${p.index}（${cid || '未知来源'}）是它那个站点的 permalink 形态且带自己的 message_id`,
+            shape ? shape.test(p.source_url) : /^https?:\/\//.test(p.source_url),
+            { url: p.source_url, collector: cid });
     }
     // 回复贴一条都不许有 —— 这一条在 API 层先验一遍，再到页面上验一遍
     const replies = task.roots.flatMap(p => p.replies || []);

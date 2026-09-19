@@ -1284,6 +1284,20 @@ class TestQuoteApiEndToEnd:
         assert cell.count("引用 @") == 2, f"导出里只留了一条引用: {cell}"
         assert "｜" in cell
 
+    def test_the_detail_endpoint_resolves_quotes_the_same_way(self):
+        """单条详情与列表**必须给出同一个说法**。
+
+        详情少建一次索引，同一个引用在列表里是 `resolved`、在详情里变成「原楼未采集」——
+        两个出口对同一份数据给出两种答案，调用方无从判断该信哪个。
+        """
+        detail = self.client.get(f"/api/v1/tasks/{self.task_id}/posts/1").json()
+        listed = self._flat()[2]["quotes"][0]
+        assert detail["quotes"], "详情里这条引用没了"
+        got = detail["quotes"][0]
+        assert got["resolved"] is True
+        assert got["content"] == listed["content"] == "主题正文"
+        assert got["index"] == listed["index"] == 1
+
     def test_thread_kind_comes_from_the_collector_declaration(self):
         """一源一串 / 一源多主贴由采集器声明给出，前端不认 collector_id"""
         flat = self._flat()

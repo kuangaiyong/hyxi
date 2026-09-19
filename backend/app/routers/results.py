@@ -371,8 +371,15 @@ async def get_post_detail(task_id: str, post_index: int):
         raise HTTPException(status_code=404, detail="帖子不存在")
 
     index_of = {post_key(p): i + 1 for i, p in enumerate(posts)}
+    # 引用要解析到被引用楼层才拿得到全文与配图（见 _resolve_quotes），这里同样得建索引 ——
+    # 少了它，同一个引用在列表里是 resolved、在详情里变成「原楼未采集」，
+    # 两个出口对同一份数据给出两种说法
+    by_mid = {
+        (p.get("source", ""), (p.get("message_id") or "").strip()): p
+        for p in posts if (p.get("message_id") or "").strip()
+    }
     return _to_post_data(posts[post_index], post_index + 1, _source_meta(task),
-                         url_sources=_url_sources(), index_of=index_of) 
+                         url_sources=_url_sources(), by_mid=by_mid, index_of=index_of)
 
 
 @router.get("/stats", response_model=TaskStats)

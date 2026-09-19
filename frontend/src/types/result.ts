@@ -1,3 +1,24 @@
+export interface QuoteData {
+  /** 被引用楼层的 id（原站就写在引用块的链接上）；引用里没有链接时是空串 */
+  message_id: string
+  /** 引用行原文（荷兰语）。被引用楼层没采到时直接显示它 —— 前端不解析荷兰语日期 */
+  cite: string
+  username: string
+  timestamp: string
+  content: string
+  /** 被引用楼层的译文。只有解析到楼层时才有 —— 快照兜底那一段没送过翻译 */
+  translation: string
+  /** 原站把长引用**服务端**截断成 [...]（点「toon volledige bericht」文本不变，实测）。
+      只有快照兜底时才会为真；解析到楼层时拿到的是全文 */
+  truncated: boolean
+  /** 引用块里的图，相对 data/media 的路径。**不是引用者的配图**（那是 post.images） */
+  images: string[]
+  /** 被引用的楼层在本任务里找得到吗 */
+  resolved: boolean
+  /** 找得到时：它在扁平数组里的绝对位置，与列表里的 #序号 是同一个编号 */
+  index: number | null
+}
+
 export interface PostData {
   index: number
   username: string
@@ -14,12 +35,25 @@ export interface PostData {
    */
   source_url: string
   reply_level: number
+  /**
+   * 这个来源装的是什么：
+   *  · `thread` 一个来源 = **一个讨论串**：一条主题 + 按时间平铺的回复（Tweakers 论坛）
+   *  · `feed`   一个来源 = 许多主贴，每条主贴带自己的评论与回复（Facebook 小组）
+   * 只用来选措辞（主题/回复 还是 主贴/评论与回复）。**不要按 source 名字或 collector
+   * 判断来源类型** —— 站点知识在采集器声明里，这里只认这个语义值。
+   */
+  thread_kind: 'thread' | 'feed'
   /** 搜索命中标记：命中评论时父贴会被一起带出来，靠这个区分谁才是命中项 */
   matched: boolean
   /** 正文图，相对 data/media 的路径；渲染时拼成 /api/v1/media/<path>?api_key=… */
   images: string[]
   /** 多模态模型读出来的图片内容。纯图帖的全部信息都在这里 */
   image_desc: string
+  /**
+   * 这条楼层引用了哪一段内容；没有引用是 `null`。
+   * **永远不在 content 里** —— 那是指纹的一部分（改了历史数据全部失配）
+   */
+  quote: QuoteData | null
   /**
    * 「老主贴上的新回复」：这条回复发在近 N 天内，而它所属主贴早于 N 天。
    * 列表按主贴时间从新到旧排、评论跟着主贴走，所以这类回复会被排到很后面 ——

@@ -42,6 +42,28 @@ const hasFilter = computed(() => searchText.value.trim() !== '' || onlyFresh.val
 
 const threadKey = (p: PostData) => `${p.source}:${p.index}`
 
+/**
+ * 这个来源是**一个讨论串**（主题 + 平铺回复）还是**一堆主贴**（主贴 + 评论与回复）。
+ *
+ * 判据是后端按采集器声明给的 `thread_kind`，**不是来源名字、也不是 collector id** ——
+ * 站点知识留在采集器声明里，加一个新来源时前端零改动。
+ * 「主贴」是 Facebook 小组的语汇，用在 Tweakers 的一串上会让人以为那里有 140 个独立帖子。
+ */
+const isThread = (p: PostData) => p.thread_kind === 'thread'
+/** 树根徽标：主题 / 主贴；父贴没采到的回复两种来源都要说实话 */
+function rootBadge(p: PostData): string {
+  if (p.reply_level > 0) return '回复（主贴缺失）'
+  return isThread(p) ? '主题' : '主贴'
+}
+function rootBadgeTitle(p: PostData): string {
+  if (p.reply_level > 0) {
+    return '这是一条回复，它的主贴没有采到，所以单独显示在这里；也因此没有原帖链接'
+  }
+  return isThread(p)
+    ? '这个讨论串的发起帖，其余楼层都挂在它下面'
+    : ''
+}
+
 // 早期采集读不到 tooltip 的绝对时间，落盘就是空的（写相对时间会污染指纹）。
 // 留一段空白看着像功能坏了，明说没有反而清楚。
 const postTime = (p: PostData) => p.timestamp?.trim() || '时间未知'
@@ -362,7 +384,7 @@ function getStatusText(): string {
             v-model="searchText"
             type="text"
             class="form-input"
-            placeholder="搜索用户名、原文或翻译..."
+            placeholder="搜索用户名、原文、翻译或引用..."
             style="padding: 6px 10px; font-size: 13px;"
             @keyup.enter="handleSearch"
           />
@@ -398,7 +420,8 @@ function getStatusText(): string {
               @click="viewMode = m[0]"
             >{{ m[1] }}</button>
           </div>
-          <span class="text-sm text-secondary">共 {{ taskStore.postsTotal }} 个主贴</span>
+          <span class="text-sm text-secondary">共 {{ taskStore.postsTotal }} 个{{
+            threads.some((t) => isThread(t.root)) ? '主题' : '主贴' }}</span>
         </div>
       </div>
 
@@ -422,6 +445,7 @@ function getStatusText(): string {
           v-for="t in threads"
           :key="threadKey(t.root)"
           class="thread"
+          :id="'post-' + t.root.index"
           :class="{ hit: t.root.matched }"
         >
           <header class="thread-head">
@@ -431,10 +455,8 @@ function getStatusText(): string {
             <span
               class="badge-role"
               :class="{ 'is-orphan': t.root.reply_level > 0 }"
-              :title="t.root.reply_level > 0
-                ? '这是一条回复，它的主贴没有采到，所以单独显示在这里；也因此没有原帖链接'
-                : ''"
-            >{{ t.root.reply_level > 0 ? '回复（主贴缺失）' : '主贴' }}</span>
+              :title="rootBadgeTitle(t.root)"
+            >{{ rootBadge(t.root) }}</span>
             <span class="badge-source">{{ t.root.source_name }}</span>
             <strong class="root-user">{{ t.root.username }}</strong>
             <span class="text-sm text-secondary">{{ postTime(t.root) }}</span>
@@ -488,13 +510,18 @@ function getStatusText(): string {
           <PostContent :post="t.root" :mode="viewMode" @zoom="zoomUrl = $event" />
 
           <div v-if="t.replies.length" class="replies">
-            <div class="replies-label">💬 {{ t.replies.length }} 条评论与回复</div>
-            <!-- 缩进随层级递增：评论一层，回复挂在它回复的那条下面再缩一层，和原帖浮层一样 -->
+            <div class="replies-label">
+              💬 {{ t.replies.length }} 条{{ isThread(t.root) ? '回复' : '评论与回复' }}
+            </div>
+            <!-- 缩进随层级递增：评论一层，回复挂在它回复的那条下面再缩一层，和原帖浮层一样。
+                 Tweakers 的一串是**平铺**的（全是第 1 层，缩进为 0）—— 那里表达「我在回谁」
+                 靠的是引用框，不是缩进 -->
             <div
               v-for="{ post: r, parentName, descendants } in t.replies"
               :key="threadKey(r)"
               class="reply"
               :class="{ hit: r.matched, fresh: r.fresh_reply }"
+              :id="'post-' + r.index"
               :style="{ marginLeft: Math.min(r.reply_level - 1, 3) * 18 + 'px' }"
             >
               <div class="reply-head">

@@ -31,7 +31,7 @@ description: hyxi 测试基础设施的实现细节：选测脚本 scripts/test_
 - **测试会话默认指向临时数据目录**（`TWEAKERS_DATA_DIR` / `TASKS_DIR` / `EXPORTS_DIR`，在任何 app 模块导入之前设好）。
   以前「测试不写真实库」靠的是 test_api.py 恰好排在最前面、`setup_class` 先改路径再导入 orchestrator，单跑某个类、
   并行打乱顺序时就没了（`TestSuiteDataIsolation` 守）
-- `browser` 标记给起真 Chrome 的 5 个类（快慢分道用，漏标只影响快道快不快）；有 `setup_class` 的类打 `xdist_group`，
+- `browser` 标记给起真 Chrome 的 7 个类（快慢分道用，漏标只影响快道快不快）；有 `setup_class` 的类打 `xdist_group`，
   并行时整类留在一个进程。**标记钩子必须 `tryfirst`**：xdist 在 worker 里读分组的钩子按注册顺序会先跑，
   那时标记还没打上，分组整个不生效（实测 `TestAPIEndpointsEndToEnd` 被拆到两个进程）
 - `pytest.ini` 只为钉住 rootdir：命令行里混进一个仓库外的路径（比如 `--cov-config 临时文件` 分开写），rootdir 会

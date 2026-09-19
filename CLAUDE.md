@@ -214,6 +214,30 @@ submit 按钮、Arkose 人机验证）、小组页 DOM 实测结论，以及已�
 
 `page_number` 对信息流类来源没有页的含义，`group_feed` 填的是**滚动批次序号**，保证字段非空；它的增量走时间水位线（`incremental_strategy = "watermark"`）而不是页码。
 
+**「一个来源 = 一个讨论串」和「一个来源 = 一堆主贴」是两种来源，由 `Collector.thread_kind` 声明**：
+
+- `"thread"`（Tweakers）：**一个来源就是一串** —— 一条主题 + 按时间**平铺**的回复。
+  主题 = 显示第 1 页的第一条 `.message`（真站实测）。**`.message.topicstarter` 不是主题标记**，
+  它标的是「这条是发起人写的」，第 1 页就有 15 条 —— 照它认主题会认出一堆。
+  其余楼层一律 `parent_fingerprint` 指向主题、`reply_level = 1`：Tweakers **没有**「回复的回复」
+  这一层，表达「我在回谁」靠的是引用块，而引用是 `quotes` 字段、**不是父指针**
+- `"feed"`（Facebook 小组 / group_feed）：许多主贴，每条主贴带自己的评论与回复，层级任意深
+
+增量跑从 `max_page_number + 1` 起抓，**看不到第 1 页**，主题指纹由 `CollectorRunner` 从库里
+查出来随 job 下发（`topic_fingerprint`）。判据是「父指针为空且 `reply_level = 0` 的行**恰好一条**」；
+0 条或 >1 条一律返回 `None` 并让脚本打警告 —— **不许猜**：随手挑一条普通楼层当主题，
+新楼层会全挂到它下面，页面看着像对的、实际每个串都错。存量库（改造前采的 N 条并列主贴）
+就是这种状态，唯一的解法是那个数据源跑一次**全量重跑**。
+
+**引用（Tweakers 的引用块）是独立的一份数据，绝不许并进 `content`。** 指纹吃
+`content[:100]`，并进去全部历史数据失配、已翻译的帖子会被判成新帖重新付费翻译。
+它存 `posts.quotes_json`（**一条楼层可以引多人**，所以是数组），采集那一刻的快照；
+出口拿快照里的 `message_id` 去本任务的帖子里找被引用楼层，**找得到就用那条楼层自己的
+正文/译文/配图**（只有这条路拿得到全文 —— 原站的长引用被服务端截断成 `[...]`，点
+`toon volledige bericht` 文本一个字符都不变，实测点不开），找不到才退回快照并标
+`resolved=false`。**引用块里的图归被引用者**：它们落进 `quote.images`，
+既不进引用者的 `post.images`，也不进多模态理解。
+
 ## API 端点
 
 全表（含参数与语义注解）见 `Skill(hyxi-architecture)`。分组概览：
@@ -286,7 +310,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 先 `Skill(hyxi-test-infra)`** —— 映射怎么建、为什么按进程归属覆盖率、会话级护栏各防什么，都在那里。
 
 **前端没有单元测试框架**（package.json 里无 vitest / jest / @vue/test-utils），
-七条前端回归靠真浏览器守，都在 `frontend/e2e/` 下：
+八条前端回归靠真浏览器守，都在 `frontend/e2e/` 下：
 
 | 脚本 | 命令 | 守的是 |
 |---|---|---|
@@ -296,6 +320,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 | `stale_bundle_navigation.js` | `npm run e2e:stale` | 服务端换了构建后点导航必须有反馈，不许静默失败 |
 | `access_key_flow.js` | `npm run e2e:key` | 被 401 挡住后照提示填服务访问密钥：找得到、首屏可见、填错明说、填对当场生效 |
 | `results_thread_structure.js` | `npm run e2e:thread` | 回复全部展开且顺序同原帖、层级缩进与「回复 某某」、「已采 X · 原帖 Y」对账（没有第 2 层回复的数据时退出码 2） |
+| `results_tweakers_quotes.js` | `npm run e2e:quotes` | 一源一串：只出一张「主题」卡、回复区标题、引用框条数与出口一致（**一条楼层可引多人**）、解析到的给「#序号」、引用图落在引用框里（没有这种数据时退出码 2） |
 | `results_backfill_translation.js` | `npm run e2e:backfill` | 补译提示条：N 与 `/stats`、出口三处一致；没待补译时不显示；`E2E_BACKFILL_CLICK=1` 才点按钮（真调模型） |
 
 真 Chrome、真前后端、无 mock，**要求两个服务都起着**（先跑 `.\start.ps1`），所以它们
@@ -392,8 +417,16 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 - **绝不按下标跨任务顶替舆情结果**：查不到就是「未分析」，不许 fallback 到最新一条
 - **LLM 重试分两层**：`_retry_with_backoff` 是传输层退避（只管 429/5xx）；解析失败是另一回事
 
-> **当前状态（2026-07-31 实测）：本机出口 IP 已被 Tweakers 防火墙整体封禁**，
-> 任何请求都会跳 DPG 隐私 gate 后拿到 403。本地 fixture 站点是唯一能跑通的验证手段。
+> **当前状态（2026-09-19 重新实测）：Tweakers 抓得了，之前「IP 被整体封禁」这个结论是错的。**
+> `curl` 那类非浏览器客户端会被 DPG 的 WAF 403（响应里点名 ClientIP），但**真 Chrome
+> 完全打得开** —— 浏览器的 TLS/JA3 与请求头过得去。所以真站是可验证、可重采的：
+> 2026-09-19 用真 Chrome 把串 `2336074` 全量跑通（3 页 203 楼、complete=true）。
+> 由此多出两条纪律：
+> ① **图片一律让浏览器自己取**（滚动触发懒加载 + 为 `[Afbeelding]` 锚点建游离 `Image`）。
+>    `context.request` 那条回源路一轮连打十几次会被 WAF 挡掉一批 —— 实测 16/35 张 403，
+>    而它表现为「图静默缺失」，页面和日志上都看不出来
+> ② **连着打十几次同域请求这件事本身就会触发 WAF**。验证真站时按采集器的节奏走，
+>    不要为了「快一点」把间隔去掉
 
 ## 常见陷阱
 

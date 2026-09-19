@@ -5081,7 +5081,7 @@ class TestTweakersThreadAndQuotesEndToEnd(_TweakersFixture):
         by_id = {p["message_id"]: p for p in self._collect()["posts"]}
 
         # 80000005 引用 Marloes（80000004）：真站 97 条引用里 94 条长这样，带 messagelink
-        quote = by_id["80000005"]["quote"]
+        quote = by_id["80000005"]["quotes"][0]
         assert quote["message_id"] == "80000004"
         assert quote["username"] == "Marloes"
         assert quote["cite"] == "Marloes schreef op zondag 24 mei 2026 @ 11:03"
@@ -5091,12 +5091,37 @@ class TestTweakersThreadAndQuotesEndToEnd(_TweakersFixture):
         assert quote["truncated"] is True
 
         # 80000001 的引用块没有 messagelink（真站 97 条里有 3 条这样）：只有快照
-        plain = by_id["80000001"]["quote"]
+        plain = by_id["80000001"]["quotes"][0]
         assert plain["message_id"] == ""
         assert plain["cite"] == ""
         assert plain["username"] == ""
         assert "Heeft iemand hier al ervaring" in plain["content"]
         assert plain["truncated"] is False
+
+    def test_a_floor_can_quote_more_than_one_person(self):
+        """**一条楼层引多人**：真站实测串 2336074 第 1 页就有一处。
+
+        只取第一个引用块是静默丢内容 —— 页面上完全看不出来少了一段。这里两段引用
+        一个有 messagelink、一个没有，正好把「多条」与「逐条各自解析」一起钉住。
+        """
+        by_id = {p["message_id"]: p for p in self._collect()["posts"]}
+        quotes = by_id["80000003"]["quotes"]
+        assert len(quotes) == 2, f"第二条引用被丢了: {quotes}"
+        assert quotes[0]["message_id"] == "80000002"
+        assert quotes[0]["username"] == "Havelaar"
+        assert "Support reageerde" in quotes[0]["content"]
+        # 第二条没有 messagelink → 只有快照
+        assert quotes[1]["message_id"] == ""
+        assert quotes[1]["cite"] == ""
+        assert "De garantie geldt alleen" in quotes[1]["content"]
+        # 而这一条自己的正文照旧一个字都没多
+        assert by_id["80000003"]["content"] == (
+            "Let op: de garantie geldt alleen bij installatie door een gecertificeerde partij. "
+            "Dat stond niet duidelijk in de brochure."
+        )
+        # 没有引用块的楼层**不带这个键**（同 _processed 那条规矩：只放已置位的键）。
+        # 出口那一层才会统一成空数组，见 TestQuoteApiEndToEnd
+        assert "quotes" not in by_id["80000009"]
 
     def test_quoted_content_never_enters_the_fingerprint(self):
         """**本次最重要的一条。** 指纹吃 `用户名|时间戳|正文前100字`。
@@ -5116,7 +5141,7 @@ class TestTweakersThreadAndQuotesEndToEnd(_TweakersFixture):
             assert post["fingerprint"] == want["fingerprint"], f"{want['message_id']} 的指纹变了"
 
         # 引用确实抓到了 —— 否则上面两句在「压根没实现引用」的代码上照样绿
-        assert got["80000005"]["quote"]["message_id"] == "80000004"
+        assert got["80000005"]["quotes"][0]["message_id"] == "80000004"
 
     def test_the_quoted_image_goes_to_the_quote_not_to_the_quoter(self):
         """引用块里的图 = 被引用者的图。既不能丢，也不能算到引用者头上。
@@ -5128,7 +5153,7 @@ class TestTweakersThreadAndQuotesEndToEnd(_TweakersFixture):
         by_id = {p["message_id"]: p for p in self._collect()["posts"]}
 
         # 锚点那一路
-        quoted = by_id["80000005"]["quote"].get("images") or []
+        quoted = by_id["80000005"]["quotes"][0].get("images") or []
         assert len(quoted) == 1, f"[Afbeelding] 锚点指的那张图没落盘: {quoted}"
         assert quoted[0].startswith("fixture_tweakers/"), f"没按 source 分目录: {quoted[0]}"
         assert not os.path.isabs(quoted[0]), "存了绝对路径，落盘文件就搬不了机器了"
@@ -5136,7 +5161,7 @@ class TestTweakersThreadAndQuotesEndToEnd(_TweakersFixture):
         assert not by_id["80000005"].get("images"), "引用图算到引用者自己的配图上了"
 
         # <img> 那一路：引用块里 400x300 的正文图同样归被引用者
-        inline = by_id["80000001"]["quote"].get("images") or []
+        inline = by_id["80000001"]["quotes"][0].get("images") or []
         assert len(inline) == 1, f"引用块里的正文图没归到引用头上: {inline}"
         assert os.path.getsize(os.path.join(self.media, inline[0])) > 0
         assert not by_id["80000001"].get("images"), "把引用块里的图算到引用者头上了"

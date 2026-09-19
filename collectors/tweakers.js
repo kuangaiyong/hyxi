@@ -82,7 +82,7 @@ async function extractPosts(page, displayPage) {
         // 里的引用块 DOM 同样是猜的（`.cite` 这个 span 真站没有）。照它写选择器，测试全绿，
         // 真站上却一段引用都收不到。
         const QUOTE_SEL = 'blockquote, .message-quote-div';
-        const scan = { candidates: [], accepted: [], rejected: [], quoteExtra: 0, skippedNoId: 0 };
+        const scan = { candidates: [], accepted: [], rejected: [], skippedNoId: 0 };
         const results = [];
         const msgBlocks = document.querySelectorAll('.message[data-message-id]');
         // 每一条 `.message` 都该带 data-message-id（真站 3 页实测 203/203）。少了就说明
@@ -207,15 +207,16 @@ async function extractPosts(page, displayPage) {
                 }
 
                 // 引用块。**先读它再读正文图**：引用块里的图归被引用者，
-                // 正文图那一轮要按 QUOTE_SEL 把它们跳过，谁收谁不收必须只有一个说法
-                let quote = null;
+                // 正文图那一轮要按 QUOTE_SEL 把它们跳过，谁收谁不收必须只有一个说法。
+                //
+                // **一条楼层可能有多个引用块**：真站实测串 2336074 第 1 页有一处
+                // （先引 tonko020445 带链接，再引另一段没有链接）—— 多引用是平台支持的写法。
+                // 只取第一个就是静默丢掉一段被引用的内容，页面上完全看不出来
+                const quotes = [];
                 if (contentEl) {
-                    const bqs = Array.prototype.filter.call(
-                        contentEl.children, el => el.tagName === 'BLOCKQUOTE');
-                    // 真站上一条帖子最多一个引用块（实测 97/97），多出来的只取第一个并记账：
-                    // 静默丢掉一段引用，页面上完全看不出来
-                    if (bqs.length > 1) scan.quoteExtra += bqs.length - 1;
-                    if (bqs[0]) quote = readQuote(bqs[0]);
+                    Array.prototype.forEach.call(
+                        contentEl.children,
+                        el => { if (el.tagName === 'BLOCKQUOTE') quotes.push(readQuote(el)); });
                 }
 
                 // 正文图。**必须在原始元素上量尺寸**：上面那个 clone 游离于文档之外，
@@ -264,9 +265,9 @@ async function extractPosts(page, displayPage) {
                         content: content,
                         page_number: displayPage,
                         message_id: messageId,
-                        // 引用块单独一份，**绝不并进 content**（指纹）。没有引用就是 null，
-                        // 出口按 null 决定不渲染，不需要判断来源
-                        quote: quote,
+                        // 引用块各自独立一份，**绝不并进 content**（指纹）。没有引用就是空数组，
+                        // 出口按空数组决定不渲染，不需要判断来源
+                        quotes: quotes,
                         // 临时字段：saveImages() 落盘后就删，换成本地路径的 images。
                         // 指纹只吃 username|timestamp|content[:100]，多挂一个不影响它
                         _imageUrls: imageUrls,
@@ -282,6 +283,76 @@ async function extractPosts(page, displayPage) {
 }
 
 /**
+ * 把整页滚一遍，让**浏览器自己**把懒加载的图取回来。
+ *
+ * 真站实测（2026-09-19，串 2336074 第 1 页）：不滚动时 13 张正文图只加载了 1 张，
+ * 其余全落到 `context.request` 那条回源路上 —— 而那条路一轮连打十几次会被 WAF 挡掉
+ * 一批（实测 16/35 张 403），**图片就这样静默缺了**；滚到底之后 13/13 由浏览器加载。
+ * 这也正是 `media.js` 那套响应缓存的立论 —— 图从浏览器自己的网络栈、cookie 与指纹
+ * 走，不制造第二条通道，顺带把「页面加载一次 + 回源一次」减成「只加载一次」。
+ *
+ * 不额外加请求间隔：这些图本来就是页面自己的资源，一个真实读者往下翻也会把它们加载出来。
+ * 步长与节奏按「快速翻完一页」定，不是逐屏细读。
+ */
+async function loadLazyImages(page) {
+    let height = 0;
+    try {
+        height = await page.evaluate(() => document.body.scrollHeight);
+    } catch (e) {
+        return;   // 页面结构读不到就算了，图少几张不该拦住整轮
+    }
+    const step = 1200;
+    for (let y = 0; y < height; y += step) {
+        await page.evaluate((yy) => window.scrollTo(0, yy), y).catch(() => {});
+        await sleep(120);
+        // 滚下去之后可能又插进来了内容（懒加载的分页/图片占位），高度会变
+        if (y && y % (step * 10) === 0) {
+            height = await page.evaluate(() => document.body.scrollHeight).catch(() => height);
+        }
+    }
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+    // 等网络静下来。**不能等太久也别抛**：站上有轮询类请求时 networkidle 可能永远不成立，
+    // 而没加载完的那些图还有 saveImages 的回源兜底
+    await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+}
+
+/**
+ * 把引用块里那些图让**浏览器**取回来。
+ *
+ * 真站上被引用的照片在引用块里不是 `<img>`，是一个 `<a href="…原图…">[Afbeelding]</a>`
+ * 锚点 —— 浏览器**根本不会去请求它**，于是这批图永远只能走 `context.request` 那条回源路。
+ * 而那条路一轮连打十几次会被 WAF 挡掉一批（真站实测 16/35 张 403，图就静默缺了）。
+ *
+ * 这里按原图地址建一批游离的 `Image` 对象，请求由页面自己的网络栈发出（同一套 cookie 与
+ * 指纹），`attachImageCapture` 就能把响应体留下来，`saveImages` 直接写盘、一次请求都不多发。
+ * 这也正是 media.js 那套缓存的立论：**不要为页面上已有的资源再开一条通道**。
+ *
+ * 每个地址最多等 8 秒，整批并发等一次 —— 数量是「本轮有几个 [Afbeelding] 锚点」级别
+ * （真站实测每页 7 个以内），不是逐张串行。
+ */
+async function prefetchQuotedImages(page) {
+    try {
+        await page.evaluate(async () => {
+            const urls = [];
+            document.querySelectorAll('blockquote a[href]').forEach((a) => {
+                if ((a.textContent || '').trim() !== '[Afbeelding]') return;
+                urls.push(a.href);
+            });
+            await Promise.all(urls.map((u) => new Promise((res) => {
+                const im = new Image();
+                const done = () => res();
+                im.onload = done;
+                im.onerror = done;
+                setTimeout(done, 8000);
+                im.src = u;
+            })));
+        });
+    } catch (e) {
+        // 拿不到就让 saveImages 的回源兜底，不该因为几张引用图把整页拖失败
+    }
+}
+
+/**
  * 提取一页 + 把这页的图落盘（正文图与引用图分开）。
  *
  * 指纹在这里就先算出来 —— 图片文件名要用它，而正式那轮指纹循环在浏览器关掉之后才跑。
@@ -290,13 +361,12 @@ async function extractPosts(page, displayPage) {
  * 已抓到的那些页也保住了自己的图。
  */
 async function grabPage(page, context, capture, tally, displayPage) {
+    await loadLazyImages(page);
+    await prefetchQuotedImages(page);
     const { posts, scan } = await extractPosts(page, displayPage);
     logImageScan(scan, tally);
     if (scan.skippedNoId) {
         log(`   ⚠️ 有 ${scan.skippedNoId} 条 .message 没有 data-message-id，这一页漏掉了它们`);
-    }
-    if (scan.quoteExtra) {
-        log(`   ⚠️ 有 ${scan.quoteExtra} 处多余引用块只取了第一个 —— 一条帖子按理只有一个`);
     }
     posts.forEach(p => { p.fingerprint = makeFingerprint(p); });
     // 主题（帖子发起帖）= **显示第 1 页的第一条楼层**。**不能用 `.message.topicstarter`**：

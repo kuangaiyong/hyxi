@@ -26,18 +26,17 @@ function clip(text: string): string {
 }
 
 const QUOTE_LIMIT = 300
-const quote = computed(() => props.post.quote || null)
+/** 一条楼层可以引多人（原站支持多引用），逐条渲染，不丢后面的 */
+const quotes = computed(() => props.post.quotes || [])
 function clipQuote(text: string): string {
   if (quoteExpanded.value || !text || text.length <= QUOTE_LIMIT) return text
   return text.slice(0, QUOTE_LIMIT) + '…'
 }
-const quoteTooLong = computed(() => {
-  const q = quote.value
-  if (!q) return false
+function quoteTooLong(q: { content?: string; translation?: string }): boolean {
   const o = showOrig.value ? (q.content || '').length : 0
   const z = showZh.value ? (q.translation || '').length : 0
   return Math.max(o, z) > QUOTE_LIMIT
-})
+}
 
 const tooLong = computed(() => {
   const o = showOrig.value ? (props.post.content || '').length : 0
@@ -52,9 +51,9 @@ function mediaUrl(rel: string): string {
 }
 
 /** 引用被人时用谁的名字：解析到楼层用它自己的，否则用快照里从引用行解出来的 */
-const quoteWho = computed(() => quote.value?.username
-  || quote.value?.cite
-  || '（未署名）')
+function quoteWho(q: { username?: string; cite?: string }): string {
+  return q.username || q.cite || '（未署名）'
+}
 </script>
 
 <template>
@@ -62,11 +61,16 @@ const quoteWho = computed(() => quote.value?.username
     <!-- 引用框在正文**上方** —— 和原站一样（引用块就是 .messagecontent 的第一个子元素）。
          它显示的永远是被引用者的内容与配图，与引用者自己的正文/配图分开渲染：
          混在一起就是把人家的图和话算到引用者头上 -->
-    <blockquote v-if="quote" class="pc-quote" data-testid="quote-box">
+    <blockquote
+      v-for="(quote, qi) in quotes"
+      :key="qi"
+      class="pc-quote"
+      data-testid="quote-box"
+    >
       <div class="pc-quote-head">
         <span class="pc-quote-mark">↖</span>
         <span class="pc-quote-label">引用</span>
-        <strong class="pc-quote-user">{{ quoteWho }}</strong>
+        <strong class="pc-quote-user">{{ quoteWho(quote) }}</strong>
         <span v-if="quote.resolved && quote.timestamp" class="pc-quote-time">{{ quote.timestamp }}</span>
         <!-- 解析到楼层时给出它在列表里的位置（内部锚点跳转）。
              没解析到时明说：这段可能只是原站给的一截，别让用户以为被引用的人就说了这么多 -->
@@ -86,7 +90,7 @@ const quoteWho = computed(() => quote.value?.username
         {{ clipQuote(quote.translation) }}
       </p>
       <p v-else-if="showZh && quote.content" class="pc-quote-untranslated">（这一段尚无译文）</p>
-      <button v-if="quoteTooLong" class="pc-more" @click="quoteExpanded = !quoteExpanded">
+      <button v-if="quoteTooLong(quote)" class="pc-more" @click="quoteExpanded = !quoteExpanded">
         {{ quoteExpanded ? '收起引用 ▴' : '展开引用 ▾' }}
       </button>
       <div v-if="quote.images && quote.images.length" class="pc-images pc-quote-images">

@@ -179,7 +179,7 @@ async function fetchOne(context, capture, url, errors) {
  *
  * 单张失败只跳过这一张，帖子照常入库 —— 图片是附加信息，不该把整条拖失败。
  *
- * **一条帖子的图有两份：它自己的，和它引用那条的**（`post.quote._imageUrls`）。
+ * **一条帖子的图有两份：它自己的，和它引用那条的**（`post.quotes[]._imageUrls`）。
  * 两份分开写、分开记：混成一份就是把别人的图算到引用者头上。「引用块里的图不算引用者的」
  * 这条规矩在抓取侧已经执行（正文图跳过引用块），这里是它的另一半 —— 那些图不是丢掉，
  * 是换个归属落盘，文件名带一个 `q` 后缀
@@ -188,7 +188,7 @@ async function saveImages(context, capture, posts, { mediaDir, sourceId, tally }
     if (!mediaDir) {
         posts.forEach((p) => {
             delete p._imageUrls;
-            if (p.quote) delete p.quote._imageUrls;
+            (p.quotes || []).forEach((q) => delete q._imageUrls);
         });
         return;
     }
@@ -201,7 +201,7 @@ async function saveImages(context, capture, posts, { mediaDir, sourceId, tally }
     let cached = 0;
     const errors = [];
 
-    /** 落一组图，返回相对路径数组。suffix 为空 = 帖子自己的，'q' = 它引用那条的 */
+    /** 落一组图，返回相对路径数组。suffix 为空 = 帖子自己的，`q<i>_` = 它第 i 条引用的 */
     const saveGroup = async (urls, suffix, fingerprint) => {
         if (!urls.length) return [];
         wanted += urls.length;
@@ -229,16 +229,21 @@ async function saveImages(context, capture, posts, { mediaDir, sourceId, tally }
 
     for (const post of posts) {
         const own = post._imageUrls || [];
-        const quoted = (post.quote && post.quote._imageUrls) || [];
+        const quotes = post.quotes || [];
+        // 先把要落的图取出来，再删临时字段（删了之后就读不到了）
+        const quotedUrls = quotes.map((q) => q._imageUrls || []);
         delete post._imageUrls;
-        if (post.quote) delete post.quote._imageUrls;
-        if (!own.length && !quoted.length) continue;
+        quotes.forEach((q) => delete q._imageUrls);
+        if (!own.length && !quotedUrls.some((u) => u.length)) continue;
 
         const rels = await saveGroup(own, '', post.fingerprint);
         if (rels.length) post.images = rels;
-        if (post.quote) {
-            const quotedRels = await saveGroup(quoted, 'q', post.fingerprint);
-            if (quotedRels.length) post.quote.images = quotedRels;
+        // 多个引用块各落各的：文件名带 `q<引用序号>_<图序号>`，两条引用引同一张图也不会
+        // 互相覆盖（真站实测一条楼层可以引两个人）
+        for (let qi = 0; qi < quotedUrls.length; qi++) {
+            if (!quotedUrls[qi].length) continue;
+            const quotedRels = await saveGroup(quotedUrls[qi], `q${qi}_`, post.fingerprint);
+            if (quotedRels.length) quotes[qi].images = quotedRels;
         }
     }
 

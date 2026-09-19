@@ -5,7 +5,7 @@ import csv
 from io import StringIO
 from collections import Counter
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 from urllib.parse import quote
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
@@ -163,8 +163,8 @@ def _post_url(post: dict, url_sources: dict) -> str:
     return collector.post_url(source, message_id) or ""
 
 
-def _resolve_quote(post: dict, by_mid: dict, index_of: dict) -> Optional[QuoteData]:
-    """把这条楼层的引用（`post["quote"]` 快照）解析成出口结构；没有引用返回 None。
+def _resolve_quotes(post: dict, by_mid: dict, index_of: dict) -> List[QuoteData]:
+    """把这条楼层的引用（`post["quotes"]` 快照数组）解析成出口结构；没有引用返回空数组。
 
     **被引用楼层在本任务里找得到时，一律用它自己那一份**（用户名、时间、正文、译文、配图）。
     这不是优化，是唯一正确的做法：
@@ -177,9 +177,13 @@ def _resolve_quote(post: dict, by_mid: dict, index_of: dict) -> Optional[QuoteDa
 
     解析**只在出口做、不落库**：落一份指纹就是双写，而且指纹会被 `post_aliases` 归并。
     """
-    raw = post.get("quote") or {}
-    if not raw:
-        return None
+    out: List[QuoteData] = []
+    for raw in post.get("quotes") or []:
+        out.append(_resolve_one_quote(post, raw, by_mid, index_of))
+    return out
+
+
+def _resolve_one_quote(post: dict, raw: dict, by_mid: dict, index_of: dict) -> QuoteData:
     mid = (raw.get("message_id") or "").strip()
     quoted = by_mid.get((post.get("source", ""), mid)) if mid else None
 
@@ -227,7 +231,7 @@ def _to_post_data(post: dict, index: int, meta: dict, matched: bool = False,
         source_name=meta.get(post.get("source", ""), {}).get(
             "name", post.get("source", "")),
         thread_kind=meta.get(post.get("source", ""), {}).get("thread_kind", "feed"),
-        quote=_resolve_quote(post, by_mid or {}, index_of or {}),
+        quotes=_resolve_quotes(post, by_mid or {}, index_of or {}),
         reply_level=int(post.get("reply_level", 0) or 0),
         matched=matched,
         images=post.get("images") or [],
@@ -289,14 +293,15 @@ async def get_posts(
         kw = search.strip().lower()
 
         def is_hit(p):
-            q = p.get("quote") or {}
+            quotes = p.get("quotes") or []
             return (kw in (p.get("username", "") or "").lower()
                     or kw in (p.get("content", "") or "").lower()
                     or kw in (p.get("translation", "") or "").lower()
                     # 引用别人的那一段也要能搜到：用户搜一个说法时，正在回它的人
                     # 和被引用的人应该一起出现，否则「谁在回应这件事」搜不出来
-                    or kw in (q.get("content", "") or "").lower()
-                    or kw in (q.get("username", "") or "").lower())
+                    or any(kw in (q.get("content", "") or "").lower()
+                           or kw in (q.get("username", "") or "").lower()
+                           for q in quotes))
 
         hit_keys = {post_key(p) for p in posts if is_hit(p)}
         # 命中评论时保留整棵子树
@@ -511,7 +516,7 @@ def _export_rows(task: dict, posts: list, results: list,
         if i < len(results) and results[i]
     }
     names = _source_names(task)
-    # 引用同样要解析到「那条楼层自己」才拿得到全文与配图（见 _resolve_quote）
+    # 引用同样要解析到「那条楼层自己」才拿得到全文与配图（见 _resolve_quotes）
     index_of = {post_key(p): i + 1 for i, p in enumerate(posts)}
     by_mid = {
         (p.get("source", ""), (p.get("message_id") or "").strip()): p
@@ -554,20 +559,22 @@ def _export_rows(task: dict, posts: list, results: list,
 def _export_quote(post: dict, by_mid: dict, index_of: dict) -> str:
     """明细表「引用」列的值：这条楼层在回复谁、基于哪一段内容。没有引用就是空串。
 
-    解析规则与 `/posts` 完全共用（`_resolve_quote`），不另写一份 —— 报告和页面各算各的
+    一条楼层可能引多人（真站实测），逐条列出来、用 ｜ 分隔，**不截断成第一条**。
+
+    解析规则与 `/posts` 完全共用（`_resolve_quotes`），不另写一份 —— 报告和页面各算各的
     迟早会分家。未解析到楼层时明说「引用片段，原楼未采集」：那段正文可能被原站截断过，
     假装是全文会让读报告的人以为被引用的人就说了这么多。
     """
-    quoted = _resolve_quote(post, by_mid, index_of)
-    if quoted is None:
-        return ""
-    body = (quoted.content or "").strip().replace("\n", " ")
-    if len(body) > 200:
-        body = body[:200] + "…"
-    who = quoted.username or "匿名"
-    head = f"引用 @{who}（#{quoted.index}）：" if quoted.resolved else \
-        f"引用 @{who}（引用片段，原楼未采集）："
-    return head + body
+    parts = []
+    for quoted in _resolve_quotes(post, by_mid, index_of):
+        body = (quoted.content or "").strip().replace("\n", " ")
+        if len(body) > 200:
+            body = body[:200] + "…"
+        who = quoted.username or "匿名"
+        head = f"引用 @{who}（#{quoted.index}）：" if quoted.resolved else \
+            f"引用 @{who}（引用片段，原楼未采集）："
+        parts.append(head + body)
+    return " ｜ ".join(parts)
 
 
 def _export_meta(task: dict, rows: list, sentiment: dict, posts: list = None,

@@ -128,11 +128,12 @@ CREATE TABLE IF NOT EXISTS posts (
     -- 多模态模型对本帖配图的中文描述。落库是为了不重复付费：主贴的图会被它下面
     -- 每一条回复的整串上下文引用，不存的话增量分析每轮都要把同一张图重新描述一遍
     image_desc         TEXT NOT NULL DEFAULT '',
-    -- 这条楼层引用了哪一段内容（Tweakers 的引用块）。**绝不许并进 content** —— 指纹吃
-    -- content[:100]，并进去全部历史数据失配、已翻译的帖子会被判成新帖重新付费翻译。
-    -- 存的是采集那一刻的快照 {message_id, cite, username, content, truncated, images}：
-    -- 被引用楼层没采到时它是唯一的内容（原站的长引用被服务端截断成 [...]，点不开）
-    quote_json         TEXT NOT NULL DEFAULT '',
+    -- 这条楼层引用了哪些内容（Tweakers 的引用块，**一条楼层可以引多人**）。绝不许并进
+    -- content —— 指纹吃 content[:100]，并进去全部历史数据失配、已翻译的帖子会被判成
+    -- 新帖重新付费翻译。存的是采集那一刻的快照数组
+    -- [{message_id, cite, username, content, truncated, images}]：
+    -- 被引用楼层没采到时快照是唯一的内容（原站的长引用被服务端截断成 [...]，点不开）
+    quotes_json        TEXT NOT NULL DEFAULT '',
     translated         INTEGER NOT NULL DEFAULT 0,
     sentiment_at       TEXT,
     -- 原帖上显示的评论数（含回复的回复），只有主贴有，读不到是 NULL。结果页拿它和
@@ -182,7 +183,7 @@ def init_db():
         _drop_stored_summary(conn)
         _ensure_posts_image_desc(conn)
         _ensure_posts_comment_counts(conn)
-        _ensure_posts_quote(conn)
+        _ensure_posts_quotes(conn)
         _ensure_tasks_force_full(conn)
         conn.close()
         logger.info("SQLite 数据库初始化完成: %s", DB_PATH)
@@ -234,21 +235,21 @@ def _ensure_tasks_force_full(conn) -> None:
         logger.error("补 tasks.force_full 列失败: %s", e)
 
 
-def _ensure_posts_quote(conn) -> None:
-    """给既有库补上 posts.quote_json 列。理由同 _ensure_posts_image_desc。
+def _ensure_posts_quotes(conn) -> None:
+    """给既有库补上 posts.quotes_json 列。理由同 _ensure_posts_image_desc。
 
     降级安全：老代码的 `_row_to_post()` 不读这一列，INSERT 的列名也是写死的 ——
     多了它不影响任何既有读写。
     """
     cols = [d[1] for d in conn.execute("PRAGMA table_info(posts)")]
-    if "quote_json" in cols:
+    if "quotes_json" in cols:
         return
     try:
-        conn.execute("ALTER TABLE posts ADD COLUMN quote_json TEXT NOT NULL DEFAULT ''")
+        conn.execute("ALTER TABLE posts ADD COLUMN quotes_json TEXT NOT NULL DEFAULT ''")
         conn.commit()
-        logger.info("posts.quote_json 已补齐")
+        logger.info("posts.quotes_json 已补齐")
     except Exception as e:
-        logger.error("补 posts.quote_json 列失败: %s", e)
+        logger.error("补 posts.quotes_json 列失败: %s", e)
 
 
 def _drop_stored_summary(conn) -> None:
@@ -834,11 +835,15 @@ def _row_to_post(row) -> dict:
     if row["image_desc"]:
         post["image_desc"] = row["image_desc"]
     # 只放已置位的键：没有引用的帖子不该凭空多出一个空对象（同 _processed 那条规矩）
-    if row["quote_json"]:
+    if row["quotes_json"]:
         try:
-            post["quote"] = json.loads(row["quote_json"])
+            quotes = json.loads(row["quotes_json"])
         except ValueError:
-            logger.warning("帖子的 quote_json 解析不了，按没有引用处理: %s", row["quote_json"][:120])
+            quotes = []
+            logger.warning("帖子的 quotes_json 解析不了，按没有引用处理: %s",
+                           row["quotes_json"][:120])
+        if quotes:
+            post["quotes"] = quotes
     if row["site_comment_count"] is not None:
         post["site_comment_count"] = row["site_comment_count"]
     # 只放已置位的键：新采到的帖子本来就没有 _processed，凭空补一个空壳会让
@@ -1406,11 +1411,11 @@ def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True,
                 # 引用同理：本轮没抓到引用不许把已有的冲成空（选择器失效、站点改版、
                 # 这条楼层的引用被作者删掉都会走到这里）。代价是引用被作者删掉时库里
                 # 会留着旧快照，与 images 那条一样的取舍
-                quote = post.get("quote") or {}
-                if quote:
+                quotes = post.get("quotes") or []
+                if quotes:
                     conn.execute(
-                        "UPDATE posts SET quote_json=? WHERE source_id=? AND fingerprint=?",
-                        (json.dumps(quote, ensure_ascii=False), source_id, fp),
+                        "UPDATE posts SET quotes_json=? WHERE source_id=? AND fingerprint=?",
+                        (json.dumps(quotes, ensure_ascii=False), source_id, fp),
                     )
                 conn.execute(
                     # **空值不许覆盖已有的好值**：归并分支两边的 username /
@@ -1440,7 +1445,7 @@ def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True,
             conn.execute(
                 """INSERT INTO posts (source_id, fingerprint, seq, username, timestamp,
                    content, translation, page_number, message_id, parent_fingerprint,
-                   reply_level, images_json, image_desc, quote_json, translated, sentiment_at,
+                   reply_level, images_json, image_desc, quotes_json, translated, sentiment_at,
                    site_comment_count)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
@@ -1451,7 +1456,7 @@ def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True,
                     int(post.get("reply_level", 0) or 0),
                     json.dumps(post.get("images") or [], ensure_ascii=False),
                     post.get("image_desc", ""),
-                    json.dumps(post.get("quote"), ensure_ascii=False) if post.get("quote") else "",
+                    json.dumps(post.get("quotes"), ensure_ascii=False) if post.get("quotes") else "",
                     1 if processed.get("translated") else 0,
                     processed.get("sentiment_at"),
                     post.get("site_comment_count"),

@@ -1151,18 +1151,23 @@ class TestQuoteApiEndToEnd:
              "translation": "我同意译文", "page_number": 1, "message_id": "1002",
              "fingerprint": "r1", "source": "src_thread",
              "parent_fingerprint": "t1", "reply_level": 1,
-             # 引用了主题，带的图是引用块里那些 —— 出口要用主题自己那份
-             "quote": {"message_id": "1001", "cite": "楼主 schreef op vrijdag 22 mei 2026 @ 17:06",
-                       "username": "楼主", "content": "被截断的主题正文 [...]",
-                       "truncated": True, "images": ["src_thread/r1_q0.png"]}},
+             # 引用了主题，带的图是引用块里那些 —— 出口要用主题自己那份。
+             # **两条引用**：真站实测一条楼层可以引多人，只留第一条就是静默丢内容
+             "quotes": [
+                 {"message_id": "1001", "cite": "楼主 schreef op vrijdag 22 mei 2026 @ 17:06",
+                  "username": "楼主", "content": "被截断的主题正文 [...]",
+                  "truncated": True, "images": ["src_thread/r1_q0.png"]},
+                 {"message_id": "8888", "cite": "", "username": "",
+                  "content": "第二段被引用的内容，没有链接", "truncated": False, "images": []},
+             ]},
             {"username": "回复乙", "timestamp": "23-05-2026 09:12", "content": "补充一句",
              "translation": "补充译文", "page_number": 1, "message_id": "1003",
              "fingerprint": "r2", "source": "src_thread",
              "parent_fingerprint": "t1", "reply_level": 1,
              # 引用了一条**没采到**的楼层（或者已被删）
-             "quote": {"message_id": "9999", "cite": "老张 schreef op vrijdag 1 mei 2026 @ 10:00",
-                       "username": "老张", "content": "那段没采到的正文",
-                       "truncated": False, "images": ["src_thread/r2_q0.png"]}},
+             "quotes": [{"message_id": "9999", "cite": "老张 schreef op vrijdag 1 mei 2026 @ 10:00",
+                         "username": "老张", "content": "那段没采到的正文",
+                         "truncated": False, "images": ["src_thread/r2_q0.png"]}]},
             {"username": "回复丙", "timestamp": "24-05-2026 09:12", "content": "没有引用",
              "translation": "", "page_number": 1, "message_id": "1004",
              "fingerprint": "r3", "source": "src_thread",
@@ -1224,16 +1229,16 @@ class TestQuoteApiEndToEnd:
         """quote_json 落库再读回来逐字段相等，且没有引用的帖子连键都没有"""
         posts = self.storage.load_posts(["src_thread"])
         by_fp = {p["fingerprint"]: p for p in posts}
-        quote = by_fp["r1"]["quote"]
+        quote = by_fp["r1"]["quotes"][0]
         assert quote["message_id"] == "1001"
         assert quote["cite"].startswith("楼主 schreef op")
         assert quote["images"] == ["src_thread/r1_q0.png"]
         assert quote["truncated"] is True
-        assert "quote" not in by_fp["r3"], "没有引用的帖子凭空多了一个空对象"
+        assert "quotes" not in by_fp["r3"], "没有引用的帖子凭空多了一个空数组"
 
     def test_a_resolved_quote_uses_the_quoted_floors_own_content(self):
         """被引用楼层在库里 → 用**它自己**的正文、译文与配图，全文不缺、图不错配"""
-        quoted = self._flat()[2]["quote"]
+        quoted = self._flat()[2]["quotes"][0]
         assert quoted["resolved"] is True
         assert quoted["message_id"] == "1001"
         assert quoted["username"] == "楼主"
@@ -1245,7 +1250,7 @@ class TestQuoteApiEndToEnd:
 
     def test_an_unresolved_quote_falls_back_to_the_snapshot(self):
         """被引用楼层没采到 → 快照兜底，并**明说**它可能只有一截"""
-        quoted = self._flat()[3]["quote"]
+        quoted = self._flat()[3]["quotes"][0]
         assert quoted["resolved"] is False
         assert quoted["message_id"] == "9999"
         assert quoted["username"] == "老张"
@@ -1255,7 +1260,29 @@ class TestQuoteApiEndToEnd:
         assert quoted["images"] == ["src_thread/r2_q0.png"]
 
     def test_a_post_without_a_quote_reports_null(self):
-        assert self._flat()[4]["quote"] is None
+        assert self._flat()[4]["quotes"] == []
+
+    def test_several_quotes_on_one_floor_are_all_rendered(self):
+        """**一条楼层引多人**：真站实测支持（串 2336074 第 1 页有一处）。
+
+        只渲染 / 只解析第一条是静默丢内容 —— 用户在页面上完全看不出少了一段被引用的东西。
+        """
+        quoted = self._flat()[2]["quotes"]
+        assert len(quoted) == 2, f"第二条引用被丢了: {quoted}"
+        assert quoted[0]["username"] == "楼主" and quoted[0]["resolved"] is True
+        assert quoted[0]["content"] == "主题正文", "第一条没走「用被引用楼层自己那份」"
+        assert quoted[1]["message_id"] == "8888"
+        assert quoted[1]["resolved"] is False
+        assert quoted[1]["content"] == "第二段被引用的内容，没有链接"
+
+    def test_the_export_lists_every_quote_of_a_floor(self):
+        from app.routers.results import _export_rows
+
+        rows = _export_rows({"description": "论坛串"}, self.forum, [], 7)
+        by_index = {r["index"]: r for r in rows}
+        cell = by_index[2]["quote"]
+        assert cell.count("引用 @") == 2, f"导出里只留了一条引用: {cell}"
+        assert "｜" in cell
 
     def test_thread_kind_comes_from_the_collector_declaration(self):
         """一源一串 / 一源多主贴由采集器声明给出，前端不认 collector_id"""

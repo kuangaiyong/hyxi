@@ -147,6 +147,9 @@ class TaskListResponse(BaseModel):
 class QuoteData(BaseModel):
     """一条楼层引用了哪一段内容（Tweakers 论坛的引用块）。
 
+    **一条楼层可以引多人**（真站实测串 2336074 第 1 页就有一处：先引一条带链接的、
+    再引一段没有链接的），所以出口给的是数组 —— 只取第一条就是静默丢掉一段被引用的内容。
+
     **引用绝不许并进 `content`** —— 指纹吃 `用户名|时间戳|正文前100字`，并进去全部
     历史数据失配、已翻译的帖子会被判成新帖重新付费翻译。原站本来也是「引用框 + 正文」两块。
 
@@ -213,9 +216,9 @@ class PostData(BaseModel):
     site_comment_count: Optional[int] = None
     # 主贴专用：它名下有几条这样的新回复，供列表页做徽标
     fresh_reply_count: int = 0
-    # 这条楼层引用了哪一段内容；没有引用就是 null（不是空对象）。
+    # 这条楼层引用了哪些内容；没有引用就是空数组。
     # **永远不进 content** —— 那是指纹的一部分
-    quote: Optional[QuoteData] = None
+    quotes: List[QuoteData] = Field(default_factory=list)
     # 这个来源装的是什么：「feed」= 一源多主贴，每条主贴带自己的评论与回复（Facebook 小组）；
     # 「thread」= 一源一串，一条主题 + 平铺的回复（Tweakers 论坛）。
     # 前端只按它选措辞，不认 collector_id —— 站点知识留在采集器声明里

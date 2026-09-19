@@ -55,12 +55,14 @@ prompt 里有两条必须留着：一是**正例要列全**（各种语序和口
 ## 关键设计决策
 
 - **增量机制**：每个帖子有 fingerprint，各步骤执行前检查 `_processed` 标记跳过已处理帖子
-- **SSE 进度推送**：`progress_manager` 按 task_id 做 pub/sub，30s 无事件发 `: keepalive` 注释帧防代理断连。**每条流的结束事件由端点自己给**（`event_generator(channel, terminal_event)`）：任务进度流等 `task_complete`、舆情流等 `sentiment_complete`、人工授权流等 `task_complete`。三者跑在同一套频道机制上，共用一份「终止事件表」会让流水线的 sentiment 步骤一发完 `sentiment_complete` 就把任务进度流掐断 —— 紧随其后的 `step_complete` 和 `task_complete` 全没人收得到，而前端只在收到 `task_complete` 时才 `fetchTask()`，于是带舆情的任务跑完后进度页永远停在 running，不跳转也不出现「查看结果」，最后一行是「连接中断」（用户实测报过）。回归测试见 `TestPipelineSentimentStepEndToEnd::test_progress_stream_survives_the_sentiment_step_and_delivers_task_complete`
+- **SSE 进度推送**：`progress_manager` 按 task_id 做 pub/sub，30s 无事件发 `: keepalive` 注释帧防代理断连。**每条流的结束事件由端点自己给**（`event_generator(channel, terminal_event)`）：任务进度流等 `task_complete`、舆情流等 `sentiment_complete`、人工授权流等 `task_complete`、补译流等 `translation_complete`（它另走 `{task_id}:translate` 频道，理由见下面「结果页补译」）。它们跑在同一套频道机制上，共用一份「终止事件表」会让流水线的 sentiment 步骤一发完 `sentiment_complete` 就把任务进度流掐断 —— 紧随其后的 `step_complete` 和 `task_complete` 全没人收得到，而前端只在收到 `task_complete` 时才 `fetchTask()`，于是带舆情的任务跑完后进度页永远停在 running，不跳转也不出现「查看结果」，最后一行是「连接中断」（用户实测报过）。回归测试见 `TestPipelineSentimentStepEndToEnd::test_progress_stream_survives_the_sentiment_step_and_delivers_task_complete`
 - **绝不按下标跨任务顶替舆情结果**：曾经查不到就 fallback 到最新一条，而那份结果是按别的任务的帖子列表编号的，取来与当前帖子完全对不上；更糟的是增量分析会把它当作 `existing_results` 合并后持久化，直接污染目标任务。**按帖子身份取则相反 —— 必须跨任务共享**，见「持久化」一节
 - **导出只有一个口**：`GET /export?format=xlsx|csv` 出一份含原文 + 译文 + 舆情结论的文件，界面入口只在舆情页。**报告每次下载现算、不落盘**（`ExcelService.build_export` 返回字节流）——落盘既会在 `exports/` 堆垃圾，两个人同时下载还会撞成一个在写另一个在读。流水线的 `generate_excel` 步骤照旧生成它自己那份，但那份不再被任何人下载
 - **导出与页面读同一份结论**（`results.py::_task_sentiment()`）：按帖子身份取，取到什么就写什么，所以报告里的「未分析」条数与舆情页显示的完全一致。它不再有「本任务 / 别的任务」之分 —— 那个区分只在按下标取整数组的年代才有意义
 - **LLM 重试分两层，别混为一谈**：`_retry_with_backoff` 是**传输层**指数退避（3 次，1s/2s/4s），只管 429/5xx；**解析失败是另一回事**——批量输出靠分隔符切分，LLM 偶尔在某一段吐出非 JSON，那一条会被记成 `{"sentiment": null, "reason_cn": "解析失败"}`。翻译和舆情都在批量之后补一轮**单条重试**（单条不必切分隔符，解析可靠得多），实测真实任务里 88 条中的 2 条因此救回。单条重试必须复用批量那份 prompt 片段（`_post_block`），来源标签和父贴上文少给一样就成了另一道题。**兜底占位一律记 `sentiment: null`，绝不能填一个具体情感值** —— 「模型整批没给分隔符」那条分支曾记成 `neutral`，于是它绕过了上面这轮单条重试（判据就是 sentiment 为不为空）、还被写上 `sentiment_at` 永久定死，最后以「中性 + 解析失败 + 空维度」进报告和情感分布。真实库里捞出 10 条，其中一条正文是明确抱怨固件的「Deze update werkt niet...」却算成中性。`storage.purge_fake_parse_failures()` 清存量（结论行 + `sentiment_at` **两处都要清**，只清一处等于把那几条永久钉在「已分析」上）。它**不在 `init_db()` 的补丁链里**，而由 `TaskOrchestrator.__init__` 在 `_migrate_sentiment()` **之后**调用 —— 旧 JSON blob 里那批假 neutral 正是那一步才写进 `sentiment_results` 的，放进 `init_db()` 会让老库升上来的第一次启动恰好空转，而那正是它唯一该生效的一次。判据里的 `sentiment IS NOT NULL` 同样不能省：新代码写下的占位 sentiment 为空、`reason_cn` 一样是「解析失败」，那是给用户看的原因且本来就没有 `sentiment_at`，连它一起删会让这个一次性迁移永远变不成 no-op。回归测试见 `TestSentimentRetryEndToEnd::test_missing_segments_are_retried_not_faked_as_neutral` 与 `TestFakeNeutralPurgeEndToEnd`
 - **翻译用 LLM 而非 Google Translate**：5 条/批 + `---POST_SEPARATOR---` 切分，解析失败的条目再单条重译。源文本可能是荷兰语或英语且批内混杂，**「译文与原文一字不差且原文非中文」判为漏译**，走同一条单条重译队列
+- **结果页补译**（v1.13.0，完整设计见 `docs/features/results-backfill-translation.md`）：采集任务不带翻译步骤时结果页会留下一片「（尚未翻译）」，在那儿直接补。几条容易改坏的：**「还缺译文」的判据只有 `translator_service.needs_translation()` 一处**（提示条的 N、补译作业挑的帖子、任务里翻译步骤的增量都用它 —— 各写一份，页面上的标签数和 N 迟早对不上；**失败标记算待补译**，以前它被当成已翻译、永不重试）；**同一来源的翻译互斥靠 `orchestrator._translation_claims` 这张普通 dict**，不许换成 `asyncio.Lock`（orchestrator 是模块级单例，而测试每个用例换一个事件循环，锁会被绑死在第一个循环上）；占用**全有全无**，释放只放自己占的；任务里的翻译步骤占到来源后**无条件回库刷一次译文**（帖子常是更早的步骤读进内存的，补译在那期间翻完、它一次就占到、压根没等过 —— 只在「等过」时刷会再翻一遍付两次钱）；补译进度走**独立频道** `{task_id}:translate`（`task_id` 频道是任务进度流和舆情流共用的）；**每 50 条落一次库**（几百条要十几分钟，中途关掉应用这一批钱就白花了）
+- **单条重译的输出预算是两档**：`RETRY_MAX_TOKENS=8192`，被模型以 400 顶回来（8K 上下文的模型要求「输入 + max_tokens ≤ 上下文」）就退回 `FALLBACK_MAX_TOKENS=2048` 再试一次。2026-09-15 对 `deepseek-flash` 实测：给 2048 时一条 2500 字的长帖 `completion_tokens=2048` 全是 reasoning、content 为空，这条就永远挂着「[翻译解析失败]」（与 `vision_service.MAX_OUTPUT_TOKENS` 同源的现象）。**非空即成功**，别再要求「超过 2 个字」—— 「Jup」→「嗯」被判失败，真实库里就挂着这么一条
 - **舆情维度是封闭集合**：`DEFAULT_DIMENSIONS` 那 14 个。`_normalize_dimensions()` 把 LLM 返回的标签对齐回去（实测它会把 `认证/合规(如Synergrid)` 简写成 `认证/合规`，于是同一维度在 `top_dimensions` 和 `cross_source` 里各占一行），对不上的直接丢弃。维度表的全部价值就在于它封闭，一碎成近义标签跨来源对比就废了
 - **原子写入**：JSON 先写 `.tmp` 再 `os.replace()`（仅 tasks.json 回退路径有此保护，其他 JSON 是直接覆写）
 - **深色模式**：CSS 变量 + `[data-theme="dark"]`，首次跟随系统偏好，之后 localStorage 记忆
@@ -98,8 +100,13 @@ GET    /api/v1/tasks/{id}/events      SSE 实时进度流
 
 GET    /api/v1/tasks/{id}/posts        帖子查询（**按主贴分页**，评论在 replies 里，**主贴按时间倒序**；?fresh_days=3|7|14 标出老帖新回复，?only_fresh=true 只留有新回复的串）
 GET    /api/v1/tasks/{id}/posts/{idx}  单条帖子详情（0-based）
-GET    /api/v1/tasks/{id}/stats        任务统计
+GET    /api/v1/tasks/{id}/stats        任务统计（含 untranslated_count 还缺译文的条数、translating 是否正在补译）
 GET    /api/v1/tasks/{id}/export       **唯一的导出口**（?format=xlsx|csv&fresh_days=3|7|14）
+
+POST   /api/v1/tasks/{id}/translate         结果页补译：只翻「有正文、没有可用译文」的（失败标记也算），已有译文一条不动。
+                                            回 started / running（同一来源已在翻）/ completed（没有要翻的）；
+                                            任务还在跑 409、模型没配置 400（都在起作业**之前**拒绝）
+GET    /api/v1/tasks/{id}/translate/events  补译 SSE 流（**独立频道** {task_id}:translate，终止事件 translation_complete）
 
 POST   /api/v1/tasks/{id}/sentiment           触发舆情分析（增量；?force=true 忽略 sentiment_at 全量重跑）
 GET    /api/v1/tasks/{id}/sentiment           获取舆情结果（只读本任务）

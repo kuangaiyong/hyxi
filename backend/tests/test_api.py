@@ -4,7 +4,9 @@ import os
 import re
 import sys
 import json
+import asyncio
 import tempfile
+import threading
 import shutil
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -1823,3 +1825,485 @@ class TestDevModePointsToTheFrontendEndToEnd:
     def test_root_and_docs_are_untouched(self):
         assert self.client.get("/").json()["service"] == "HYXi 舆情分析 API"
         assert self.client.get("/api/health").status_code == 200
+
+
+class TestBackfillTranslationEndToEnd:
+    """结果页补译：只翻「有正文、没有可用译文」的，分块落库，同一来源不翻两遍。
+    真 HTTP 模型替身（llm_site）、真 SQLite、真路由函数与后台作业。
+    规格见 docs/features/results-backfill-translation.md"""
+
+    SRC = "src_bt"
+
+    def setup_method(self):
+        import app.config as cfg
+        from app.services import storage
+        self.cfg = cfg
+        self.storage = storage
+        self.tmpdir = tempfile.mkdtemp()
+        self._old = (cfg.settings.api_key, cfg.settings.data_dir, cfg.settings.exports_dir, storage.DB_PATH)
+        cfg.settings.api_key = ""
+        cfg.settings.data_dir = self.tmpdir
+        # exports_dir 是类定义时算好的常量：只改 data_dir 的话流水线的 generate_excel 会写进真实目录
+        cfg.settings.exports_dir = os.path.join(self.tmpdir, "exports")
+        os.makedirs(cfg.settings.exports_dir, exist_ok=True)
+        storage.DB_PATH = os.path.join(self.tmpdir, "hyxi.db")
+        storage.init_db()
+
+        from main import app
+        from app.services.orchestrator import orchestrator
+        self.client = TestClient(app)
+        self.orchestrator = orchestrator
+        # 流水线的「翻译已有数据」按已启用来源读帖子，来源得注册着
+        storage.save_source({
+            "id": self.SRC, "name": "补译来源", "collector_id": "group_feed",
+            "params": {"group_id": "g1", "base_url": "http://127.0.0.1:1"},
+            "enabled": True, "created_at": "2026-09-15T09:00:00",
+        })
+        self.task_id = "backfill-e2e"
+        self._task(self.task_id, "completed")
+
+    def teardown_method(self):
+        for tid in [t for t in self.orchestrator.tasks if t.startswith("backfill-")]:
+            self.orchestrator.tasks.pop(tid, None)
+        # 用例失败时作业可能没走到释放那一步；进程里的单例不清掉会连累同一 worker 的下一条
+        self.orchestrator._translation_claims.pop(self.SRC, None)
+        (self.cfg.settings.api_key, self.cfg.settings.data_dir,
+         self.cfg.settings.exports_dir, self.storage.DB_PATH) = self._old
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _task(self, task_id, status):
+        from datetime import datetime
+        self.orchestrator.tasks[task_id] = {
+            "id": task_id, "status": status, "description": "补译", "plan": [], "logs": [],
+            # 缺 created_at 的话流水线每次落库都会记一条「NOT NULL constraint failed」
+            "progress": 1.0, "current_step": None, "force_full": False, "created_at": datetime.now(),
+            "result": {"total_posts": 0, "sources": [
+                {"id": self.SRC, "name": "补译来源", "collector_id": "group_feed", "post_count": 0}]},
+        }
+
+    def _seed(self, rows):
+        """rows: (fingerprint, content, translation)。都带 message_id —— 否则空正文的会在入库口被丢掉"""
+        self.storage.upsert_posts(self.SRC, [
+            {"username": f"u_{fp}", "timestamp": "15-09-2026 10:00", "content": content,
+             "translation": translation, "page_number": 1, "fingerprint": fp, "source": self.SRC,
+             "message_id": f"m_{fp}", "parent_fingerprint": None, "reply_level": 0,
+             **({"_processed": {"translated": True}} if translation else {})}
+            for fp, content, translation in rows
+        ])
+
+    def _by_fp(self):
+        return {p["fingerprint"]: p for p in self.storage.load_posts([self.SRC])}
+
+    def _llm_site(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures"))
+        import llm_site
+        return llm_site
+
+    def _configure_llm(self, url):
+        self.storage.set_app_config("llm", {"api_key": "sk-test", "base_url": url, "model_name": "test-model"})
+
+    async def _wait_released(self, timeout=60):
+        for _ in range(int(timeout / 0.05)):
+            if self.orchestrator.translation_owner([self.SRC]) is None:
+                return
+            await asyncio.sleep(0.05)
+        raise AssertionError("补译作业没有结束（来源一直被占着）")
+
+    async def _wait_blocked(self, server, n=1, timeout=30):
+        for _ in range(int(timeout / 0.05)):
+            if len(server.blocked) >= n:
+                return
+            await asyncio.sleep(0.05)
+        raise AssertionError(f"等不到第 {n} 个被卡住的翻译请求：{server.blocked}")
+
+    # ===== R1 待补译条数 =====
+
+    def test_stats_count_exactly_the_posts_that_have_no_usable_translation(self):
+        """提示条上的 N 必须等于页面上「（尚未翻译）」加失败标记的条数 —— 两处各算各的，迟早对不上。
+        没正文的翻不了；译文只有空白的算没翻；译文是失败标记的也算（G2：2026-09-15 补译完真实数据里出了 5 条）"""
+        self._seed([
+            ("a", "Nog niet vertaald", ""),
+            ("b", "Ook nog niet", ""),
+            ("g", "Vertaling is alleen spaties", "   "),
+            ("f", "Mislukt", "[翻译解析失败] Mislukt"),
+            ("c", "Al vertaald", "已经翻译"),
+            ("d", "", ""),
+            ("e", "   ", ""),
+        ])
+        stats = self.client.get(f"/api/v1/tasks/{self.task_id}/stats").json()
+        assert stats["untranslated_count"] == 4, stats
+        assert stats["translating"] is False, stats
+
+    # ===== R7 单条重译与失败标记 =====
+
+    def _translate(self, posts):
+        from app.services.translator_service import TranslatorService
+        from app.services.progress_manager import ProgressManager
+        return asyncio.new_event_loop().run_until_complete(
+            TranslatorService.execute("backfill-unit", posts, {}, ProgressManager()))["posts"]
+
+    def test_a_two_character_retry_translation_is_accepted(self):
+        """「Jup」→「是的」只有 2 个字。单条重译以前要求译文超过 2 个字才算成功，
+        于是真实数据里它挂着「[翻译解析失败] Jup」—— 这条回复明明翻出来了"""
+        server = self._llm_site().LLMSite(batch_empty=True, retry_reply="是的")
+        with server as url:
+            self._configure_llm(url)
+            out = self._translate([{"source": self.SRC, "fingerprint": "j", "content": "Jup"}])
+        assert out[0]["translation"] == "是的", out[0]
+
+    def test_a_long_post_is_translated_on_retry_by_a_reasoning_model(self):
+        """2026-09-15 实测 deepseek-flash：单条重译给 2048 token 时 2048 个全是 reasoning、content 为空，
+        长帖因此永远挂着失败标记。替身按实测复刻：预算不到 2049 只推理不出字"""
+        from app.services.translator_service import is_failed_translation
+        server = self._llm_site().LLMSite(batch_empty=True, reasoning_floor=2049)
+        with server as url:
+            self._configure_llm(url)
+            out = self._translate([{"source": self.SRC, "fingerprint": "l", "content": "Lange tekst. " * 200}])
+        assert out[0]["translation"] and not is_failed_translation(out[0]["translation"]), out[0]["translation"][:60]
+
+    def test_a_model_that_rejects_the_bigger_retry_budget_still_gets_the_old_one(self):
+        """评审发现：预算是为推理模型调大的，而模型由用户自己配。8K 上下文的模型要求「输入 + max_tokens ≤ 上下文」，
+        超了整个请求 400 —— 原来 2048 能重译成的帖子会一律挂失败标记。被 400 拒绝就退回旧预算再试一次"""
+        from app.services.translator_service import is_failed_translation
+        server = self._llm_site().LLMSite(batch_empty=True, max_tokens_limit=4096)
+        with server as url:
+            self._configure_llm(url)
+            out = self._translate([{"source": self.SRC, "fingerprint": "k", "content": "Korte tekst"}])
+        assert out[0]["translation"] and not is_failed_translation(out[0]["translation"]), out[0]["translation"]
+
+    def test_a_pipeline_run_retries_failed_translations_and_leaves_good_ones_alone(self):
+        """失败标记以前被当成「已翻译」，任务怎么跑都不会重翻。补译按钮和任务的增量判据必须是同一个答案"""
+        self._seed([("x", "Mislukt bericht", "[翻译解析失败] Mislukt bericht"), ("c", "Al vertaald", "已经翻译")])
+        server = self._llm_site().LLMSite()
+        with server as url:
+            self._configure_llm(url)
+            self.orchestrator.create_task("backfill-rerun", "重新翻译已有数据")
+            asyncio.new_event_loop().run_until_complete(self.orchestrator.execute_task("backfill-rerun"))
+        task = self.orchestrator.get_task("backfill-rerun")
+        assert task["status"] == "completed", task.get("error_message")
+        assert server.translated == [1], f"应该只重翻失败的那 1 条：{server.translated}"
+        posts = self._by_fp()
+        assert posts["x"]["translation"] == "译文1", posts["x"]
+        assert posts["c"]["translation"] == "已经翻译"
+
+    # ===== R2–R4 补译接口、后台作业、进度流 =====
+
+    def test_unknown_task_is_404(self):
+        assert self.client.post("/api/v1/tasks/backfill-nope/translate").status_code == 404
+
+    def test_a_task_that_is_still_running_is_refused(self):
+        """它自己的翻译步骤会处理；而且结果里还没记下来源，按全部已注册来源读会翻到别的来源头上"""
+        self._seed([("a", "Nog niet vertaald", "")])
+        self._task("backfill-running", "running")
+        resp = self.client.post("/api/v1/tasks/backfill-running/translate")
+        assert resp.status_code == 409, resp.text
+        assert self.orchestrator.translation_owner([self.SRC]) is None, "拒绝了还占着来源"
+
+    def test_a_task_that_did_not_complete_is_refused(self):
+        """评审发现：result 只在任务成功时写，失败 / 取消的任务没记下来源，load_task_posts 会退回「全部已注册来源」——
+        在它的结果页补译，等于把所有来源的未译帖子一起送去翻（按条付费）。
+        前端只给已完成的任务显示提示条，接口必须是同一个口径"""
+        self._seed([("a", "Nog niet vertaald", "")])
+        server = self._llm_site().LLMSite()
+        with server as url:
+            self._configure_llm(url)
+            for status in ("failed", "cancelled"):
+                tid = f"backfill-{status}"
+                self._task(tid, status)
+                self.orchestrator.tasks[tid]["result"] = None      # 真实的失败 / 取消任务就是这样
+                resp = self.client.post(f"/api/v1/tasks/{tid}/translate")
+                assert resp.status_code == 409, (status, resp.text)
+                assert self.orchestrator.translation_owner([self.SRC]) is None, f"{status}：拒绝了还占着来源"
+
+    def test_nothing_to_translate_completes_without_touching_the_model(self):
+        self._seed([("c", "Al vertaald", "已经翻译"), ("d", "", "")])
+        body = self.client.post(f"/api/v1/tasks/{self.task_id}/translate").json()
+        assert body["status"] == "completed" and body["pending_count"] == 0, body
+        assert self.orchestrator.translation_owner([self.SRC]) is None
+
+    def test_without_model_config_it_is_refused_before_anything_starts(self):
+        """先回「已开始」再在后台静默失败的话，页面会一直显示「正在补译」"""
+        self._seed([("a", "Nog niet vertaald", "")])
+        resp = self.client.post(f"/api/v1/tasks/{self.task_id}/translate")
+        assert resp.status_code == 400, resp.text
+        assert "请先配置 LLM API" in resp.json()["detail"]
+        assert self.orchestrator.translation_owner([self.SRC]) is None
+
+    def test_claims_are_all_or_nothing_and_released_only_by_their_owner(self):
+        """占用表是「同一批帖子不翻两遍」的闸门。接口那道先查只挡得住按钮，
+        直接起作业的入口（以及任务里的翻译步骤）靠的是这里：占不齐就一个都不占，别人放不掉我的"""
+        o = self.orchestrator
+        try:
+            assert o.claim_translation([self.SRC], "backfill:x") is None
+            assert o.claim_translation(["src_other", self.SRC], "task:y") == "backfill:x", "被占着还占上了"
+            assert o.translation_owner(["src_other"]) is None, "占不上时不许占掉一部分"
+            o.release_translation([self.SRC], "task:y")
+            assert o.translation_owner([self.SRC]) == "backfill:x", "别人把我的占用放掉了"
+            o.release_translation([self.SRC], "backfill:x")
+            assert o.translation_owner([self.SRC]) is None
+        finally:
+            o._translation_claims.pop("src_other", None)
+
+    def test_a_source_that_is_already_being_translated_is_not_translated_again(self):
+        """双击、共用这个来源的另一个任务也点了 —— 第二次必须认出来，不另起一轮付费翻译"""
+        self._seed([("a", "Nog niet vertaald", "")])
+        server = self._llm_site().LLMSite()
+        with server as url:
+            self._configure_llm(url)
+            assert self.orchestrator.claim_translation([self.SRC], "backfill:backfill-other") is None
+            try:
+                body = self.client.post(f"/api/v1/tasks/{self.task_id}/translate").json()
+            finally:
+                self.orchestrator.release_translation([self.SRC], "backfill:backfill-other")
+        assert body["status"] == "running", body
+        assert server.translated == [], f"来源被占着还发了翻译请求：{server.translated}"
+
+    def test_backfill_translates_only_what_is_missing_and_reports_on_its_own_channel(self):
+        """整条链路：路由 → 后台作业 → 真 HTTP 模型 → 落库 → 进度流。
+        已有译文的一个字都不能动（动了就是重复付费、还冲掉好译文）。
+        翻译事件不许出现在 task_id 频道上 —— 那是任务进度流和舆情流共用的，
+        同一任务的舆情页正在分析时，翻译进度会串到舆情进度条上"""
+        from app.routers.results import trigger_backfill_translation, translation_events
+        from app.services.orchestrator import translation_channel
+        from app.services.progress_manager import progress_manager
+        self._seed([
+            ("a", "Nog niet vertaald", ""), ("b", "Ook nog niet", ""), ("g", "Spaties", "   "),
+            ("f", "Mislukt", "[翻译解析失败] Mislukt"),
+            ("c", "Al vertaald", "已经翻译"), ("d", "", ""),
+        ])
+        server = self._llm_site().LLMSite()
+        events, shared = [], []
+        with server as url:
+            self._configure_llm(url)
+
+            async def main():
+                shared_queue = progress_manager.subscribe(self.task_id)
+                resp = await translation_events(self.task_id)
+
+                async def consume():
+                    async for chunk in resp.body_iterator:
+                        lines = chunk.splitlines()
+                        if len(lines) >= 2 and lines[0].startswith("event: "):
+                            events.append((lines[0][len("event: "):], json.loads(lines[1][len("data: "):])))
+
+                consumer = asyncio.ensure_future(consume())
+                # 订阅在生成器第一次被拉动时才建立，抢在作业开跑之前
+                for _ in range(200):
+                    if progress_manager.subscribers.get(translation_channel(self.task_id)):
+                        break
+                    await asyncio.sleep(0.01)
+                body = await trigger_backfill_translation(self.task_id)
+                assert body["status"] == "started" and body["pending_count"] == 4, body
+                await asyncio.wait_for(consumer, timeout=30)
+                await self._wait_released()
+                while not shared_queue.empty():
+                    shared.append(shared_queue.get_nowait()["event"])
+                progress_manager.unsubscribe(self.task_id, shared_queue)
+
+            asyncio.new_event_loop().run_until_complete(main())
+
+        assert sum(server.translated) == 4, f"发给模型的条数不对：{server.translated}"
+        posts = self._by_fp()
+        for fp in ("a", "b", "g", "f"):
+            assert posts[fp]["translation"].startswith("译文"), posts[fp]
+            assert (posts[fp].get("_processed") or {}).get("translated") is True, posts[fp]
+        assert posts["c"]["translation"] == "已经翻译", "已有译文被改了"
+        assert posts["d"]["translation"] == "", "没正文的不该翻"
+
+        assert [e for e, _ in events][-1] == "translation_complete", events
+        done = [d["done"] for e, d in events if e == "translation_progress"]
+        assert done and done == sorted(done) and done[-1] == 4, done
+        assert events[-1][1]["status"] == "completed" and events[-1][1]["translated"] == 4, events[-1]
+        assert shared == [], f"翻译事件串到了任务进度 / 舆情共用的频道：{shared}"
+
+        stats = self.client.get(f"/api/v1/tasks/{self.task_id}/stats").json()
+        assert stats["untranslated_count"] == 0 and stats["translating"] is False, stats
+
+    def test_progress_is_saved_chunk_by_chunk(self):
+        """几百条要翻十几分钟。整批翻完才写库的话，中途关掉应用这一整批钱就白花了
+        （2026-09-15 便携包中途被关过一次）。卡住第二块，第一块必须已经在库里"""
+        import app.services.orchestrator as orch_module
+        from app.routers.results import trigger_backfill_translation
+        self._seed([("a", "Een", ""), ("b", "Twee", ""), ("c", "Drie", "")])
+        gate = threading.Event()
+        server = self._llm_site().LLMSite(translate_gate=gate, gate_after=1)
+        old_chunk, mid_run = orch_module.BACKFILL_CHUNK_SIZE, {}
+        orch_module.BACKFILL_CHUNK_SIZE = 2
+        try:
+            with server as url:
+                self._configure_llm(url)
+
+                async def main():
+                    body = await trigger_backfill_translation(self.task_id)
+                    assert body["status"] == "started", body
+                    await self._wait_blocked(server)          # 第二块的请求卡在替身模型里
+                    mid_run.update({fp: p["translation"] for fp, p in self._by_fp().items()})
+                    gate.set()
+                    await self._wait_released()
+
+                asyncio.new_event_loop().run_until_complete(main())
+        finally:
+            gate.set()
+            orch_module.BACKFILL_CHUNK_SIZE = old_chunk
+
+        assert mid_run["a"] and mid_run["b"], f"第一块翻完没落库：{mid_run}"
+        assert mid_run["c"] == "", f"第二块还卡着就有译文了：{mid_run}"
+        assert all(p["translation"] for p in self._by_fp().values()), "放行之后没翻完"
+
+    def test_a_failed_run_says_so_and_frees_the_source(self):
+        """作业失败时页面必须收到明确的失败，来源也得放开 —— 否则按钮永远停在「正在补译」"""
+        from app.services.orchestrator import translation_channel
+        from app.services.progress_manager import progress_manager
+        self._seed([("a", "Nog niet vertaald", "")])
+        # 不配模型、绕过接口那道 400 直接起作业：译者在作业里才发现没配置，走作业自己的失败路径
+        pending = [p for p in self.storage.load_posts([self.SRC]) if p["fingerprint"] == "a"]
+        got = []
+
+        async def main():
+            channel = translation_channel(self.task_id)
+            queue = progress_manager.subscribe(channel)
+            try:
+                assert self.orchestrator.start_backfill_translation(self.task_id, [self.SRC], pending) is None
+                await self._wait_released()
+                while not queue.empty():
+                    got.append(queue.get_nowait())
+            finally:
+                progress_manager.unsubscribe(channel, queue)
+
+        asyncio.new_event_loop().run_until_complete(main())
+        complete = [m["data"] for m in got if m["event"] == "translation_complete"]
+        assert complete and complete[-1]["status"] == "failed", got
+        assert "请先配置 LLM API" in complete[-1]["error"], complete[-1]
+
+    def test_a_run_that_translates_nothing_fails_and_says_why(self):
+        """评审发现：模型每次都报错（API Key 失效、模型名写错）时，译者把异常吃掉、写成「[翻译失败]」标记，
+        不抛 —— 作业照样报 completed，页面上 N 纹丝不动、没有任何提示，用户只会一遍遍重点。
+        替身让每个请求都回 400：批量、单条重译、退回旧预算那一次，全部失败"""
+        from app.routers.results import trigger_backfill_translation
+        from app.services.orchestrator import translation_channel
+        from app.services.progress_manager import progress_manager
+        self._seed([("a", "Nog niet vertaald", "")])
+        server = self._llm_site().LLMSite(max_tokens_limit=1)
+        got = []
+        with server as url:
+            self._configure_llm(url)
+
+            async def main():
+                channel = translation_channel(self.task_id)
+                queue = progress_manager.subscribe(channel)
+                try:
+                    body = await trigger_backfill_translation(self.task_id)
+                    assert body["status"] == "started", body
+                    await self._wait_released()
+                    while not queue.empty():
+                        got.append(queue.get_nowait())
+                finally:
+                    progress_manager.unsubscribe(channel, queue)
+
+            asyncio.new_event_loop().run_until_complete(main())
+        complete = [m["data"] for m in got if m["event"] == "translation_complete"]
+        assert complete and complete[-1]["status"] == "failed", complete
+        assert complete[-1]["translated"] == 0, complete[-1]
+        # 原因要带上模型给的那句，不然用户不知道该去改哪
+        assert "max_tokens exceeds the limit of 1" in complete[-1]["error"], complete[-1]
+
+    # ===== R5 与任务里的翻译步骤互斥 =====
+
+    def test_a_pipeline_translate_step_waits_for_the_backfill_and_pays_once(self):
+        """补译在跑时，一个带翻译步骤的任务（比如定时任务）开始翻同一来源：
+        它得等补译结束、回库看过译文再算待翻译。否则两边各翻一遍，同一批帖子付两次钱"""
+        from app.routers.results import trigger_backfill_translation
+        self._seed([("a", "Een", ""), ("b", "Twee", ""), ("c", "Al vertaald", "已经翻译")])
+        gate = threading.Event()
+        server = self._llm_site().LLMSite(translate_gate=gate)
+        pipeline_id = "backfill-pipeline"
+        try:
+            with server as url:
+                self._configure_llm(url)
+
+                async def main():
+                    body = await trigger_backfill_translation(self.task_id)
+                    assert body["status"] == "started", body
+                    await self._wait_blocked(server)           # 补译的请求卡住，来源占着
+                    self.orchestrator.create_task(pipeline_id, "重新翻译已有数据")
+                    run = asyncio.ensure_future(self.orchestrator.execute_task(pipeline_id))
+                    # 等到任务要么在等补译、要么自己也发出了翻译请求（后者就是要挡的故障）
+                    for _ in range(600):
+                        logs = " ".join(l["message"] for l in self.orchestrator.get_task(pipeline_id)["logs"])
+                        if "正在补译" in logs or len(server.blocked) >= 2:
+                            break
+                        await asyncio.sleep(0.05)
+                    gate.set()
+                    await asyncio.wait_for(run, timeout=60)
+                    await self._wait_released()
+
+                asyncio.new_event_loop().run_until_complete(main())
+        finally:
+            gate.set()
+
+        task = self.orchestrator.get_task(pipeline_id)
+        assert task["status"] == "completed", task.get("error_message")
+        assert sum(server.translated) == 2, f"同一批帖子被翻了不止一遍：{server.translated}"
+        assert all(p["translation"] for p in self._by_fp().values() if p["content"])
+
+    def test_a_pipeline_that_read_its_posts_before_a_backfill_finished_does_not_pay_again(self):
+        """评审发现：任务在前面的步骤（采集、舆情）就把帖子读进了内存，等它走到翻译时别人的补译已经翻完、放掉了来源 ——
+        它一次就占到来源、没等过。只在「等过」时回库刷新的话，手里那份还是空译文：再翻一遍付两次钱，
+        重译失败还会把补译落库的好译文冲成失败标记"""
+        from app.routers.results import trigger_backfill_translation
+        self._seed([("a", "Een", ""), ("b", "Twee", "")])
+        gate = threading.Event()
+        server = self._llm_site().LLMSite(sentiment_gate=gate)
+        pipeline_id = "backfill-stale"
+        try:
+            with server as url:
+                self._configure_llm(url)
+
+                async def main():
+                    self.orchestrator.create_task(pipeline_id, "先分析舆情再翻译已有数据")
+                    run = asyncio.ensure_future(self.orchestrator.execute_task(pipeline_id))
+                    # 任务卡在舆情步骤里：a、b 已经以「没译文」的样子读进内存，翻译步骤还没开始
+                    for _ in range(600):
+                        if server.sentiment_blocked:
+                            break
+                        await asyncio.sleep(0.05)
+                    assert server.sentiment_blocked, "任务的舆情请求一直没发出来"
+                    body = await trigger_backfill_translation(self.task_id)
+                    assert body["status"] == "started", body
+                    await self._wait_released()                # 补译翻完、放掉了来源
+                    gate.set()
+                    await asyncio.wait_for(run, timeout=60)
+
+                asyncio.new_event_loop().run_until_complete(main())
+        finally:
+            gate.set()
+
+        task = self.orchestrator.get_task(pipeline_id)
+        assert task["status"] == "completed", task.get("error_message")
+        assert sum(server.translated) == 2, f"补译翻过的帖子被任务又翻了一遍：{server.translated}"
+
+    def test_backfill_is_not_started_while_a_pipeline_is_translating_the_same_source(self):
+        from app.routers.results import trigger_backfill_translation
+        self._seed([("a", "Een", ""), ("b", "Twee", "")])
+        gate = threading.Event()
+        server = self._llm_site().LLMSite(translate_gate=gate)
+        pipeline_id = "backfill-pipeline"
+        try:
+            with server as url:
+                self._configure_llm(url)
+
+                async def main():
+                    self.orchestrator.create_task(pipeline_id, "重新翻译已有数据")
+                    run = asyncio.ensure_future(self.orchestrator.execute_task(pipeline_id))
+                    await self._wait_blocked(server)           # 任务的翻译请求卡住，来源占着
+                    body = await trigger_backfill_translation(self.task_id)
+                    gate.set()
+                    await asyncio.wait_for(run, timeout=60)
+                    await self._wait_released()
+                    return body
+
+                body = asyncio.new_event_loop().run_until_complete(main())
+        finally:
+            gate.set()
+        assert body["status"] == "running", body
+        assert sum(server.translated) == 2, f"任务在翻的时候补译又翻了一遍：{server.translated}"

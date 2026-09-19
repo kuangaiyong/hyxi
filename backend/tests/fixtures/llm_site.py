@@ -24,6 +24,9 @@ PLAN_WITH_TRANSLATE = ('{"plan": [{"action": "translate", "params": {}}, '
                        '{"action": "sentiment", "params": {}}]}')
 PLAN_WITH_SENTIMENT = ('{"plan": [{"action": "generate_excel", "params": {"include_stats": true}}, '
                        '{"action": "sentiment", "params": {}}]}')
+# 翻译排在舆情之后：翻译步骤开始时，帖子是舆情那一步就读进内存的
+PLAN_SENTIMENT_THEN_TRANSLATE = ('{"plan": [{"action": "sentiment", "params": {}}, '
+                                 '{"action": "translate", "params": {}}]}')
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -41,12 +44,24 @@ class _Handler(BaseHTTPRequestHandler):
         self.server.prompts.append(system_msg)
         self.server.user_prompts.append(user_msg)
 
+        limit = self.server.max_tokens_limit
+        if limit and (body.get("max_tokens") or 0) > limit:
+            # 复刻 8K 上下文模型：输入 + max_tokens 超过上下文就整个请求 400
+            self._reply(400, {"error": {"message": f"max_tokens exceeds the limit of {limit}"}})
+            return
+        if n_posts and self.server.sentiment_gate is not None and "智能调度器" not in system_msg:
+            # 卡住舆情请求：任务停在舆情步骤里，帖子已读进内存、翻译步骤还没开始
+            self.server.sentiment_blocked.append(n_posts)
+            self.server.sentiment_gate.wait(timeout=60)
+
         if "智能调度器" in system_msg:
             # 替身模型：描述里要了舆情就给带 sentiment 的计划。真模型靠 prompt
             # 里那几条规则自己判断，这里只需要可控
             # 触发词要窄：既有用例的描述里就有「翻译已有数据」，用「翻译」当判据
             # 会把它们的计划一起改掉
-            if "重新翻译" in user_msg:
+            if "先分析舆情再翻译" in user_msg:
+                content = PLAN_SENTIMENT_THEN_TRANSLATE
+            elif "重新翻译" in user_msg:
                 content = PLAN_WITH_TRANSLATE
             else:
                 content = PLAN_WITH_SENTIMENT if "舆情" in user_msg else PLAN
@@ -55,8 +70,21 @@ class _Handler(BaseHTTPRequestHandler):
             # 内容是什么不重要 —— 这个分支存在的意义是「翻译这一步到底有没有真的发出去」
             n = len(re.findall(r"^\[\d+\]$", user_msg, re.M))
             self.server.translated.append(n)
-            joiner = chr(10) + "---POST_SEPARATOR---" + chr(10)
-            content = joiner.join(f"译文{i + 1}" for i in range(max(n, 1)))
+            gate = self.server.translate_gate
+            if gate is not None and len(self.server.translated) > self.server.gate_after:
+                # 卡住第 gate_after 个及以后的翻译请求，让测试在「翻译进行到一半」的时刻检查状态
+                self.server.blocked.append(n)
+                gate.wait(timeout=60)
+            floor = self.server.reasoning_floor
+            if (n and self.server.batch_empty) or (floor and (body.get("max_tokens") or 0) < floor):
+                # 复刻 2026-09-15 对 deepseek-flash 的实测：预算被推理吃光，HTTP 200、content 为空
+                content = ""
+            elif not n and self.server.retry_reply is not None:
+                # 单条重译（请求里没有 [n] 编号）回指定的译文
+                content = self.server.retry_reply
+            else:
+                joiner = chr(10) + "---POST_SEPARATOR---" + chr(10)
+                content = joiner.join(f"译文{i + 1}" for i in range(max(n, 1)))
         elif n_posts > 1:
             if self.server.drop_separator:
                 # 模型压根没照分隔符输出，整批 JSON 连成一段 —— parts 只有 1 段，
@@ -71,11 +99,14 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             content = GOOD
 
-        payload = json.dumps({
+        self._reply(200, {
             "choices": [{"message": {"content": content}}],
             "usage": {"total_tokens": 1},
-        }).encode("utf-8")
-        self.send_response(200)
+        })
+
+    def _reply(self, status, body):
+        payload = json.dumps(body).encode("utf-8")
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
@@ -99,10 +130,26 @@ class LLMSite:
     和图片描述。
     """
 
-    def __init__(self, port: int = 0, drop_separator: bool = False):
+    def __init__(self, port: int = 0, drop_separator: bool = False, batch_empty: bool = False,
+                 retry_reply: str = None, reasoning_floor: int = 0,
+                 translate_gate: threading.Event = None, gate_after: int = 0,
+                 sentiment_gate: threading.Event = None, max_tokens_limit: int = 0):
         self._port = port
         # True 时批量结果整段返回、不带分隔符，走「parts 不够」那条路
         self.drop_separator = drop_separator
+        # 翻译：batch_empty 让批量请求回空内容（推理把预算吃光，全部落进单条重译）；
+        # retry_reply 指定单条重译回什么；reasoning_floor 让 max_tokens 低于它的翻译请求回空内容
+        self.batch_empty = batch_empty
+        self.retry_reply = retry_reply
+        self.reasoning_floor = reasoning_floor
+        # 翻译请求闸门：前 gate_after 个照常回，之后的记进 blocked 并等 translate_gate 放行
+        self.translate_gate = translate_gate
+        self.gate_after = gate_after
+        self.blocked = []
+        # 舆情请求闸门（记进 sentiment_blocked 后等放行）；max_tokens_limit 让超预算的请求回 400
+        self.sentiment_gate = sentiment_gate
+        self.sentiment_blocked = []
+        self.max_tokens_limit = max_tokens_limit
         self._server = None
         self._thread = None
         self.seen = []
@@ -119,6 +166,15 @@ class LLMSite:
         self._server.user_prompts = self.user_prompts
         self._server.translated = self.translated
         self._server.drop_separator = self.drop_separator
+        self._server.batch_empty = self.batch_empty
+        self._server.retry_reply = self.retry_reply
+        self._server.reasoning_floor = self.reasoning_floor
+        self._server.translate_gate = self.translate_gate
+        self._server.gate_after = self.gate_after
+        self._server.blocked = self.blocked
+        self._server.sentiment_gate = self.sentiment_gate
+        self._server.sentiment_blocked = self.sentiment_blocked
+        self._server.max_tokens_limit = self.max_tokens_limit
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         return "http://127.0.0.1:{}".format(self._server.server_address[1])

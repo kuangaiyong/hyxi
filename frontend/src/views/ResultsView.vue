@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useTaskStore } from '@/stores/task'
 import PostContent from '@/components/PostContent.vue'
+import * as resultsApi from '@/api/results'
 import * as sentimentApi from '@/api/sentiment'
 import type { PostData } from '@/types/result'
 import type { SentimentResult } from '@/types/sentiment'
@@ -100,9 +101,93 @@ const threads = computed(() =>
 const isShort = (t: { root: PostData; replies: unknown[] }) =>
   t.root.site_comment_count != null && t.replies.length < t.root.site_comment_count
 
+// ===== 补译：统计栏下面那条提示条 =====
+// 「还缺译文」的条数由后端一处算（needs_translation），前端只显示 —— 各算一份迟早对不上。
+// 进度走 SSE，另每 10 秒拉一次 /stats 兜底：翻译可能是共用同一来源的别的任务发起的，
+// 本任务的频道上收不到任何事件，只有 /stats 的 translating 看得见。
+const backfillRunning = ref(false)
+const backfillDone = ref(0)
+const backfillTotal = ref(0)
+const backfillError = ref('')
+let translateSource: EventSource | null = null
+let statsTimer: number | null = null
+
+const untranslatedCount = computed(() => taskStore.stats?.untranslated_count ?? 0)
+/** 任务没跑完（它自己的翻译步骤还会翻），或者没有要翻的也没在翻，就不显示这条 */
+const showBackfillBar = computed(() =>
+  taskStore.isCompleted && (untranslatedCount.value > 0 || backfillRunning.value)
+)
+
+function stopWatchingBackfill() {
+  translateSource?.close()
+  translateSource = null
+  if (statsTimer !== null) {
+    clearInterval(statsTimer)
+    statsTimer = null
+  }
+}
+
+/** 补译结束（不管是谁翻的）：帖子和统计都要重拉，N 归零提示条自己就消失了 */
+async function finishBackfill(err = '') {
+  stopWatchingBackfill()
+  backfillRunning.value = false
+  backfillError.value = err
+  await reload(taskStore.currentPage)
+}
+
+function watchBackfill(total: number) {
+  stopWatchingBackfill()
+  backfillRunning.value = true
+  backfillError.value = ''
+  backfillDone.value = 0
+  backfillTotal.value = total
+
+  const es = new EventSource(resultsApi.getTranslationEventsUrl(taskId.value))
+  translateSource = es
+  es.addEventListener('translation_progress', (e: MessageEvent) => {
+    const d = JSON.parse(e.data)
+    backfillDone.value = d.done || 0
+    if (d.total) backfillTotal.value = d.total
+  })
+  es.addEventListener('translation_complete', (e: MessageEvent) => {
+    const d = JSON.parse(e.data)
+    finishBackfill(d.status === 'completed' ? '' : d.error || '补译失败')
+  })
+  // 连接层错误不 close：EventSource 自己会重连，下面的轮询也兜得住
+
+  statsTimer = window.setInterval(async () => {
+    try {
+      const stats = await resultsApi.fetchStats(taskId.value)
+      if (!stats.translating) await finishBackfill()
+    } catch {
+      /* 后端暂时不可达，下一轮再看 */
+    }
+  }, 10000)
+}
+
+async function startBackfill() {
+  if (backfillRunning.value) return
+  backfillError.value = ''
+  try {
+    const body = await resultsApi.triggerBackfillTranslation(taskId.value)
+    if (body.status === 'started' || body.status === 'running') {
+      watchBackfill(body.pending_count ?? untranslatedCount.value)
+    } else {
+      await reload(taskStore.currentPage)   // completed：没有要翻的，刷新一下让提示条消失
+    }
+  } catch (e: any) {
+    // 模型没配置这类前置条件，后端在起作业之前就回 400；原文照显，用户才知道去哪配
+    backfillError.value = e?.response?.data?.detail || e?.message || '发起补译失败'
+  }
+}
+
+onUnmounted(stopWatchingBackfill)
+
 onMounted(async () => {
   taskStore.currentTaskId = taskId.value
   await reload()
+  // 进页面时来源已经在翻了（别的标签页点的、或共用来源的任务在翻）：直接接上进度
+  if (taskStore.stats?.translating) watchBackfill(untranslatedCount.value)
   await taskStore.fetchTask(taskId.value)
   // 舆情是附加信息，没分析过、正在分析、请求失败都只是不显示按钮，
   // 不能让它拖累帖子列表本身
@@ -225,6 +310,31 @@ function getStatusText(): string {
           {{ taskStore.stats.time_range_end || 'N/A' }}
         </div>
         <div class="stat-label">时间结束</div>
+      </div>
+    </div>
+
+    <!-- 补译：采集留下的没译文的帖子，在这里一键补齐（只翻缺的，同舆情页的增量分析） -->
+    <div v-if="showBackfillBar" class="card backfill-bar" data-testid="backfill-bar">
+      <div class="flex items-center justify-between gap-4">
+        <div>
+          <span v-if="backfillRunning" class="text-sm" data-testid="backfill-status">
+            ⏳ 正在补译 {{ backfillDone }} / {{ backfillTotal }}
+          </span>
+          <span v-else class="text-sm" data-testid="backfill-status">
+            📝 有 {{ untranslatedCount }} 条帖子还没有译文
+          </span>
+          <p v-if="backfillError" class="text-sm backfill-error" data-testid="backfill-error">
+            ⚠️ {{ backfillError }}
+          </p>
+        </div>
+        <button
+          class="btn btn-primary"
+          data-testid="backfill-start"
+          :disabled="backfillRunning"
+          @click="startBackfill"
+        >
+          {{ backfillRunning ? '正在补译…' : `翻译这 ${untranslatedCount} 条` }}
+        </button>
       </div>
     </div>
 
@@ -698,5 +808,12 @@ function getStatusText(): string {
   background: #FDE68A;
   color: #92400E;
   white-space: nowrap;
+}
+.backfill-bar {
+  border-left: 3px solid var(--primary);
+}
+.backfill-error {
+  margin: 4px 0 0;
+  color: var(--error);
 }
 </style>

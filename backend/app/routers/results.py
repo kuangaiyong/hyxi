@@ -9,7 +9,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 from app.collectors import get_collector
-from app.models import PostsResponse, PostData, TaskStats
+from app.models import PostsResponse, PostData, TaskStats, TaskStatus
 from app.services import source_service, storage
 from app.services.excel_service import (
     ExcelService, EXPORT_COLUMNS, SENTIMENT_CN, UNANALYZED,
@@ -19,7 +19,9 @@ from app.services.post_tree import (
     mark_fresh_replies, normalize_timestamp, order_by_thread, post_key, sort_time,
 )
 from app.services.sentiment_service import is_analyzable
-from app.services.orchestrator import orchestrator, load_task_posts
+from app.services.llm_utils import load_llm_config
+from app.services.translator_service import needs_translation
+from app.services.orchestrator import orchestrator, load_task_posts, translation_channel
 
 router = APIRouter(prefix="/api/v1/tasks/{task_id}", tags=["结果"])
 
@@ -305,6 +307,78 @@ async def get_stats(task_id: str):
         time_range_start=timestamps[0] if timestamps else None,
         time_range_end=timestamps[-1] if timestamps else None,
         top_users=top_users,
+        untranslated_count=sum(1 for p in posts if needs_translation(p)),
+        translating=orchestrator.translation_owner(_task_source_ids(task, posts)) is not None,
+    )
+
+
+def _task_source_ids(task: dict, posts: list) -> list:
+    """这个任务读的是哪几个来源：结果里记下的为准，没记（还没跑完）就按帖子里出现过的"""
+    recorded = [e["id"] for e in ((task.get("result") or {}).get("sources") or []) if e.get("id")]
+    return recorded or sorted({p.get("source") or "tweakers" for p in posts})
+
+
+# ===== 补译 =====
+
+def _busy_message(owner: str, task_id: str) -> str:
+    kind, _, who = owner.partition(":")
+    if kind == "backfill":
+        return "正在补译" if who == task_id else "同一来源正在由另一个任务补译"
+    return "同一来源正在被一个任务翻译，结束后再看"
+
+
+@router.post("/translate")
+async def trigger_backfill_translation(task_id: str):
+    """结果页补译：把这个任务所读来源里「有正文、没有可用译文」的帖子翻掉，已有译文的一条不动。
+
+    检查顺序有讲究：没有要翻的直接说完成（不必配模型）；模型没配置必须在起作业**之前**拒绝 ——
+    先回「已开始」再在后台失败，页面会一直显示「正在补译」。
+    """
+    task = _get_task_or_404(task_id)
+    # 只补**成功完成**的任务：result（连同采了哪些来源）只在成功时写，没记来源时 load_task_posts
+    # 会退回「全部已注册来源」—— 在这里补译就成了把所有来源的未译帖子一起送去翻。
+    # 前端也只给已完成的任务显示提示条，两边同一个口径
+    if task.get("status") in (TaskStatus.PENDING, TaskStatus.PARSING, TaskStatus.RUNNING):
+        raise HTTPException(status_code=409, detail="任务还在执行，等它结束再补译")
+    if task.get("status") != TaskStatus.COMPLETED:
+        raise HTTPException(status_code=409, detail="任务没有成功完成，不能在它的结果页补译")
+
+    posts = load_task_posts(task)
+    source_ids = _task_source_ids(task, posts)
+    owner = orchestrator.translation_owner(source_ids)
+    if owner:
+        return {"status": "running", "message": _busy_message(owner, task_id), "task_id": task_id}
+
+    pending = [p for p in posts if needs_translation(p)]
+    if not pending:
+        return {"status": "completed", "pending_count": 0, "message": "没有需要补译的帖子", "task_id": task_id}
+
+    if load_llm_config() is None:
+        raise HTTPException(status_code=400, detail="请先配置 LLM API")
+
+    holder = orchestrator.start_backfill_translation(task_id, source_ids, pending)
+    if holder:
+        return {"status": "running", "message": _busy_message(holder, task_id), "task_id": task_id}
+    return {"status": "started", "pending_count": len(pending),
+            "message": f"开始补译 {len(pending)} 条", "task_id": task_id}
+
+
+@router.get("/translate/events")
+async def translation_events(task_id: str):
+    """补译进度 SSE。频道与任务进度流、舆情流分开（见 translation_channel）"""
+    _get_task_or_404(task_id)
+
+    from fastapi.responses import StreamingResponse
+    from app.services.progress_manager import progress_manager
+
+    return StreamingResponse(
+        progress_manager.event_generator(translation_channel(task_id), "translation_complete"),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

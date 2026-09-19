@@ -199,6 +199,11 @@ class TaskStats(BaseModel):
     time_range_start: Optional[str] = None
     time_range_end: Optional[str] = None
     top_users: List[dict] = Field(default_factory=list)
+    # 有正文、却没有可用译文的条数（译文为空或是失败标记，判据见 translator_service.needs_translation）。
+    # 结果页的补译提示条靠它，必须和页面上「（尚未翻译）」加失败标记的条数对得上
+    untranslated_count: int = 0
+    # 这个任务读的来源里，眼下有没有翻译在跑（补译作业或任务里的翻译步骤）
+    translating: bool = False
 
 
 # ===== SSE 事件 =====

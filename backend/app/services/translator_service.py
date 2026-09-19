@@ -16,6 +16,16 @@ logger = logging.getLogger("hyxi.translator")
 # 批量翻译时每次 LLM 调用处理的帖子数量
 BATCH_SIZE = 5
 
+# 单条重译的输出预算。推理型模型的 reasoning 也计入 max_tokens：2026-09-15 对 deepseek-flash 实测，
+# 给 2048 时一条 2500 字的长帖 completion_tokens=2048 全是 reasoning、content 为空，这条就永远挂着
+# 「[翻译解析失败]」。8192 也是 DeepSeek 非推理模型的上限，不会因为超上限让整个请求 400
+RETRY_MAX_TOKENS = 8192
+
+# 被模型以 400 顶回来时退回的旧预算。**模型是用户自己配的**：8K 上下文的那些要求
+# 「输入 + max_tokens ≤ 上下文」，8192 直接让整个请求 400 —— 不退回去的话，原来 2048
+# 能重译成的帖子会一律挂上失败标记，比调大预算之前更糟
+FALLBACK_MAX_TOKENS = 2048
+
 # 人设句与术语表单独抽出来，是因为**图片理解要用同一个角色**（vision_service 直接
 # import 这两个常量）。依赖方向看着有点怪，但这正是需求要的「多模态模型的角色与翻译
 # 时一致」—— 看懂储能设备照片、App 截图、配电箱接线图靠的就是这份术语表。
@@ -79,6 +89,53 @@ def _looks_untranslated(translation: str, content: str) -> bool:
     """
     t, c = translation.strip(), content.strip()
     return bool(t) and t == c and not _has_cjk(c)
+
+
+# 译者写进 translation 的三种失败标记，结果页上显示的就是这串
+FAILED_PREFIXES = ("[翻译失败", "[翻译为空", "[翻译解析失败")
+
+
+def is_failed_translation(text: str) -> bool:
+    """译文是不是译者留下的失败标记（「[翻译解析失败] 原文…」这类）"""
+    return (text or "").strip().startswith(FAILED_PREFIXES)
+
+
+def needs_translation(post: dict) -> bool:
+    """这条帖子还缺一份能用的译文：有正文，且译文为空或是失败标记。
+
+    **判据只有这一处**：结果页补译提示条的条数、补译作业挑的帖子、任务里翻译步骤的增量都用它 ——
+    各写一份的话，提示条上的 N 和页面上「（尚未翻译）」加失败标记的条数迟早对不上。
+    失败标记也算：以前它被当成「已翻译」永不重试，2026-09-15 一次补译就留下 5 条。
+    只含空白的正文没什么可翻，不算。
+    """
+    if not (post.get("content") or "").strip():
+        return False
+    translation = (post.get("translation") or "").strip()
+    return not translation or is_failed_translation(translation)
+
+
+async def _retranslate_one(llm: LLMService, content: str, idx: int) -> str:
+    """单条重译一条帖子。预算先给足，被模型以 400 顶回来就退回旧预算再试一次。
+
+    只认 400：429 / 5xx 已经在 `_retry_with_backoff` 那层退避过了，到这里还是错就是真错。
+    400 也可能是别的原因（模型名写错之类），那时退回去的这一次照样失败、落进 still_failed，
+    代价是多发一个请求 —— 比为此去解析供应商各不相同的错误文案划算。
+    """
+    args = dict(
+        system_prompt=TRANSLATION_SYSTEM_PROMPT,
+        user_message=f"请将以下荷兰语翻译成中文（直接输出翻译，不要额外说明）：\n{content}",
+        temperature=0.2,
+        max_retries=2,
+        label=f"重译单条 #{idx}",
+    )
+    try:
+        return await llm.chat_with_retry(max_tokens=RETRY_MAX_TOKENS, **args)
+    except Exception as e:
+        if "LLM API 错误: 400" not in str(e):
+            raise
+        logger.warning("重译单条 #%s 被拒（%s），退回 %s token 预算再试一次",
+                       idx, str(e)[:120], FALLBACK_MAX_TOKENS)
+        return await llm.chat_with_retry(max_tokens=FALLBACK_MAX_TOKENS, **args)
 
 
 class TranslatorService:
@@ -202,8 +259,7 @@ class TranslatorService:
             # 译文与原文完全相同且原文非中文 = 漏译，走同一条单条重译队列。
             failed_indices = [
                 i for i, t in enumerate(translations)
-                if t.startswith("[翻译失败") or t.startswith("[翻译为空")
-                or t.startswith("[翻译解析失败")
+                if is_failed_translation(t)
                 or _looks_untranslated(t, posts[i].get("content", ""))
             ]
 
@@ -219,15 +275,9 @@ class TranslatorService:
                     truncated = content[:2500] if len(content) > 2500 else content
 
                     try:
-                        trans = await llm.chat_with_retry(
-                            system_prompt=TRANSLATION_SYSTEM_PROMPT,
-                            user_message=f"请将以下荷兰语翻译成中文（直接输出翻译，不要额外说明）：\n{truncated}",
-                            temperature=0.2,
-                            max_tokens=2048,
-                            max_retries=2,
-                            label=f"重译单条 #{idx}",
-                        )
-                        if trans and len(trans.strip()) > 2:
+                        trans = await _retranslate_one(llm, truncated, idx)
+                        # 非空即成功。以前要求超过 2 个字，「Jup」→「是的」就被判失败（真实数据里挂着失败标记）
+                        if trans and trans.strip():
                             translations[idx] = trans.strip()
                             success_count += 1
                             fail_count -= 1

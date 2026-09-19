@@ -14,7 +14,7 @@ from app.services import source_service
 from app.services.post_tree import post_key, thread_of
 from app.services.llm_service import LLMService
 from app.services.collector_runner import CollectorRunner, ManualAuthRequired
-from app.services.translator_service import TranslatorService
+from app.services.translator_service import TranslatorService, needs_translation
 from app.services.excel_service import ExcelService
 from app.services.progress_manager import progress_manager
 from app.services.storage import (
@@ -28,6 +28,43 @@ from app.services import storage
 
 logger = get_logger(__name__)
 
+# 结果页补译每翻完这么多条就落一次库：几百条要翻十几分钟，整批翻完才写的话，
+# 中途关掉应用这一整批的钱就白花了（2026-09-15 便携包中途被关过一次）
+BACKFILL_CHUNK_SIZE = 50
+
+
+def translation_channel(task_id: str) -> str:
+    """补译进度走的频道。**不能直接用 task_id**：任务进度流和舆情流共用那个频道，
+    同一任务的舆情页正在分析时，翻译进度会串到舆情进度条上"""
+    return f"{task_id}:translate"
+
+
+class _BackfillProgress:
+    """把译者「这一块翻到几成」（step_progress）换算成补译的「总共翻了几条」。
+
+    补译频道上只发 translation_progress / translation_complete 两种事件，译者的 log 不转发；
+    只把 warning 级的记进 warnings —— 译者把批量调用的异常（API Key 失效、模型名写错）吃掉、
+    只留一条 warning，一条都没翻成时要拿它当失败原因告诉用户
+    """
+
+    def __init__(self, channel: str, done_before: int, chunk_size: int, total: int, warnings: list):
+        self.channel = channel
+        self.done_before = done_before
+        self.chunk_size = chunk_size
+        self.total = total
+        self.warnings = warnings
+
+    async def emit(self, _channel: str, event_type: str, data: dict):
+        if event_type == "log" and data.get("level") == "warning":
+            self.warnings.append(data.get("message") or "")
+            return
+        if event_type != "step_progress":
+            return
+        fraction = min(max(float(data.get("progress") or 0), 0.0), 1.0)
+        await progress_manager.emit(self.channel, "translation_progress", {
+            "done": self.done_before + int(self.chunk_size * fraction), "total": self.total,
+        })
+
 
 class TaskOrchestrator:
     """编排任务执行：解析意图 → 逐步执行 → 汇总结果"""
@@ -36,6 +73,12 @@ class TaskOrchestrator:
         self.tasks: Dict[str, dict] = {}
         self._running_tasks: set = set()
         self._sentiment_running: set = set()
+        # 来源 → 正在翻译它的占用者（`backfill:<任务>` 补译作业 / `task:<任务>` 任务里的翻译步骤）。
+        # 翻译状态按帖子跨任务共享，同一批帖子翻两遍就是付两遍钱。**用普通字典不用 asyncio.Lock**：
+        # 本对象是模块级单例，测试每次换一个事件循环，锁一旦在某个循环里争用过就绑死在那个循环上
+        self._translation_claims: Dict[str, str] = {}
+        # 补译作业一跑十几分钟。asyncio 只弱引用任务，不留强引用的话可能在跑到一半时被回收
+        self._backfill_jobs: set = set()
         self._task_queue: asyncio.Queue = asyncio.Queue()  # 任务等待队列
         init_db()
         migrate_from_json()
@@ -336,26 +379,46 @@ class TaskOrchestrator:
                                 m["total_pages"] for m in loaded_meta.values()
                             )
 
-                        # 增量：过滤已翻译的帖子。全量重跑时全部重译
-                        if force_full:
-                            already, pending = [], list(posts)
-                            await self._task_log(task_id, "info", f"全量重跑: {len(pending)} 条全部重新翻译")
+                        # 同一来源正被结果页补译（或别的任务在翻）时先等它结束：翻译状态按帖子跨任务共享，
+                        # 两边各翻一遍就是付两遍钱。翻译期间自己也占着来源，补译那边见了就不另起
+                        source_ids = sorted({p.get("source") or "tweakers" for p in posts})
+                        owner = f"task:{task_id}"
+                        claimed = await self._wait_and_claim_translation(task, source_ids, owner)
+                        if not claimed:
+                            await self._task_log(task_id, "info", "任务已取消，跳过翻译")
                         else:
-                            already = [p for p in posts if p.get("_processed", {}).get("translated") and p.get("translation")]
-                            pending = [p for p in posts if not p.get("_processed", {}).get("translated") or not p.get("translation")]
-                        if already:
-                            await self._task_log(task_id, "info", f"增量翻译: {len(already)} 条已翻译跳过, {len(pending)} 条待翻译")
-                        if pending:
-                            result = await TranslatorService.execute(
-                                task_id, pending, step.params, progress_manager, idx
-                            )
-                            for p in result.get("posts", []):
-                                p.setdefault("_processed", {})["translated"] = True
-                            context["posts"] = _merge_by_fingerprint(posts, result.get("posts", []))
-                        else:
-                            context["posts"] = already
-                            await self._task_log(task_id, "info", "所有帖子已翻译，跳过")
-                        self._save_translations(context["posts"])
+                            try:
+                                # 占到来源后**无条件**回库刷一次译文：补译刚翻好的帖子在内存里还是空译文，
+                                # 不刷新就会再翻一遍（付两遍钱），重译失败还会把好译文冲成失败标记。
+                                # 不能只在「等过」时刷 —— 帖子往往是前面的步骤（采集、舆情）读进内存的，
+                                # 补译在那期间就翻完、放掉了来源，这一步一次占到、压根没等过
+                                posts = _refresh_translations(posts)
+                                context["posts"] = posts
+
+                                # 增量：过滤已翻译的帖子。全量重跑时全部重译
+                                if force_full:
+                                    already, pending = [], list(posts)
+                                    await self._task_log(task_id, "info", f"全量重跑: {len(pending)} 条全部重新翻译")
+                                else:
+                                    # 「还缺译文」只认 needs_translation 一处：失败标记也算，
+                                    # 以前它被当成已翻译、任务怎么跑都不重试，与结果页的补译口径两样
+                                    already = [p for p in posts if p.get("_processed", {}).get("translated") and not needs_translation(p)]
+                                    pending = [p for p in posts if not p.get("_processed", {}).get("translated") or needs_translation(p)]
+                                if already:
+                                    await self._task_log(task_id, "info", f"增量翻译: {len(already)} 条已翻译跳过, {len(pending)} 条待翻译")
+                                if pending:
+                                    result = await TranslatorService.execute(
+                                        task_id, pending, step.params, progress_manager, idx
+                                    )
+                                    for p in result.get("posts", []):
+                                        p.setdefault("_processed", {})["translated"] = True
+                                    context["posts"] = _merge_by_fingerprint(posts, result.get("posts", []))
+                                else:
+                                    context["posts"] = already
+                                    await self._task_log(task_id, "info", "所有帖子已翻译，跳过")
+                                self._save_translations(context["posts"])
+                            finally:
+                                self.release_translation(source_ids, owner)
 
                     elif step.action == "generate_excel":
                         posts = context.get("posts", [])
@@ -567,6 +630,103 @@ class TaskOrchestrator:
     def is_sentiment_running(self, task_id: str) -> bool:
         return task_id in self._sentiment_running
 
+    # ===== 翻译占用（补译作业与任务里的翻译步骤互斥） =====
+
+    def translation_owner(self, source_ids: List[str]) -> Optional[str]:
+        """这几个来源里任何一个正被翻译占着，就返回占用者；都空闲返回 None"""
+        for sid in source_ids:
+            owner = self._translation_claims.get(sid)
+            if owner:
+                return owner
+        return None
+
+    def claim_translation(self, source_ids: List[str], owner: str) -> Optional[str]:
+        """占住这几个来源去翻译。成功返回 None；有一个被别人占着就一个都不占，返回那个占用者"""
+        for sid in source_ids:
+            holder = self._translation_claims.get(sid)
+            if holder and holder != owner:
+                return holder
+        for sid in source_ids:
+            self._translation_claims[sid] = owner
+        return None
+
+    def release_translation(self, source_ids: List[str], owner: str) -> None:
+        """只放自己占的：占用者对不上说明来源已经归别人了，不能替人放"""
+        for sid in source_ids:
+            if self._translation_claims.get(sid) == owner:
+                del self._translation_claims[sid]
+
+    async def _wait_and_claim_translation(self, task: dict, source_ids: List[str], owner: str) -> bool:
+        """任务里的翻译步骤占来源：被补译或别的任务占着就每秒重试，第一次被挡时记一条日志。
+
+        占到返回 True；等的过程中任务被取消返回 False，调用方跳过这一步。
+        翻译本身跑起来也停不下（取消只在步骤之间检查），所以这里只管「别在被取消之后还接着等」
+        """
+        waited = False
+        while True:
+            holder = self.claim_translation(source_ids, owner)
+            if not holder:
+                return True
+            if task.get("_cancelled"):
+                return False
+            if not waited:
+                what = "正在补译" if holder.startswith("backfill:") else "正在被另一个任务翻译"
+                await self._task_log(task["id"], "info", f"同一来源{what}，等它结束再翻译")
+                waited = True
+            await asyncio.sleep(1)
+
+    def start_backfill_translation(self, task_id: str, source_ids: List[str],
+                                   pending: List[dict]) -> Optional[str]:
+        """结果页补译：占住来源、起后台作业，立刻返回 None；来源被占着就返回占用者、不起作业。
+
+        占用必须在这里**同步**做（同 run_sentiment_async）：等协程被调度起来再占的话，
+        连点两下会在第一轮占上之前起出第二轮
+        """
+        owner = f"backfill:{task_id}"
+        holder = self.claim_translation(source_ids, owner)
+        if holder:
+            return holder
+        job = asyncio.create_task(self._backfill_translation(task_id, source_ids, pending, owner))
+        self._backfill_jobs.add(job)
+        job.add_done_callback(self._backfill_jobs.discard)
+        return None
+
+    async def _backfill_translation(self, task_id: str, source_ids: List[str],
+                                    pending: List[dict], owner: str):
+        """分块翻、每块落库。后台协程的异常没人接，一律变成 translation_complete{failed}。
+
+        translated 报的是**真翻成了几条**（按 needs_translation 判），不是处理了几条：译者把失败写成
+        标记、不抛，只数处理条数的话一条没翻成也是「完成」。一条都没翻成就报失败并带上原因
+        """
+        channel = translation_channel(task_id)
+        total, done, ok, warnings = len(pending), 0, 0, []
+        outcome = {"status": "completed"}
+        try:
+            await progress_manager.emit(channel, "translation_progress", {"done": 0, "total": total})
+            for start in range(0, total, BACKFILL_CHUNK_SIZE):
+                chunk = pending[start:start + BACKFILL_CHUNK_SIZE]
+                result = await TranslatorService.execute(
+                    channel, chunk, {}, _BackfillProgress(channel, done, len(chunk), total, warnings), 0,
+                )
+                translated = result.get("posts", [])
+                for p in translated:
+                    p.setdefault("_processed", {})["translated"] = True
+                self._save_translations(translated)
+                done += len(chunk)
+                ok += sum(1 for p in translated if not needs_translation(p))
+                await progress_manager.emit(channel, "translation_progress", {"done": done, "total": total})
+            if total and not ok:
+                reason = warnings[0] if warnings else "模型返回的都是空内容"
+                outcome = {"status": "failed",
+                           "error": f"一条都没有翻成（{reason}）。到「LLM 配置」页点「测试连接」检查 API Key 和模型名后再试"}
+        except Exception as e:
+            logger.exception("补译失败 task=%s", task_id)
+            outcome = {"status": "failed", "error": str(e)}
+        finally:
+            # 先放来源再发完成：页面收到完成就去拉 /stats，那时 translating 必须已经是 false
+            self.release_translation(source_ids, owner)
+        await progress_manager.emit(channel, "translation_complete", {**outcome, "translated": ok, "total": total})
+
     async def run_sentiment(self, task_id: str, all_posts: list, pending_posts: list,
                             existing_results: list = None, step_index: int = 0):
         """跑一轮舆情分析并等它结束（增量：仅分析 pending_posts，合并已有结果）。
@@ -658,6 +818,24 @@ def load_task_posts(task: dict) -> List[dict]:
     if not recorded:
         return storage.load_posts([s["id"] for s in source_service.list_sources()])
     return storage.load_posts([e["id"] for e in recorded if e.get("id")])
+
+
+def _refresh_translations(posts: list) -> list:
+    """把这批帖子的译文与「已翻译」标记换成库里的最新值（按 source:fingerprint 对齐，顺序不动）。
+
+    任务里的翻译步骤占到来源之后用：它手里那份是更早的步骤读进来的，补译刚翻好的帖子在内存里还是空译文
+    """
+    sources = sorted({p.get("source") or "tweakers" for p in posts})
+    fresh = {post_key(p): p for p in storage.load_posts(sources)}
+    out = []
+    for p in posts:
+        latest = fresh.get(post_key(p))
+        if latest is not None:
+            p = dict(p, translation=latest.get("translation", ""))
+            if (latest.get("_processed") or {}).get("translated"):
+                p["_processed"] = {**(p.get("_processed") or {}), "translated": True}
+        out.append(p)
+    return out
 
 
 def _merge_by_fingerprint(source_posts: list, translated: list) -> list:

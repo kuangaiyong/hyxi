@@ -38,7 +38,9 @@ function mediaUrl(rel: string): string {
 <template>
   <div class="post-content">
     <p v-if="showOrig && post.content" class="pc-orig">{{ clip(post.content) }}</p>
-    <p v-if="showZh && post.translation" class="pc-zh">{{ clip(post.translation) }}</p>
+    <!-- 判据必须和后端 needs_translation 一样去空白：只有空格的译文渲染成一行空白，
+         看着像「翻了但是空的」，而提示条上的 N 把它算作待补译，两处对不上 -->
+    <p v-if="showZh && (post.translation || '').trim()" class="pc-zh">{{ clip(post.translation) }}</p>
     <p v-else-if="showZh && post.content" class="pc-untranslated">（尚未翻译）</p>
 
     <button v-if="tooLong" class="pc-more" @click="expanded = !expanded">

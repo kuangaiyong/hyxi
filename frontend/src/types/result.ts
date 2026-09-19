@@ -52,6 +52,10 @@ export interface TaskStats {
   time_range_start: string | null
   time_range_end: string | null
   top_users: { username: string; count: number }[]
+  /** 还缺译文的条数：有正文、译文为空或是「[翻译…失败]」标记。提示条上的 N 就是它 */
+  untranslated_count: number
+  /** 这个任务的来源正在被补译（也可能是共用来源的别的任务在翻）—— 进页面就得显示「正在补译」 */
+  translating: boolean
 }
 
 export interface SSEEvent {

@@ -1,4 +1,4 @@
-import apiClient from './client'
+import apiClient, { withApiKey } from './client'
 import type { PostsResponse, PostData, TaskStats } from '@/types/result'
 
 export async function fetchPosts(
@@ -29,4 +29,21 @@ export async function fetchPostDetail(taskId: string, index: number): Promise<Po
 export async function fetchStats(taskId: string): Promise<TaskStats> {
   const { data } = await apiClient.get(`/tasks/${taskId}/stats`)
   return data
+}
+
+/**
+ * 补译这个任务里还缺译文的帖子。只翻缺的那些，已有译文的一条不动 —— 同舆情页的增量分析，
+ * 所以不弹确认框。status 有三种：started（起了作业）、running（同一来源已经在翻）、
+ * completed（没有要翻的）；模型没配置时后端回 400。
+ */
+export async function triggerBackfillTranslation(
+  taskId: string
+): Promise<{ status: string; message: string; pending_count?: number }> {
+  const { data } = await apiClient.post(`/tasks/${taskId}/translate`)
+  return data
+}
+
+/** 补译进度流。频道与任务进度、舆情分开，所以是独立一条 URL */
+export function getTranslationEventsUrl(taskId: string): string {
+  return withApiKey(`/api/v1/tasks/${taskId}/translate/events`)
 }

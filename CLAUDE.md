@@ -220,6 +220,7 @@ submit 按钮、Arkose 人机验证）、小组页 DOM 实测结论，以及已�
 
 - `/api/v1/tasks*` —— 创建 / 列表 / 详情 / 取消删除 / retry 重跑 / `events` SSE 进度流
 - `/api/v1/tasks/{id}/posts*` —— 帖子查询（**按主贴分页**，评论在 `replies` 下）、单条详情、`stats`
+- `/api/v1/tasks/{id}/translate`、`/translate/events` —— 结果页补译（只翻还缺译文的）与它自己的 SSE 频道
 - `/api/v1/tasks/{id}/sentiment`、`/export` —— 舆情结论与导出（导出只有这一个口）
 - `/api/v1/sources*` —— 数据源增删改查、`authorize` 人工登录、凭据（写入即加密，只出不进）
 - `/api/v1/schedules*`、`/api/v1/config*`、`/api/v1/media/{path}` —— 定时任务、LLM 配置、正文图
@@ -259,7 +260,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 
 ## 测试
 
-**473 个测试，交付前必须全部 PASSED**（本机实测 `473 passed`）。但**全量只在最后一次代码改动之后跑一次**
+**492 个测试，交付前必须全部 PASSED**（本机实测 `test_impact.py build` 492 条全过，2026-09-19，677 秒）。但**全量只在最后一次代码改动之后跑一次**
 —— 质量红线的另一半是：它之前的每一轮改动，都要跑到受影响的范围。
 
 ### 什么时候跑什么（在仓库根目录）
@@ -268,7 +269,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 |---|---|---|---|
 | 写用例、红 → 绿 → 反向验证 | 那一两条 | `pytest backend\tests\test_core.py::TestX::test_y` | 秒级~1 分钟 |
 | 一轮修改收尾 | 受影响的用例 | `python scripts\test_impact.py run` | 改舆情服务：151 条 **46 秒**；改采集脚本：82 条 9 分 40 秒（其中 54 条浏览器，省不掉） |
-| 想先要个快信号 | 快道（不起浏览器的 415 条） | `pytest backend\tests -m "not browser" -n 3 --dist loadgroup` | **48 秒**（当时 407 条） |
+| 想先要个快信号 | 快道（不起浏览器的 434 条） | `pytest backend\tests -m "not browser" -n 3 --dist loadgroup` | **48 秒**（当时 407 条） |
 | **交付前（最后一次代码改动之后）** | 全量 + 刷新映射 | `python scripts\test_impact.py build` | 约 12 分钟，全过才写映射，和代码一起提交 |
 | 只要全量结论、不刷映射 | 全量 | `pytest backend\tests -n 3 --dist loadgroup` | **10 分 30 秒左右**（连跑 3 轮 10:30 / 10:29 / 12:02；串行 31 分钟） |
 
@@ -310,7 +311,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
   漂到盘符根，nodeid 变成 `code/hyxi/backend/…`，`--deselect` 和选测映射全对不上（实测）
 
 **前端没有单元测试框架**（package.json 里无 vitest / jest / @vue/test-utils），
-六条前端回归靠真浏览器守，都在 `frontend/e2e/` 下：
+七条前端回归靠真浏览器守，都在 `frontend/e2e/` 下：
 
 | 脚本 | 命令 | 守的是 |
 |---|---|---|
@@ -320,6 +321,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 | `stale_bundle_navigation.js` | `npm run e2e:stale` | 服务端换了构建后点导航必须有反馈，不许静默失败 |
 | `access_key_flow.js` | `npm run e2e:key` | 被 401 挡住后照提示填服务访问密钥：找得到、首屏可见、填错明说、填对当场生效 |
 | `results_thread_structure.js` | `npm run e2e:thread` | 回复全部展开且顺序同原帖、层级缩进与「回复 某某」、「已采 X · 原帖 Y」对账（没有第 2 层回复的数据时退出码 2） |
+| `results_backfill_translation.js` | `npm run e2e:backfill` | 补译提示条：N 与 `/stats`、出口三处一致；没待补译时不显示；`E2E_BACKFILL_CLICK=1` 才点按钮（真调模型） |
 
 真 Chrome、真前后端、无 mock，**要求两个服务都起着**（先跑 `.\start.ps1`），所以它们
 进不了 pytest。都自己从 `/tasks` 里挑任务，不写死任何 ID；密钥从项目根 `.env` 读。
@@ -344,7 +346,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 
 Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/src`。已注册路由：`/tasks`（默认）、`/sentiment`、`/schedules`、`/sources`、`/config`、`/tasks/:id/progress`、`/tasks/:id/results`、`/tasks/:id/sentiment`。
 
-`useSSE.ts` 是唯一的 SSE 消费点：监听 `step_start` / `step_progress` / `step_complete` / `log` / `error` / `task_complete`，收到 `task_complete` 后主动 `disconnect()`。
+`useSSE.ts` 是**任务进度流**的唯一消费点：监听 `step_start` / `step_progress` / `step_complete` / `log` / `error` / `task_complete`，收到 `task_complete` 后主动 `disconnect()`。另外三条流各由自己的页面直接连：舆情页（`sentiment/events`，等 `sentiment_complete`）、结果页补译（`translate/events`，等 `translation_complete`）、数据源页人工授权（`authorize` 的流）—— 每条流的终止事件不同，见 `Skill(hyxi-architecture)` 的 SSE 一条。
 
 `SourcesView.vue` 的参数表单**不写死字段**，按 `GET /api/v1/collectors` 回的 `param_fields` 渲染；必填校验以后端 `_validate_params()` 的 400 为准，前端只负责把报文显示出来。加新采集器时前端零改动。
 

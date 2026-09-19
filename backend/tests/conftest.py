@@ -64,6 +64,8 @@ BROWSER_CLASSES = {
     "TestFacebookLoginEndToEnd",
     "TestSessionStateReflectsReality",
     "TestTweakersCollectorGoldenEndToEnd",
+    "TestTweakersThreadAndQuotesEndToEnd",
+    "TestTweakersIncrementalTopicEndToEnd",
     "TestGroupFeedCollectorEndToEnd",
     "TestThreadDialogExtractionEndToEnd",
 }

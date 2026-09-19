@@ -35,9 +35,18 @@ const CONFIG = {
     mediaDir: job.media_dir || '',
     sourceId: job.source_id || 'tweakers',
     // 正文图的渲染尺寸下限。比 Facebook 那边（100）松一档：那个数字是对真站核实过的，
-    // 而 Tweakers 的真实页面本机访问不到，宁可多收几张让日志报出来，也不要静默漏掉
+    // 而 Tweakers 的真实页面本机访问不到，宁可多收几张让日志报出来，也不要静默漏掉。
+    // 2026 真站实测：正文真图渲染 369x800 ~ 800x600，表情是 16x16 / 34x16 / 30x17，
+    // 80 这条线两边都留了足够余量，没有真图落在它下面
     imageMinSize: 80,
+    // 增量跑（从 max_page_number + 1 起抓）时看不到第 1 页，主题指纹由 Python 从库里下发。
+    // 拿不到又没抓第 1 页时**不猜**，见 markTopicAndReplies()
+    topicFingerprint: job.topic_fingerprint || '',
 };
+
+// 本轮的「主题」（帖子发起帖）指纹。grabPage() 抓到显示第 1 页时定下来，
+// 后处理阶段拿它给全部楼层写父指针
+let topicFingerprint = CONFIG.topicFingerprint;
 
 // URL格式: /0 = 显示第1页, /1 = 显示第2页
 function displayToUrl(displayPage) { return displayPage - 1; }
@@ -67,10 +76,98 @@ async function handleConsent(page) {
 // ===== 提取帖子 =====
 async function extractPosts(page, displayPage) {
     const { posts, scan } = await page.evaluate(({ displayPage, minSize }) => {
-        const QUOTE_SEL = '.quote, .bb_quote, blockquote, [class*="quote"], .quotetext, .cite';
-        const scan = { candidates: [], accepted: [], rejected: [] };
+        // 引用块的真实标记（2026 真站实测）：<blockquote> 是 .messagecontent 的**直接子元素**，
+        // 里面包一个 .message-quote-div。**旧版那串 `.quote / .bb_quote / .cite / .quotetext`
+        // 在真站上一个都不存在**（实测计数全 0）—— 它们是照着 fixture 猜的，而那份 fixture
+        // 里的引用块 DOM 同样是猜的（`.cite` 这个 span 真站没有）。照它写选择器，测试全绿，
+        // 真站上却一段引用都收不到。
+        const QUOTE_SEL = 'blockquote, .message-quote-div';
+        const scan = { candidates: [], accepted: [], rejected: [], quoteExtra: 0, skippedNoId: 0 };
         const results = [];
         const msgBlocks = document.querySelectorAll('.message[data-message-id]');
+        // 每一条 `.message` 都该带 data-message-id（真站 3 页实测 203/203）。少了就说明
+        // 这个选择器收窄出了问题，那些楼层会被**静默跳过** —— 页面上完全看不出来
+        scan.skippedNoId = document.querySelectorAll('.message').length - msgBlocks.length;
+
+        /**
+         * 读一个引用块。**引用块是独立的一份数据，绝不许并进正文** ——
+         * 指纹吃 `用户名|时间戳|正文前100字`，并进去全部历史数据失配、已翻译的帖子会被
+         * 重新付费翻译。原站本来也是「引用框 + 正文」两块。
+         *
+         * 真站实测的三条形态：
+         *  · 引用行是 `<b><a class="messagelink" href="…/list_message/<id>#<id>">张三 schreef
+         *    op …</a>:</b>` —— **被引用楼层的 id 就在 href 里**，引用关系有精确的 join key
+         *  · 长引用（`.large-quote`）的正文被**服务端**截断，中间插一个字面量 `[...]`；
+         *    点 `.toggle-quote` 只加一个 CSS class，文本一个字符都不变、0 个新 XHR —— 点不开
+         *  · 被引用的图**不是 `<img>`**，是一个 `<a href="…原图…">[Afbeelding]</a>` 锚点，
+         *    所以「`<img>` + 渲染尺寸」那条路永远收不到它
+         */
+        function readQuote(bq) {
+            const div = bq.querySelector('.message-quote-div') || bq;
+            const link = div.querySelector('a.messagelink');
+            let cite = '';
+            let quotedId = '';
+            if (link) {
+                cite = link.textContent.trim();
+                const m = (link.href || '').match(/list_message\/(\d+)/);
+                if (m) quotedId = m[1];
+            }
+
+            const imageUrls = [];
+            // 图必须在**原始元素**上量尺寸：下面那个 clone 游离于文档之外，
+            // getBoundingClientRect() 一律返回 0，照着它取会把每张图都过滤掉
+            div.querySelectorAll('img').forEach(im => {
+                const url = im.currentSrc || im.src || '';
+                if (!url || url.startsWith('data:')) return;
+                scan.candidates.push(url);
+                const r = im.getBoundingClientRect();
+                if (r.width < minSize || r.height < minSize) {
+                    scan.rejected.push({ why: '引用块尺寸', url,
+                                         w: Math.round(r.width), h: Math.round(r.height) });
+                    return;
+                }
+                scan.accepted.push(url);
+                imageUrls.push(url);
+            });
+            // [Afbeelding] 锚点：真站上被引用的照片只以这个形态出现。它不是 <img>，
+            // 没有渲染尺寸，所以只能按「锚点文字就是 [Afbeelding]」认 —— 引用块里
+            // 别的 <a>（指向别的页面、用户相册）不是图，不能误收
+            div.querySelectorAll('a[href]').forEach(a => {
+                if ((a.textContent || '').trim() !== '[Afbeelding]') return;
+                const url = a.href || '';
+                if (!url || url.startsWith('data:')) return;
+                scan.candidates.push(url);
+                scan.accepted.push(url);
+                imageUrls.push(url);
+            });
+
+            // 正文用克隆：剔掉引用行（<b> 里那个 messagelink）与 toggle-quote
+            const clone = div.cloneNode(true);
+            clone.querySelectorAll('.toggle-quote').forEach(el => el.remove());
+            const cloneLink = clone.querySelector('a.messagelink');
+            if (cloneLink) {
+                const b = cloneLink.closest('b');
+                (b || cloneLink).remove();
+            }
+            const content = clone.textContent
+                .replace(/\s+/g, ' ')
+                .replace(/\[Afbeelding\]/gi, '[图片]')
+                .replace(/&nbsp;/g, ' ')
+                .trim();
+
+            // 引用行的文字形如「Storms schreef op zaterdag 23 mei 2026 @ 12:01」，
+            // 作者是 " schreef op" 之前那一段。**只当兜底**：被引用楼层采到时，
+            // 出口一律用那条楼层自己的用户名与时间（这里不解析荷兰语日期）
+            const um = cite.match(/^(.*?)\s+schreef\s+op\s/i);
+            return {
+                message_id: quotedId,
+                cite: cite,
+                username: um ? um[1].trim() : '',
+                content: content,
+                truncated: div.classList.contains('large-quote') && content.includes('[...]'),
+                _imageUrls: imageUrls,   // saveImages() 落盘后就删
+            };
+        }
 
         msgBlocks.forEach(block => {
             try {
@@ -104,23 +201,38 @@ async function extractPosts(page, displayPage) {
                     const postDiv = block.querySelector('.post');
                     if (postDiv) {
                         const clone = postDiv.cloneNode(true);
-                        clone.querySelectorAll('.quote, .bb_quote, blockquote, [class*="quote"]').forEach(el => el.remove());
+                        clone.querySelectorAll(QUOTE_SEL).forEach(el => el.remove());
                         content = clone.textContent.trim();
                     }
                 }
 
+                // 引用块。**先读它再读正文图**：引用块里的图归被引用者，
+                // 正文图那一轮要按 QUOTE_SEL 把它们跳过，谁收谁不收必须只有一个说法
+                let quote = null;
+                if (contentEl) {
+                    const bqs = Array.prototype.filter.call(
+                        contentEl.children, el => el.tagName === 'BLOCKQUOTE');
+                    // 真站上一条帖子最多一个引用块（实测 97/97），多出来的只取第一个并记账：
+                    // 静默丢掉一段引用，页面上完全看不出来
+                    if (bqs.length > 1) scan.quoteExtra += bqs.length - 1;
+                    if (bqs[0]) quote = readQuote(bqs[0]);
+                }
+
                 // 正文图。**必须在原始元素上量尺寸**：上面那个 clone 游离于文档之外，
                 // getBoundingClientRect() 会一律返回 0，照着 clone 取等于把每张图都
-                // 过滤掉。引用块里的图不算这条帖子的 —— 与 clone 删掉引用块同一个意思。
-                // **不设 host 白名单**：Facebook 那边能写死 scontent 是因为对真站核实过，
-                // Tweakers 的真实 DOM 本机访问不到，写死 host 等于赌。这里只按
-                // 「在正文容器内」+「非 data: URI」+「渲染尺寸」筛，其余交给日志。
+                // 过滤掉。**不设 host 白名单**：Tweakers 的正文图在 tweakers.net/i/ 下，
+                // 但写死 host 是赌站点不改，这里只按「在正文容器内」+「非 data: URI」
+                // +「渲染尺寸」筛，其余交给日志。
                 // 取图的容器要跟着正文走：没有 .messagecontent 时正文来自 .post，
                 // 图自然也在那里 —— 盯死 contentEl 会让这条路上的帖子静默丢图。
                 const imageUrls = [];
                 const imgRoot = contentEl || block.querySelector('.post');
                 if (imgRoot) {
                     imgRoot.querySelectorAll('img').forEach(im => {
+                        // 引用块里的图已经由 readQuote() 收走、归被引用者了。
+                        // 这里**不能再记一次排除** —— 那不是丢掉，是归了别人，
+                        // 记账说成「排除」会让「图片汇总」那行谎报丢失
+                        if (im.closest(QUOTE_SEL)) return;
                         const url = im.currentSrc || im.src || '';
                         if (!url || url.startsWith('data:')) return;   // 界面图标，不算候选
                         scan.candidates.push(url);
@@ -128,9 +240,6 @@ async function extractPosts(page, displayPage) {
                         const rej = (why) => scan.rejected.push({
                             why, url, w: Math.round(r.width), h: Math.round(r.height),
                         });
-                        // 引用块也要记账：QUOTE_SEL 里的 [class*="quote"] 相当宽，
-                        // 真站上万一误伤了正文图，不报出来就完全看不见
-                        if (im.closest(QUOTE_SEL)) return rej('引用块');
                         if (r.width < minSize || r.height < minSize) return rej('尺寸');
                         scan.accepted.push(url);
                         imageUrls.push(url);
@@ -155,6 +264,9 @@ async function extractPosts(page, displayPage) {
                         content: content,
                         page_number: displayPage,
                         message_id: messageId,
+                        // 引用块单独一份，**绝不并进 content**（指纹）。没有引用就是 null，
+                        // 出口按 null 决定不渲染，不需要判断来源
+                        quote: quote,
                         // 临时字段：saveImages() 落盘后就删，换成本地路径的 images。
                         // 指纹只吃 username|timestamp|content[:100]，多挂一个不影响它
                         _imageUrls: imageUrls,
@@ -170,7 +282,7 @@ async function extractPosts(page, displayPage) {
 }
 
 /**
- * 提取一页 + 把这页的正文图落盘。
+ * 提取一页 + 把这页的图落盘（正文图与引用图分开）。
  *
  * 指纹在这里就先算出来 —— 图片文件名要用它，而正式那轮指纹循环在浏览器关掉之后才跑。
  * makeFingerprint 是纯函数，那一轮重算得到的是同一个值。
@@ -180,7 +292,20 @@ async function extractPosts(page, displayPage) {
 async function grabPage(page, context, capture, tally, displayPage) {
     const { posts, scan } = await extractPosts(page, displayPage);
     logImageScan(scan, tally);
+    if (scan.skippedNoId) {
+        log(`   ⚠️ 有 ${scan.skippedNoId} 条 .message 没有 data-message-id，这一页漏掉了它们`);
+    }
+    if (scan.quoteExtra) {
+        log(`   ⚠️ 有 ${scan.quoteExtra} 处多余引用块只取了第一个 —— 一条帖子按理只有一个`);
+    }
     posts.forEach(p => { p.fingerprint = makeFingerprint(p); });
+    // 主题（帖子发起帖）= **显示第 1 页的第一条楼层**。**不能用 `.message.topicstarter`**：
+    // 真站实测那个 class 标的是「这条是发起人写的」，发起人在第 1 页就有 15 条楼层
+    if (!topicFingerprint && displayPage === 1 && posts.length) {
+        topicFingerprint = posts[0].fingerprint;
+        log(`   🧵 主题（第 1 页第一条）: [${posts[0].username}] ${posts[0].timestamp} — `
+            + `${posts[0].content.substring(0, 60)}...`);
+    }
     await saveImages(context, capture, posts, {
         mediaDir: CONFIG.mediaDir, sourceId: CONFIG.sourceId, tally,
     });
@@ -224,9 +349,14 @@ async function getTotalPages(page) {
 }
 
 // ===== 解析最后一页URL =====
+//
+// 末页链接真站是 `class="lastpage"`（实测：`<a href="…/2" class="lastpage">3</a>`），
+// **不是** href 里带 "last"。旧版写的 `a[href*="last"]` 永远匹配不到，等于这条路一直是死的
+// —— 只是 getTotalPages() 从页码链里算得出总页数，所以没暴露出来。
 async function getLastDisplayPage(page) {
     const lastHref = await page.evaluate(() => {
-        const lastLink = document.querySelector('.pageIndex a[href*="last"]');
+        const lastLink = document.querySelector('.pageIndex a.lastpage')
+            || document.querySelector('.pageIndex a[href*="last"]');
         return lastLink ? lastLink.getAttribute('href') : null;
     });
     if (lastHref) {
@@ -246,6 +376,47 @@ async function getLastDisplayPage(page) {
         }
     }
     return null;
+}
+
+/**
+ * 给全部楼层写父子关系：**一个数据源就是一串 —— 一条主题 + 按时间平铺的回复**。
+ *
+ * 改造前这里一个字段都不写，于是 140 条楼层全落成 `reply_level=0`、父指针为空，
+ * `build_tree()` 得到 140 个 root：结果页 140 张卡、每张标「主贴」、下面一条回复都没有，
+ * Excel 的「层级」列全是 0，「只看新回复」和按串给的舆情上下文一起失效。
+ *
+ * **回复一律是主题的第 1 层**，不嵌套 —— Tweakers 没有「回复的回复」这一层，
+ * 表达「我在回谁」靠的是引用块，而引用是另一份数据（`post.quote`），不是父指针。
+ *
+ * 主题拿不到时**不猜**：猜错会让新楼层挂到一个不相干的楼层上，页面看着像对的。
+ * 存量库（140 条并列主贴）就是这种状态，所以这里必须把原因和解法都说出来。
+ */
+function markTopicAndReplies(posts) {
+    if (!topicFingerprint) {
+        log('   ⚠️ 本轮确定不了主题：没抓第 1 页，库里也没有可用的历史主题指纹');
+        log('   ↳ 这批楼层先按「主贴」呈现，父子关系留给下一次全量跑');
+        if (CONFIG.incremental && CONFIG.startPage > 1) {
+            // 存量库的典型样子：改造前采的全是并列主贴，root 不唯一。全量重跑一次就修好
+            // （Python 侧只认「root 恰好一条」，两条以上一律不下发主题指纹）
+            log('   ↳ 若这个数据源的历史数据是改造前的平铺结构，请对它的任务点一次「全量重跑」');
+        }
+        return;
+    }
+    let topics = 0;
+    for (const post of posts) {
+        if (post.fingerprint === topicFingerprint) {
+            post.parent_fingerprint = null;
+            post.reply_level = 0;
+            topics++;
+        } else {
+            post.parent_fingerprint = topicFingerprint;
+            post.reply_level = 1;
+        }
+    }
+    if (!topics && posts.length) {
+        // 主题这一轮不在结果里（增量只抓到新楼层）—— 正常，父指针照样指向它
+        log(`   🧵 主题不在本轮结果里（库里的历史楼层），本轮 ${posts.length} 条楼层全挂在它下面`);
+    }
 }
 
 // ===== 主流程 =====
@@ -429,11 +600,12 @@ async function main() {
         log('🔒 浏览器已关闭');
     }
 
-    // ===== 后处理：指纹生成 + 去重 + 合并 =====
+    // ===== 后处理：指纹生成 + 父子关系 + 去重 + 合并 =====
     for (const post of allPosts) {
         post.fingerprint = makeFingerprint(post);
         post._processed = post._processed || { translated: false, sentiment_at: null };
     }
+    markTopicAndReplies(allPosts);
 
     // 只输出本轮抓到的：历史数据在 posts 表里，合并由 Python 侧的 upsert 完成
     // （它会保住已有帖子的 translation 和 _processed 标记）

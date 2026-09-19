@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Dict, Optional
+from urllib.parse import quote
 
 from app.collectors.base import Collector
 from app.config import settings
 
 DEFAULT_BASE_URL = "https://gathering.tweakers.net"
+# 原帖链接只接受 http(s) 的站点地址（见 post_url）。`javascript:` 拼出来是一段合法脚本，
+# 会原样进 `<a :href>` —— 与 facebook_group.py 同一条实测结论
+_WEB_BASE = re.compile(r"^https?://[^/\s]", re.IGNORECASE)
 
 
 class TweakersCollector(Collector):
@@ -17,6 +22,9 @@ class TweakersCollector(Collector):
     script = "tweakers.js"
     needs_credentials = False
     incremental_strategy = "page"
+    # 一个来源 = 一个 thread = **一条主题 + 按时间平铺的回复**。不是 Facebook 那种
+    # 「许多主贴各自带评论」—— 出口的措辞与增量时下发的主题指纹都看这个
+    thread_kind = "thread"
     param_fields = [
         {
             "name": "thread_id",
@@ -42,6 +50,28 @@ class TweakersCollector(Collector):
             return None
         return os.path.join(settings.project_root, f"tweakers_thread_{thread_id}.json")
 
+    def post_url(self, source: Dict[str, Any], message_id: str) -> Optional[str]:
+        """单条楼层的固定链接：`/forum/list_message/{id}#{id}`。
+
+        这是站点自己在用的形态（真站实测：楼层头部的日期就是一个指向它的
+        `<a class="oldage" href="…/forum/list_message/85322114#85322114">`）。
+
+        改造前 Tweakers 一条链接都没有（基类默认返回 None），结果页上主题卡因此没有
+        「🔗 原帖」。**回复不挂链接**：那是 `results.py::_post_url` 按 `reply_level == 0`
+        统一定的口径（Facebook 的评论 id 拼不出正确链接），这里不另开一条路。
+
+        `base_url` 取自数据源参数而不是写死常量（本地 fixture 验证时要指向测试站点），
+        并照抄 Facebook 那三条实测结论：非 http(s) 不给链接（`javascript:` 是一段合法脚本）、
+        非字符串不给（手工构造的 API 请求能把它存成数字，抛异常就是整页 500）、
+        路径段一律编码。
+        """
+        params = source.get("params") or {}
+        base = params.get("base_url") or source.get("base_url") or DEFAULT_BASE_URL
+        if not message_id or not isinstance(base, str) or not _WEB_BASE.match(base):
+            return None
+        mid = quote(str(message_id), safe="")
+        return f"{base.rstrip('/')}/forum/list_message/{mid}#{mid}"
+
     def build_job(self, source: Dict[str, Any], output_path: str) -> Dict[str, Any]:
         params = source.get("params") or {}
         # 续抓点由 Python 从 posts 表算出来。脚本不再读旧落盘文件 ——
@@ -62,6 +92,10 @@ class TweakersCollector(Collector):
             },
             "incremental": params.get("incremental", True),
             "known_fingerprints": source.get("known_fingerprints") or [],
+            # 主题（发起帖）的指纹，由 CollectorRunner 从库里查出来下发。增量跑从
+            # max_page_number + 1 起抓、看不到第 1 页，脚本自己认不出主题；拿不到时脚本
+            # 不猜（存量库的 140 条并列主贴就是这种状态），见 markTopicAndReplies()
+            "topic_fingerprint": source.get("topic_fingerprint") or None,
             "output_path": output_path,
             "state_file": source.get("state_file")
             or os.path.join(settings.project_root, ".scraper_state.json"),

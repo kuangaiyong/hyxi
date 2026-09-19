@@ -158,6 +158,14 @@ class CollectorRunner:
             source["known_comment_counts"] = (
                 storage.known_comment_counts(source_id) if incremental else {}
             )
+            # 一源一串的来源（Tweakers）：增量从 max_page_number + 1 起抓，脚本看不到第 1 页，
+            # 认不出主题，而全部楼层都要挂在它下面。库里 root 恰好一条才下发，多一条都不下发 ——
+            # 存量库是改造前采的 N 条并列主贴，那时猜一个主题出来比不猜糟得多
+            source["topic_fingerprint"] = (
+                storage.thread_topic_fingerprint(source_id)
+                if incremental and getattr(collector, "thread_kind", "feed") == "thread"
+                else None
+            )
 
         job = collector.build_job(source, output_path)
         # source 里给了就用：测试要一个已经过去的时刻

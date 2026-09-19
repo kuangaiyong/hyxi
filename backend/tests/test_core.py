@@ -4922,9 +4922,274 @@ class TestTweakersCollectorGoldenEndToEnd:
         # **汇总按 URL 去重**：逐页累加的话同一张图会被算两次，汇总行显示成
         # 「候选 4 张 · 保存 2 张」，看着像丢了一半，而实际一张没丢。信息流那边更狠 ——
         # 每一批都会把上一批的帖子重新提取一遍，10 批下来能虚报出 82% 的假丢失率
-        assert "图片汇总：候选图片地址 3 个 · 通过筛选 1 个 · 落盘 2 张" in joined, (
-            f"汇总行把同一个 URL 重复计数了: {joined}"
+        #
+        # 数字在 v1.13.0 从「3/1/2」变成「4/3/4」：引用块里的图不再算「排除」，
+        # 而是换个归属落盘（`fixture 80000001` 引用块里那张 400x300 的 <img>、
+        # `80000005` 引用块里那个 [Afbeelding] 锚点）。**它们不是丢了，是归了被引用者** ——
+        # 记账说成「排除」会让这一行谎报丢失，而它正是远端唯一的诊断依据
+        assert "图片汇总：候选图片地址 4 个 · 通过筛选 3 个 · 落盘 4 张" in joined, (
+            f"汇总行与图片的归属对不上了: {joined}"
         )
+
+
+def _run_tweakers_fixture(tmpdir, media, base_url, *, progress=None,
+                          source_id="fixture_tweakers", incremental=False):
+    """真 Chrome + 真 HTTP + 真子进程跑一轮 Tweakers 采集，抓的是本地 fixture 站点。
+
+    临时库与临时 media 的建立留给各测试类 —— 两类用例要的落点不同，共用一个函数只是
+    为了不必把 _run() 抄两遍。**不动黄金基线那个类的 _run()**：它要的是「提取结果逐字
+    等于重构前的脚本」，混进新参数就动摇了那条锁。
+    """
+    import asyncio
+    from app.collectors import get_collector
+    from app.services.collector_runner import CollectorRunner
+    from app.services.progress_manager import ProgressManager
+
+    source = {
+        "id": source_id,
+        "params": {
+            "thread_id": FIXTURE_THREAD_ID,
+            "headless": True,
+            "incremental": incremental,
+        },
+        "base_url": base_url,
+        "state_file": os.path.join(tmpdir, "state.json"),
+        # 不给的话正文图会落进真实的 backend/data/media（settings.data_dir 那份）
+        "media_dir": media,
+        "pacing": {"delay_min": 200, "delay_max": 400},
+    }
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(
+            CollectorRunner.execute("fixture", get_collector("tweakers"), source,
+                                    progress or ProgressManager())
+        )
+    finally:
+        loop.close()
+
+
+class _TweakersFixture:
+    """跑一轮真采集的脚手架：临时库 + 临时 media + 本地 fixture 站点。"""
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.media = os.path.join(self.tmpdir, "media")
+        self.storage, self._restore_db = _use_temp_db(self.tmpdir)
+
+    def teardown_method(self):
+        self._restore_db()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _skip_unless_ready(self):
+        import pytest
+        from app.config import settings
+
+        if not _HAS_NODE:
+            pytest.skip("未安装 node")
+        if not os.path.exists(
+            os.path.join(settings.project_root, "node_modules", "playwright", "package.json")
+        ):
+            pytest.skip("项目根目录未安装 playwright")
+
+    def _collect(self, progress=None, incremental=False, source_id="fixture_tweakers"):
+        self._skip_unless_ready()
+        sys.path.insert(0, _FIXTURES_DIR)
+        from fixture_site import FixtureSite
+
+        with FixtureSite() as base_url:
+            return _run_tweakers_fixture(
+                self.tmpdir, self.media, base_url,
+                progress=progress, source_id=source_id, incremental=incremental,
+            )
+
+
+class TestTweakersThreadAndQuotesEndToEnd(_TweakersFixture):
+    """Tweakers 的一串 = 1 个主题 + 按时间平铺的回复；引用单独成字段，图片归属分明。
+
+    **改造前这里一个断言都没有**：`tweakers.js` 一个 `parent_fingerprint` 都不写，
+    于是 140 条楼层全落成 `reply_level=0`，`build_tree()` 得到 140 个 root ——
+    结果页 140 张卡、每张标「主贴」、下面一条回复都没有，Excel 的「层级」列全是 0。
+
+    真站实测（2026，本机真 Chrome 直连 gathering.tweakers.net）：
+      · 主题 = 显示第 1 页的第一条 `.message`
+      · `.message.topicstarter` 标的是**发起人的所有楼层**（第 1 页就有 15 条），不是主题标记
+      · 引用块是 `<blockquote><div class="message-quote-div">…`，里面一个
+        `a.messagelink` 指向被引用楼层的 `/forum/list_message/<id>`
+      · 长引用（`large-quote`）的正文被**服务端**截断成字面量 `[...]`，`toggle-quote` 点不开
+      · 被引用的图在引用块里**不是 `<img>`**，是一个 `[Afbeelding]` 锚点
+    fixture 已按这套结构重写 —— 旧 fixture 里的 `.quote` / `.cite` 在真站上根本不存在，
+    照着它写的选择器测试会全绿，而真站上一张图、一段引用都收不到。
+    """
+
+    TOPIC_ID = "80000001"
+
+    def test_the_topic_is_the_first_floor_of_page_one(self):
+        posts = self._collect()["posts"]
+        topics = [p for p in posts if not p.get("parent_fingerprint")]
+        assert len(topics) == 1, (
+            "不是恰好一个主题 —— 一个数据源就是一串，只有第一条楼层是主题: "
+            f"{[(p['message_id'], p.get('reply_level')) for p in topics]}"
+        )
+        assert topics[0]["message_id"] == self.TOPIC_ID
+        assert int(topics[0].get("reply_level", 0) or 0) == 0
+
+    def test_topicstarter_is_not_the_topic_marker(self):
+        """`.message.topicstarter` 是「这条是发起人写的」，不是「这条是发起帖」。
+
+        真站实测第 1 页 15 条都带这个 class。fixture 里 Dorpjes 有两楼
+        （80000001 / 80000006），两条都带 —— 照 class 认主题会得到两个主题。
+        前半段顺便钉住 fixture 的覆盖度：class 标记被删掉，这条就退化成恒真了。
+        """
+        html = ""
+        for name in ("page_0.html", "page_1.html", "page_2.html"):
+            with open(os.path.join(_FIXTURES_DIR, "tweakers_site", name),
+                      encoding="utf-8") as f:
+                html += f.read()
+        marked = html.count('class="message topicstarter"')
+        assert marked == 2, f"fixture 里的 topicstarter 标记数变了，这条用例不再说明问题: {marked}"
+
+        topics = [p for p in self._collect()["posts"] if not p.get("parent_fingerprint")]
+        assert len(topics) == 1, "把 topicstarter 当成主题标记了"
+
+    def test_every_other_floor_is_a_reply_of_the_topic(self):
+        """其余楼层全是主题的第 1 层回复 —— **平铺**，不嵌套。
+
+        Tweakers 没有「回复的回复」这一层（引用才是表达「我在回谁」的方式），所以第二层
+        必须是 0 条；但「都属于同一个主题」这条关系必须写下来，否则就是改造前那 140 个主贴。
+        """
+        from app.services.post_tree import build_tree, post_key
+
+        data = self._collect()
+        by_id = {p["message_id"]: p for p in data["posts"]}
+        assert len(by_id) == 9, f"fixture 的楼层数变了: {sorted(by_id)}"
+        topic_fp = by_id[self.TOPIC_ID]["fingerprint"]
+
+        for mid, post in by_id.items():
+            if mid == self.TOPIC_ID:
+                continue
+            assert post.get("parent_fingerprint") == topic_fp, (
+                f"{mid} 没挂在主题下: {post.get('parent_fingerprint')}"
+            )
+            assert int(post.get("reply_level", 0) or 0) == 1, f"{mid} 的层级不是 1"
+
+        roots, children = build_tree(data["posts"])
+        assert [r["message_id"] for r in roots] == [self.TOPIC_ID]
+        assert len(children[post_key(by_id[self.TOPIC_ID])]) == 8
+
+    def test_quotes_are_captured_as_snapshots(self):
+        """引用块的内容、作者、被引用楼层的 id 都要单独存下来 —— 而正文一个字都不多。"""
+        by_id = {p["message_id"]: p for p in self._collect()["posts"]}
+
+        # 80000005 引用 Marloes（80000004）：真站 97 条引用里 94 条长这样，带 messagelink
+        quote = by_id["80000005"]["quote"]
+        assert quote["message_id"] == "80000004"
+        assert quote["username"] == "Marloes"
+        assert quote["cite"] == "Marloes schreef op zondag 24 mei 2026 @ 11:03"
+        assert "Terugverdientijd" in quote["content"]
+        assert "[图片]" in quote["content"], "引用块里的 [Afbeelding] 没跟着正文一起归一化"
+        # large-quote 的正文是服务端截断的（实测点 toggle-quote 文本长度一个字符都不变）
+        assert quote["truncated"] is True
+
+        # 80000001 的引用块没有 messagelink（真站 97 条里有 3 条这样）：只有快照
+        plain = by_id["80000001"]["quote"]
+        assert plain["message_id"] == ""
+        assert plain["cite"] == ""
+        assert plain["username"] == ""
+        assert "Heeft iemand hier al ervaring" in plain["content"]
+        assert plain["truncated"] is False
+
+    def test_quoted_content_never_enters_the_fingerprint(self):
+        """**本次最重要的一条。** 指纹吃 `用户名|时间戳|正文前100字`。
+
+        引用一旦并进正文，全部历史数据失配 —— 已翻译的帖子会被判成新帖重新付费翻译，
+        存量归并也跟着错。正文必须逐字等于黄金基线，引用只能走独立的字段。
+        """
+        data = self._collect()
+        with open(GOLDEN_FILE, "r", encoding="utf-8") as f:
+            golden = json.load(f)
+        got = {p["message_id"]: p for p in data["posts"]}
+        assert len(got) == len(golden["posts"])
+
+        for want in golden["posts"]:
+            post = got[want["message_id"]]
+            assert post["content"] == want["content"], f"{want['message_id']} 的正文被改了"
+            assert post["fingerprint"] == want["fingerprint"], f"{want['message_id']} 的指纹变了"
+
+        # 引用确实抓到了 —— 否则上面两句在「压根没实现引用」的代码上照样绿
+        assert got["80000005"]["quote"]["message_id"] == "80000004"
+
+    def test_the_quoted_image_goes_to_the_quote_not_to_the_quoter(self):
+        """引用块里的图 = 被引用者的图。既不能丢，也不能算到引用者头上。
+
+        真站实测：被引用的照片在引用块里**不是 `<img>`**，是一个
+        `<a href="…">[Afbeelding]</a>` 锚点 —— 靠「`<img>` + 渲染尺寸」永远收不到它。
+        所以引用图有两路来源：`[Afbeelding]` 锚点的 href，以及引用块里过了尺寸线的 `<img>`。
+        """
+        by_id = {p["message_id"]: p for p in self._collect()["posts"]}
+
+        # 锚点那一路
+        quoted = by_id["80000005"]["quote"].get("images") or []
+        assert len(quoted) == 1, f"[Afbeelding] 锚点指的那张图没落盘: {quoted}"
+        assert quoted[0].startswith("fixture_tweakers/"), f"没按 source 分目录: {quoted[0]}"
+        assert not os.path.isabs(quoted[0]), "存了绝对路径，落盘文件就搬不了机器了"
+        assert os.path.getsize(os.path.join(self.media, quoted[0])) > 0
+        assert not by_id["80000005"].get("images"), "引用图算到引用者自己的配图上了"
+
+        # <img> 那一路：引用块里 400x300 的正文图同样归被引用者
+        inline = by_id["80000001"]["quote"].get("images") or []
+        assert len(inline) == 1, f"引用块里的正文图没归到引用头上: {inline}"
+        assert os.path.getsize(os.path.join(self.media, inline[0])) > 0
+        assert not by_id["80000001"].get("images"), "把引用块里的图算到引用者头上了"
+
+
+class TestTweakersIncrementalTopicEndToEnd(_TweakersFixture):
+    """增量跑看不到第 1 页，主题指纹只能由 Python 从库里下发。
+
+    判据是「`parent_fingerprint` 为空且 `reply_level=0` 的行**恰好一条**」。
+    存量库现在有 140 条并列主贴，那时**不许猜**一个主题出来，但要说出怎么修。
+    """
+
+    def _seed(self, *rows):
+        self.storage.upsert_posts("fixture_tweakers", list(rows))
+
+    def test_a_run_starting_mid_thread_uses_the_stored_topic(self):
+        self._seed({
+            "fingerprint": "topic00000000000", "username": "Dorpjes",
+            "timestamp": "22-05-2026 17:06", "content": "主题正文（历史那一轮采的）",
+            "page_number": 1, "message_id": "80000001",
+            "parent_fingerprint": None, "reply_level": 0,
+        })
+        data = self._collect(incremental=True)
+
+        fresh = [p for p in data["posts"] if p["fingerprint"] != "topic00000000000"]
+        assert len(fresh) == 6, f"增量没把第 2、3 页（各 3 条）采回来: {len(fresh)}"
+        for post in fresh:
+            assert post["parent_fingerprint"] == "topic00000000000", (
+                f"{post['message_id']} 没挂到库里那个主题上"
+            )
+            assert post["reply_level"] == 1
+
+    def test_ambiguous_roots_do_not_get_a_topic_and_say_so(self):
+        """存量库是 N 条并列主贴（真实数据 140 条）。不猜主题，但必须说清怎么修。"""
+        for fp, mid, name in (("rootA000000000000", "80000001", "Dorpjes"),
+                              ("rootB000000000000", "80000002", "Havelaar")):
+            self._seed({
+                "fingerprint": fp, "username": name,
+                "timestamp": "22-05-2026 17:06", "content": f"正文{fp}",
+                "page_number": 1, "message_id": mid,
+                "parent_fingerprint": None, "reply_level": 0,
+            })
+        progress = _RecordingProgress()
+        data = self._collect(progress=progress, incremental=True)
+
+        joined = chr(10).join(progress.messages)
+        assert "全量重跑" in joined, f"没说清怎么修，用户只能看着 140 个主贴猜: {joined}"
+
+        fresh = [p for p in data["posts"]
+                 if p["fingerprint"] not in ("rootA000000000000", "rootB000000000000")]
+        assert fresh, "增量一条都没采到，这条用例什么都没测"
+        for post in fresh:
+            assert not post.get("parent_fingerprint"), "root 不唯一时猜了一个主题出来"
 
 
 class TestFullRerunDropsIncrementalAnchorsEndToEnd(_ScraperTmpRoot):

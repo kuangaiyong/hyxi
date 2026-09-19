@@ -178,10 +178,18 @@ async function fetchOne(context, capture, url, errors) {
  * 一片裂图，而舆情报告本来就是要回溯的。存相对路径而不是绝对路径，数据才能跨机器搬。
  *
  * 单张失败只跳过这一张，帖子照常入库 —— 图片是附加信息，不该把整条拖失败。
+ *
+ * **一条帖子的图有两份：它自己的，和它引用那条的**（`post.quote._imageUrls`）。
+ * 两份分开写、分开记：混成一份就是把别人的图算到引用者头上。「引用块里的图不算引用者的」
+ * 这条规矩在抓取侧已经执行（正文图跳过引用块），这里是它的另一半 —— 那些图不是丢掉，
+ * 是换个归属落盘，文件名带一个 `q` 后缀
  */
 async function saveImages(context, capture, posts, { mediaDir, sourceId, tally }) {
     if (!mediaDir) {
-        posts.forEach((p) => { delete p._imageUrls; });
+        posts.forEach((p) => {
+            delete p._imageUrls;
+            if (p.quote) delete p.quote._imageUrls;
+        });
         return;
     }
     const dir = path.join(mediaDir, sourceId);
@@ -193,10 +201,9 @@ async function saveImages(context, capture, posts, { mediaDir, sourceId, tally }
     let cached = 0;
     const errors = [];
 
-    for (const post of posts) {
-        const urls = post._imageUrls || [];
-        delete post._imageUrls;
-        if (!urls.length) continue;
+    /** 落一组图，返回相对路径数组。suffix 为空 = 帖子自己的，'q' = 它引用那条的 */
+    const saveGroup = async (urls, suffix, fingerprint) => {
+        if (!urls.length) return [];
         wanted += urls.length;
         const rels = [];
         for (let i = 0; i < urls.length; i++) {
@@ -207,7 +214,7 @@ async function saveImages(context, capture, posts, { mediaDir, sourceId, tally }
             if (!got) { failed++; continue; }
             try {
                 fs.mkdirSync(dir, { recursive: true });
-                const name = `${post.fingerprint}_${i}.${extOf(got.contentType, urls[i])}`;
+                const name = `${fingerprint}_${suffix}${i}.${extOf(got.contentType, urls[i])}`;
                 fs.writeFileSync(path.join(dir, name), got.buf);
                 rels.push(`${sourceId}/${name}`);
                 saved++;
@@ -217,7 +224,22 @@ async function saveImages(context, capture, posts, { mediaDir, sourceId, tally }
                 if (errors.length < 3) errors.push(`落盘失败 ${e.message}`);
             }
         }
+        return rels;
+    };
+
+    for (const post of posts) {
+        const own = post._imageUrls || [];
+        const quoted = (post.quote && post.quote._imageUrls) || [];
+        delete post._imageUrls;
+        if (post.quote) delete post.quote._imageUrls;
+        if (!own.length && !quoted.length) continue;
+
+        const rels = await saveGroup(own, '', post.fingerprint);
         if (rels.length) post.images = rels;
+        if (post.quote) {
+            const quotedRels = await saveGroup(quoted, 'q', post.fingerprint);
+            if (quotedRels.length) post.quote.images = quotedRels;
+        }
     }
 
     if (tally) {

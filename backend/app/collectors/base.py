@@ -20,6 +20,13 @@ class Collector:
     needs_credentials: bool = False
     param_fields: List[Dict[str, Any]] = []
     incremental_strategy: str = "page"  # "page" | "watermark"
+    # 一个来源里装的是什么：
+    #   "feed"   一个来源 = 许多条主贴，每条主贴底下挂自己的评论与回复（Facebook 小组）
+    #   "thread" 一个来源 = **一个讨论串**：一条主题 + 按时间平铺的回复（Tweakers 论坛）
+    # 只影响两处：出口按它选措辞（主题/回复 还是 主贴/评论与回复），Runner 按它决定要不要
+    # 把「库里那个主题的指纹」下发给脚本 —— 增量跑看不到第 1 页，脚本自己认不出主题。
+    # 站点知识留在声明里，Python 与前端都不需要按 collector_id 分支
+    thread_kind: str = "feed"
     # 不进「新增数据源」的采集器下拉框。留给没有真实站点、只服务于本地 fixture 的采集器；
     # get_collector() 照样能解析出来，已注册的数据源和回归测试不受影响
     internal: bool = False

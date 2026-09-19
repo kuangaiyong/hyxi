@@ -128,6 +128,11 @@ CREATE TABLE IF NOT EXISTS posts (
     -- 多模态模型对本帖配图的中文描述。落库是为了不重复付费：主贴的图会被它下面
     -- 每一条回复的整串上下文引用，不存的话增量分析每轮都要把同一张图重新描述一遍
     image_desc         TEXT NOT NULL DEFAULT '',
+    -- 这条楼层引用了哪一段内容（Tweakers 的引用块）。**绝不许并进 content** —— 指纹吃
+    -- content[:100]，并进去全部历史数据失配、已翻译的帖子会被判成新帖重新付费翻译。
+    -- 存的是采集那一刻的快照 {message_id, cite, username, content, truncated, images}：
+    -- 被引用楼层没采到时它是唯一的内容（原站的长引用被服务端截断成 [...]，点不开）
+    quote_json         TEXT NOT NULL DEFAULT '',
     translated         INTEGER NOT NULL DEFAULT 0,
     sentiment_at       TEXT,
     -- 原帖上显示的评论数（含回复的回复），只有主贴有，读不到是 NULL。结果页拿它和
@@ -177,6 +182,7 @@ def init_db():
         _drop_stored_summary(conn)
         _ensure_posts_image_desc(conn)
         _ensure_posts_comment_counts(conn)
+        _ensure_posts_quote(conn)
         _ensure_tasks_force_full(conn)
         conn.close()
         logger.info("SQLite 数据库初始化完成: %s", DB_PATH)
@@ -226,6 +232,23 @@ def _ensure_tasks_force_full(conn) -> None:
         logger.info("tasks.force_full 已补齐")
     except Exception as e:
         logger.error("补 tasks.force_full 列失败: %s", e)
+
+
+def _ensure_posts_quote(conn) -> None:
+    """给既有库补上 posts.quote_json 列。理由同 _ensure_posts_image_desc。
+
+    降级安全：老代码的 `_row_to_post()` 不读这一列，INSERT 的列名也是写死的 ——
+    多了它不影响任何既有读写。
+    """
+    cols = [d[1] for d in conn.execute("PRAGMA table_info(posts)")]
+    if "quote_json" in cols:
+        return
+    try:
+        conn.execute("ALTER TABLE posts ADD COLUMN quote_json TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+        logger.info("posts.quote_json 已补齐")
+    except Exception as e:
+        logger.error("补 posts.quote_json 列失败: %s", e)
 
 
 def _drop_stored_summary(conn) -> None:
@@ -810,6 +833,12 @@ def _row_to_post(row) -> dict:
         post["images"] = images
     if row["image_desc"]:
         post["image_desc"] = row["image_desc"]
+    # 只放已置位的键：没有引用的帖子不该凭空多出一个空对象（同 _processed 那条规矩）
+    if row["quote_json"]:
+        try:
+            post["quote"] = json.loads(row["quote_json"])
+        except ValueError:
+            logger.warning("帖子的 quote_json 解析不了，按没有引用处理: %s", row["quote_json"][:120])
     if row["site_comment_count"] is not None:
         post["site_comment_count"] = row["site_comment_count"]
     # 只放已置位的键：新采到的帖子本来就没有 _processed，凭空补一个空壳会让
@@ -949,6 +978,33 @@ def max_page_number(source_id: str) -> int:
         return row[0] or 0
     finally:
         conn.close()
+
+
+def thread_topic_fingerprint(source_id: str) -> Optional[str]:
+    """一源一串的来源（Tweakers）里那条**主题**（发起帖）的指纹；判不出来返回 None。
+
+    增量跑从 `max_page_number + 1` 起抓，脚本看不到显示第 1 页，可全部楼层都要挂在主题下 ——
+    这个指纹随 job 下发。全量跑用不到（脚本自己从第 1 页的第一条认）。
+
+    **判据是「`parent_fingerprint` 为空且 `reply_level = 0` 的行恰好一条」，不是
+    「第 1 页里时间最早那条」**：存量库是改造前采的 N 条并列主贴（真实数据 140 条），
+    用启发式会挑出一条普通楼层当主题，然后新楼层全挂到它下面 —— 页面看着像对的，
+    实际每个串都错。`None` 则让脚本把原因和「全量重跑」这条解法都打出来。
+
+    历史数据里 `page_number=1` 的那批在库里的先后顺序并不等于楼层顺序（真数据实测），
+    所以也不拿 seq 当判据。`drop_empty_posts()` / `merge_duplicate_posts()` 把回复提成
+    树根时只清父指针、`reply_level` 一个字不动（存储红线），所以那些行不会被误认成主题。
+    """
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT fingerprint FROM posts WHERE source_id = ? "
+            "AND TRIM(COALESCE(parent_fingerprint, '')) = '' AND reply_level = 0",
+            (source_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return rows[0][0] if len(rows) == 1 else None
 
 
 def merge_duplicate_posts() -> None:
@@ -1347,6 +1403,15 @@ def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True,
                         "UPDATE posts SET images_json=? WHERE source_id=? AND fingerprint=?",
                         (json.dumps(images, ensure_ascii=False), source_id, fp),
                     )
+                # 引用同理：本轮没抓到引用不许把已有的冲成空（选择器失效、站点改版、
+                # 这条楼层的引用被作者删掉都会走到这里）。代价是引用被作者删掉时库里
+                # 会留着旧快照，与 images 那条一样的取舍
+                quote = post.get("quote") or {}
+                if quote:
+                    conn.execute(
+                        "UPDATE posts SET quote_json=? WHERE source_id=? AND fingerprint=?",
+                        (json.dumps(quote, ensure_ascii=False), source_id, fp),
+                    )
                 conn.execute(
                     # **空值不许覆盖已有的好值**：归并分支两边的 username /
                     # timestamp / content 本来就可能不同，而「这轮没读到时间戳」正是
@@ -1375,9 +1440,9 @@ def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True,
             conn.execute(
                 """INSERT INTO posts (source_id, fingerprint, seq, username, timestamp,
                    content, translation, page_number, message_id, parent_fingerprint,
-                   reply_level, images_json, image_desc, translated, sentiment_at,
+                   reply_level, images_json, image_desc, quote_json, translated, sentiment_at,
                    site_comment_count)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     source_id, fp, next_seq, post.get("username", ""),
                     post.get("timestamp", ""), post.get("content", ""),
@@ -1386,6 +1451,7 @@ def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True,
                     int(post.get("reply_level", 0) or 0),
                     json.dumps(post.get("images") or [], ensure_ascii=False),
                     post.get("image_desc", ""),
+                    json.dumps(post.get("quote"), ensure_ascii=False) if post.get("quote") else "",
                     1 if processed.get("translated") else 0,
                     processed.get("sentiment_at"),
                     post.get("site_comment_count"),

@@ -17,6 +17,9 @@ class TweakersCollector(Collector):
     script = "tweakers.js"
     needs_credentials = False
     incremental_strategy = "page"
+    # 一个来源 = 一个 thread = **一条主题 + 按时间平铺的回复**。tweakers.js 不写父指针，
+    # 楼层全部按主贴入库 ——「老帖新回复」靠这个把它们认成同一主题下的回复
+    thread_kind = "thread"
     param_fields = [
         {
             "name": "thread_id",

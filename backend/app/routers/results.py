@@ -15,7 +15,7 @@ from app.services.excel_service import (
     ExcelService, EXPORT_COLUMNS, SENTIMENT_CN, UNANALYZED,
 )
 from app.services.post_tree import (
-    FRESH_DAYS_CHOICES, FRESH_DAYS_DEFAULT, baseline_time, build_tree,
+    FRESH_DAYS_CHOICES, FRESH_DAYS_DEFAULT, baseline_time, build_tree, flat_thread_starts,
     mark_fresh_replies, normalize_timestamp, order_by_thread, post_key, sort_time,
 )
 from app.services.sentiment_service import is_analyzable
@@ -120,6 +120,27 @@ def _url_sources() -> dict:
     return out
 
 
+def _thread_sources(task: dict = None) -> set:
+    """一源一串（`Collector.thread_kind == "thread"`，即 Tweakers）的来源 id，给「老帖新回复」认平铺楼层用。
+
+    注册表为准；来源被删掉后用任务里记下的 collector_id 兜底（同 _source_names）——
+    否则删掉数据源之后，历史任务的「只看新回复」又变回空的。
+    """
+    kinds = {s["id"]: s.get("collector_id") for s in source_service.list_sources()}
+    for entry in ((task or {}).get("result") or {}).get("sources", []):
+        if entry.get("id"):
+            kinds.setdefault(entry["id"], entry.get("collector_id"))
+    # 多来源改造之前的帖子没有 source 字段，全链路缺省按 "tweakers"（post_key）—— 那批就是 Tweakers 的楼层
+    found = {"tweakers"}
+    for sid, collector_id in kinds.items():
+        try:
+            if get_collector(collector_id).thread_kind == "thread":
+                found.add(sid)
+        except ValueError:
+            continue   # 采集器被下掉了：同 _url_sources()，不能让整页 500
+    return found
+
+
 def _post_url(post: dict, url_sources: dict) -> str:
     """原帖链接。**只给主贴** —— 用户明确只要主贴，而评论的锚点是 `?comment_id=`
     另一种形态；每条回复都挂一个链接还会把列表塞满。
@@ -203,7 +224,7 @@ async def get_posts(
     # 标记基于**全量** posts 而不是本页 —— 基准是数据集里最新的帖子时间，
     # 只拿本页算的话，翻到第 3 页时基准会变成那一页最新的帖子，标出来的东西
     # 每页都不一样
-    fresh = mark_fresh_replies(posts, _validate_fresh_days(fresh_days))
+    fresh = mark_fresh_replies(posts, _validate_fresh_days(fresh_days), _thread_sources(task))
 
     if search and search.strip():
         kw = search.strip().lower()
@@ -419,12 +440,18 @@ def _export_rows(task: dict, posts: list, results: list,
     names = _source_names(task)
     # 标记基于**全量 posts**，且必须在 order_by_thread 之前算 —— 判据看的是
     # 「回复 vs 它的顶层主贴」的时间关系，与呈现次序无关
-    fresh = mark_fresh_replies(posts, fresh_days)
+    thread_sources = _thread_sources(task)
+    fresh = mark_fresh_replies(posts, fresh_days, thread_sources)
+    # 一源一串平铺入库的楼层：新回复自己就是 level 0，「近期新回复」表得知道它挂在哪个主题下
+    topics = flat_thread_starts(posts, thread_sources)
+    ordered = order_by_thread(posts)
+    row_of = {post_key(p): i for i, p in enumerate(ordered)}
     rows = []
-    for i, p in enumerate(order_by_thread(posts), 1):
+    for i, p in enumerate(ordered, 1):
         r = by_key.get(post_key(p)) or {}
         sid = p.get("source", "")
         gap = fresh.get(post_key(p))
+        topic = topics.get(sid or "tweakers")
         rows.append({
             # 「老主贴上的新回复」的提醒文案。排序把这类回复埋到了很后面，
             # 这一列是用户在明细表里唯一能扫到它的东西
@@ -446,6 +473,9 @@ def _export_rows(task: dict, posts: list, results: list,
             "intensity": r.get("intensity") if r.get("sentiment") else "",
             "reason": r.get("reason_cn", ""),
             "dimensions": "、".join(r.get("dimensions") or []),
+            # 不进任何一列：一源一串平铺入库的楼层（含主题自己）所属主题那一行的下标。楼层不排在主题下面，
+            # 「近期新回复」的分组、「另有 N 条较早回复」、概览的评论数都按它认
+            "thread_root": row_of[post_key(topic)] if topic else None,
         })
     return rows
 
@@ -461,7 +491,9 @@ def _export_meta(task: dict, rows: list, sentiment: dict, posts: list = None,
         "sources": "、".join(dict.fromkeys(r["source"] for r in rows if r["source"])),
         "exported_at": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
         "total": len(rows),
-        "replies": sum(1 for r in rows if r["level"] > 0),
+        # 平铺楼层也是评论（主题之外的每一楼），否则概览里「评论 0 条」会紧挨着「老帖新回复 N 条」
+        "replies": sum(1 for i, r in enumerate(rows)
+                       if r["level"] > 0 or r.get("thread_root") not in (None, i)),
         "analyzed": sum(1 for r in rows if r["sentiment"] != UNANALYZED),
         "time_start": stamps[0] if stamps else "",
         "time_end": stamps[-1] if stamps else "",

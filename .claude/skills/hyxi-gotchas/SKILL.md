@@ -1,6 +1,6 @@
 ---
 name: hyxi-gotchas
-description: hyxi 的 29 条已知陷阱，逐条绑定具体文件与函数：result 可能为 None、INSERT OR REPLACE 触发级联删除、422 回显明文密码、storage.DB_PATH 是 import 时常量、爬虫退出码契约、增量抓取起点、舆情结果对齐等。改后端 API / 存储层 / 采集脚本 / 前端视图之前扫一遍。
+description: hyxi 的 30 条已知陷阱，逐条绑定具体文件与函数：result 可能为 None、INSERT OR REPLACE 触发级联删除、422 回显明文密码、storage.DB_PATH 是 import 时常量、爬虫退出码契约、增量抓取起点、舆情结果对齐等。改后端 API / 存储层 / 采集脚本 / 前端视图之前扫一遍。
 ---
 
 ## 常见陷阱
@@ -25,6 +25,7 @@ description: hyxi 的 29 条已知陷阱，逐条绑定具体文件与函数：r
 - **舆情结果贴回帖子必须「先按 key 建映射、再排序」**：`sentiment_*.json` 的 `results[i]` 对齐的是**扁平数组**第 i 条（下标来自 `enumerate(all_posts)`），而导出明细按 `order_by_thread()` 排成「主贴 → 它的评论 → 下一主贴」。排完再按行号取，每条帖子都会配上别人的情感结论 —— 实测 88 条里 72 条位置会变，而导出的表**表面上完全看不出异常**。回归测试见 `TestExportEndpointEndToEnd::test_sentiment_follows_the_post_not_the_row_number`（把实现改成按行号取，它会立刻报出「评论A1 拿到了主贴B 的结论」）
 - **主贴时间倒序的排序键必须先转 ISO**，理由同上一条；**且只排主贴**，评论跟着自己的主贴走。没解析出时间的帖子沉到最后而不是当成最早 —— 早期采集读不到 tooltip 绝对时间时是**故意留空**的（写相对时间会污染指纹），这批帖子实际很新，排到最前面会把整页占满（实测那个任务里正好 12 条，用户看到的首屏一个时间都没有）。改排序时**页面和导出两条路都要顾**，回归测试分别在 `TestNestedPostsApiEndToEnd`、`TestPostTreeEndToEnd`、`TestExportEndpointEndToEnd::test_rows_are_ordered_newest_first`
 - **`/posts` 的 `index` 是扁平存储数组里的绝对位置，不是页内序号**：`SentimentView` 用 `index - 1` 反查帖子，而舆情结果数组的下标来自 `enumerate(all_posts)`。一页只保证 `page_size` 个**主贴**，带上评论后条目数会超出，按页内计数编号会让相邻两页的 index 区间重叠、详情弹窗显示错帖子。它也**不等于 `posts.seq`**：index 是 `load_task_posts()` 列表里的位置（`i + 1`），`seq` 有空洞（归并掉的重复帖、丢弃的空帖），多来源任务还是几个来源首尾相接 —— 拿页面上的「#305」去库里 `where seq=305` 会**静默查到另一条帖子**（2026-09-19 实测：index 1076 那条的 seq 是 1078）。要按 index 找库里的行，先 `GET /posts/{index-1}`（0-based）取回 fingerprint 再查
+- **Tweakers 楼层平铺入库、没有父指针**：`tweakers.js` 一个 `parent_fingerprint` 都不写，`build_tree()` 把每一楼当主贴。依赖父子关系的功能对 Tweakers 都会**静默失效** —— 「只看新回复」曾经三个窗口恒为空（用户实测报过，导出的「近期新回复」表也从没建出来），现在靠 `Collector.thread_kind == "thread"` + `post_tree.flat_thread_starts()`（主题 = 时间最早的一楼）兜住；舆情的同串上下文（`thread_of()` 给每一楼返回它自己）、结果页的主题 / 回复结构至今仍是平的，结构性修复在分支 `feat/tweakers-thread-quotes`。**给 Tweakers 造测试数据必须是平铺楼层**：`TestOnlyFreshFilterEndToEnd` 把来源标成 tweakers 却造了带父指针的数据，那组用例一直绿、功能一直坏。见 `docs/fixes/2026-10-14-tweakers-only-fresh-empty.md`
 - **删数据源不能让历史任务结果变空白**：`task["result"]["sources"]` 里存了当时的 `output_path`，来源从注册表消失后 `results.py` 照原路读文件兜底
 - **`error_message` 取 stderr 的第一行，不是最后一行**：脚本先写 `stopReason`，而 Playwright 的报错是多行的 —— 第一行才是原因（`page.goto: Timeout 30000ms exceeded.`），后面跟着一整段 `Call log:` 明细。取末行拿到的是 `  - navigating to "..."`，真正的原因整个丢掉，还把 ANSI 转义码带进界面：用户实测看到的就是 `采集脚本异常退出 (code=1): [2m - navigating to "…"[22m`，完全看不出是超时还是被拒。ANSI 在 `CollectorRunner` 读完 stderr 时**一次剥干净**（SSE 日志、人工授权原因、`error_message` 三处都拿它，各剥各的迟早漏一处）；`_stderr_reason()` 另外跳过 Node 告警 —— 它**占两行**（实测 node v24.14.1：`(node:11032) ExperimentalWarning: x` 后面还跟一行 ``(Use `node --trace-warnings ...` to show where the warning was created)``），只跳第一行的话返回的是第二行，原因照样丢、只是往后挪了一格。
 - **测「网络失败」不能按请求次数掐连接**：Chrome 对 `ERR_EMPTY_RESPONSE` 会自己重发（实测一次 `page.goto` 打了 4 个请求），掐一次会被它内部重试救回来，`gotoPage` 压根不抛异常 —— 那条用例于是在修复前后都是绿的。`fixture_site.py` 的 `drop_seconds` 因此按**时间窗**掐，且窗口从第一个页面请求起算而不是服务器启动起算（浏览器冷启动要一两秒）。同理，重试了几次只能数脚本自己打的日志，服务端收到的请求数不是那个数。

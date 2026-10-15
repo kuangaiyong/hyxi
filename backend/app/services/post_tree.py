@@ -7,7 +7,7 @@
 
 import re
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Collection, Dict, List, Optional, Tuple
 
 # 「近 N 天」的默认窗口与可选值。**必须是封闭集合** —— 这个数字会进 Excel 的文案和
 # 概览统计，放任调用方传任意整数等于让它决定报告口径，两份报告就再也对不上了
@@ -84,7 +84,31 @@ def baseline_time(posts: List[dict]) -> Optional[datetime]:
     return max(stamps) if stamps else None
 
 
-def mark_fresh_replies(posts: List[dict], days: int = FRESH_DAYS_DEFAULT) -> Dict[str, int]:
+def flat_thread_starts(posts: List[dict], thread_sources: Collection[str]) -> Dict[str, dict]:
+    """一源一串、且楼层平铺入库的来源 → 它的主题楼层。
+
+    Tweakers 一个来源就是一个主题（`Collector.thread_kind == "thread"`），但 tweakers.js 一个父指针
+    都不写，楼层全部按主贴入库 —— 哪些是回复只能在这里认：**时间最早的那一楼就是主题**（真站实测：
+    主题是第 1 页第一条，即全串最早的一楼）。不能按 seq / 页码挑：真实存量库里主题排在第 63 条。
+    没采第 1 页时取到的是已采到的最早楼层，只会比真主题晚，判「主题在窗口外」时偏保守。
+    时间读不出的楼层不参与挑选。
+
+    来源里只要有一条父指针（结构化入库的串）就不在此列，走 mark_fresh_replies 原来那条判据。
+    """
+    structured = {p.get("source") or "tweakers" for p in posts if p.get("parent_fingerprint")}
+    starts: Dict[str, Tuple[datetime, dict]] = {}
+    for p in posts:
+        sid = p.get("source") or "tweakers"
+        if sid not in thread_sources or sid in structured:
+            continue
+        at = parse_time(p.get("timestamp"))
+        if at and (sid not in starts or at < starts[sid][0]):
+            starts[sid] = (at, p)
+    return {sid: p for sid, (_, p) in starts.items()}
+
+
+def mark_fresh_replies(posts: List[dict], days: int = FRESH_DAYS_DEFAULT,
+                       thread_sources: Collection[str] = ()) -> Dict[str, int]:
     """找出「老主贴上的新回复」，返回 {回复的 post_key: 距其主贴的天数}。
 
     出口按「主贴发表时间从新到旧」排、评论跟着自己的主贴走（见 order_by_thread），
@@ -100,23 +124,33 @@ def mark_fresh_replies(posts: List[dict], days: int = FRESH_DAYS_DEFAULT) -> Dic
     · **父贴不在本批数据里的回复 → 不标**。build_tree() 已把它按主贴处理，它就不是回复
 
     判定按**顶层主贴**算（thread_of 已把嵌套回复归到顶层），跨来源用 post_key。
+
+    `thread_sources`：一源一串的来源 id（Tweakers）。它们平铺入库的楼层没有父指针，上面那条判据
+    一条都认不出来，于是「只看新回复」对 Tweakers 恒为空（用户实测报过）。这些楼层按「同一主题下的
+    回复」判，主题见 flat_thread_starts()，判据与三条边界完全相同。
     """
     base = baseline_time(posts)
     if not base:
         return {}
     cutoff = base - timedelta(days=days)
 
+    starts = flat_thread_starts(posts, thread_sources)
     threads = thread_of(posts)
     fresh: Dict[str, int] = {}
     for post in posts:
         if not post.get("parent_fingerprint"):
-            continue
-        thread = threads.get(post_key(post)) or []
-        # 串首就是顶层主贴。孤儿回复自成一串，串首是它自己 —— 那它不算回复
-        if len(thread) < 2 or post_key(thread[0]) == post_key(post):
-            continue
+            # 一源一串平铺入库的楼层：主题之外都是它的回复
+            root = starts.get(post.get("source") or "tweakers")
+            if not root or post_key(root) == post_key(post):
+                continue
+        else:
+            thread = threads.get(post_key(post)) or []
+            # 串首就是顶层主贴。孤儿回复自成一串，串首是它自己 —— 那它不算回复
+            if len(thread) < 2 or post_key(thread[0]) == post_key(post):
+                continue
+            root = thread[0]
         reply_at = parse_time(post.get("timestamp"))
-        root_at = parse_time(thread[0].get("timestamp"))
+        root_at = parse_time(root.get("timestamp"))
         if not reply_at or not root_at:
             continue
         if reply_at >= cutoff and root_at < cutoff:

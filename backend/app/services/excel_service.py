@@ -451,12 +451,17 @@ class ExcelService:
 
         rows 已按 order_by_thread 排成「主贴 → 它的评论 → 下一主贴」，所以一条回复的
         主贴就是它前面最近的那个 level == 0 —— 不必再把树传进来算一遍。
+
+        例外是一源一串平铺入库的楼层（Tweakers）：新回复自己就是 level 0，上面那条认不出它，
+        这张表就建不出来。每一楼都带着 thread_root（主题那一行的下标），按那个挂。
         """
         threads = {}
         root_idx = None
         for i, item in enumerate(rows):
             if item["level"] == 0:
                 root_idx = i
+                if item.get("fresh") and item.get("thread_root") is not None:
+                    threads.setdefault(item["thread_root"], []).append(i)
             elif item.get("fresh") and root_idx is not None:
                 threads.setdefault(root_idx, []).append(i)
         return threads
@@ -557,6 +562,10 @@ class ExcelService:
     @staticmethod
     def _older_reply_count(rows: List[dict], root_idx: int, fresh_idxs: set) -> int:
         """这个主贴名下、不在本次新回复里的回复条数"""
+        if rows[root_idx].get("thread_root") == root_idx:
+            # 一源一串平铺入库：楼层不排在主题下面（主题按时间沉在最后），按所属主题数
+            return sum(1 for i, r in enumerate(rows)
+                       if r.get("thread_root") == root_idx and i != root_idx and i not in fresh_idxs)
         count = 0
         for i in range(root_idx + 1, len(rows)):
             if rows[i]["level"] == 0:

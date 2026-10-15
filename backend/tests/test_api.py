@@ -866,6 +866,153 @@ class TestOnlyFreshFilterEndToEnd:
         assert "3/7/14" in resp.json()["detail"]
 
 
+class TestOnlyFreshFlatThreadEndToEnd:
+    """Tweakers 的「只看新回复」：一个来源就是一个主题，楼层**平铺入库、没有父指针**。
+
+    用户实测报过：Tweakers 任务点「只看新回复」，3 / 7 / 14 天都是空的。tweakers.js 一个父指针都不写，
+    判据只认有父贴的回复，于是一条都认不出来。上面那组用例把来源标成 tweakers 却造了带父指针的数据，
+    替一个真实不存在的形状作证，所以一直是绿的 —— **这组照真实形状造**（与真 tweakers.js 采出来的一致）。
+    同一任务里挂一个没有评论的 Facebook 来源当对照：它的帖子同样没有父指针，但它不是一个主题。
+    """
+
+    TW, FB = "src_tw", "src_fb"
+
+    @classmethod
+    def setup_class(cls):
+        import app.config as cfg
+
+        cls.cfg = cfg
+        cls._old_api_key = cfg.settings.api_key
+        cfg.settings.api_key = ""
+
+        from main import app
+        from app.services import storage
+
+        cls.tmpdir = tempfile.mkdtemp()
+        cls.storage = storage
+        cls._old_db_path = storage.DB_PATH
+        storage.DB_PATH = os.path.join(cls.tmpdir, "hyxi.db")
+        storage.init_db()
+        cls.client = TestClient(app)
+
+        for sid, collector_id, params in ((cls.TW, "tweakers", {"thread_id": "1"}),
+                                          (cls.FB, "facebook_group", {"group_id": "g1"})):
+            storage.save_source({"id": sid, "name": sid, "collector_id": collector_id, "params": params,
+                                 "enabled": True, "created_at": "2026-08-20T10:00:00"})
+
+        def post(source, fp, when, who):
+            return {"username": who, "timestamp": when, "content": f"{who} 的正文", "translation": "",
+                    "page_number": 1, "fingerprint": fp, "source": source, "message_id": f"m_{fp}",
+                    "parent_fingerprint": None, "reply_level": 0}
+
+        # 主题故意不排第一：真实存量库里主题排在第 63 条，只能按时间认
+        storage.upsert_posts(cls.TW, [
+            post(cls.TW, "t1", "05-06-2026 10:00", "u1"),
+            post(cls.TW, "t2", "10-08-2026 10:00", "u2"),
+            post(cls.TW, "t0", "01-06-2026 10:00", "主题作者"),
+            post(cls.TW, "t3", "15-08-2026 10:00", "u3"),
+            post(cls.TW, "t4", "19-08-2026 10:00", "u4"),
+            post(cls.TW, "t5", "20-08-2026 10:00", "u5"),
+        ])
+        storage.upsert_posts(cls.FB, [
+            post(cls.FB, "f0", "02-06-2026 10:00", "fb_old"),
+            post(cls.FB, "f1", "19-08-2026 12:00", "fb_new"),
+        ])
+
+        cls.task_id = "only-fresh-flat-thread"
+        from app.services.orchestrator import orchestrator
+        orchestrator.tasks[cls.task_id] = {
+            "id": cls.task_id, "status": "completed", "description": "Tweakers 只看新回复",
+            "plan": [], "logs": [], "progress": 1.0, "current_step": None,
+            "result": {"total_posts": 8, "sources": [
+                {"id": cls.TW, "name": "Tweakers", "collector_id": "tweakers", "post_count": 6},
+                {"id": cls.FB, "name": "Facebook", "collector_id": "facebook_group", "post_count": 2},
+            ]},
+        }
+        cls.orchestrator = orchestrator
+
+    @classmethod
+    def teardown_class(cls):
+        cls.cfg.settings.api_key = cls._old_api_key
+        cls.storage.DB_PATH = cls._old_db_path
+        cls.orchestrator.tasks.pop(cls.task_id, None)
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _posts(self, **params):
+        return self.client.get(f"/api/v1/tasks/{self.task_id}/posts",
+                               params={"page_size": 200, **params}).json()
+
+    def test_new_floors_of_an_old_thread_are_found_in_every_window(self):
+        """基准 = 最新一楼 20-08 10:00。3 / 7 / 14 天各自截到 17-08、13-08、06-08 —— 窗口越宽筛出越多。
+        主题永远不算（它是主题不是回复），Facebook 那条 19-08 的帖子也永远不算（它不是谁的回复）"""
+        assert self._posts()["total"] == 8, "不筛选时一张卡片都不能少"
+        expected = {3: ["u4", "u5"], 7: ["u3", "u4", "u5"], 14: ["u2", "u3", "u4", "u5"]}
+        for days, users in expected.items():
+            data = self._posts(only_fresh=True, fresh_days=days)
+            got = sorted(p["username"] for p in data["posts"])
+            assert got == users, (days, got)
+            assert data["total"] == len(users), (days, data["total"])
+            assert all(p["fresh_reply"] for p in data["posts"]), (days, data["posts"])
+
+    def test_days_are_counted_from_the_topic(self):
+        """20-08 10:00 的那楼距主题 01-06 10:00 整 80 天 —— 按列表顺序挑主题会挑成 05-06 那楼、算成 76"""
+        data = self._posts(only_fresh=True, fresh_days=3)
+        gaps = {p["username"]: p["days_since_root"] for p in data["posts"]}
+        assert gaps.get("u5") == 80, gaps
+
+    def test_legacy_posts_without_a_source_are_a_tweakers_thread(self):
+        """多来源改造之前的任务把帖子内嵌在 result.posts 里、不带 source 字段，全链路缺省按 tweakers 处理
+        （post_key），那批就是 Tweakers 的楼层 —— 它们的「只看新回复」也得能用"""
+        def floor(fp, when):
+            return {"username": fp, "timestamp": when, "content": fp, "translation": "",
+                    "page_number": 1, "fingerprint": fp, "parent_fingerprint": None, "reply_level": 0}
+
+        legacy_id = "only-fresh-legacy"
+        self.orchestrator.tasks[legacy_id] = {
+            "id": legacy_id, "status": "completed", "description": "历史任务", "plan": [], "logs": [],
+            "progress": 1.0, "current_step": None,
+            "result": {"total_posts": 3, "posts": [
+                floor("lt0", "01-06-2026 10:00"), floor("lt1", "19-08-2026 10:00"),
+                floor("lt2", "20-08-2026 10:00")]},
+        }
+        try:
+            data = self.client.get(f"/api/v1/tasks/{legacy_id}/posts", params={
+                "page_size": 200, "only_fresh": True, "fresh_days": 3}).json()
+        finally:
+            self.orchestrator.tasks.pop(legacy_id, None)
+        assert sorted(p["username"] for p in data["posts"]) == ["lt1", "lt2"], data
+
+    def test_export_lists_the_new_floors_under_the_topic(self):
+        """导出那条路同一个根因：总览 0 条、「近期新回复」表建不出来（它只把 level > 0 的行挂到主贴下）"""
+        from io import BytesIO
+        from openpyxl import load_workbook
+        from app.services.excel_service import FRESH_SHEET, DETAIL_SHEET
+
+        resp = self.client.get(f"/api/v1/tasks/{self.task_id}/export",
+                               params={"format": "xlsx", "fresh_days": 7})
+        assert resp.status_code == 200, resp.text[:200]
+        wb = load_workbook(BytesIO(resp.content))
+        assert FRESH_SHEET in wb.sheetnames, wb.sheetnames
+
+        lines = [str(r[0]) for r in wb[FRESH_SHEET].iter_rows(max_col=1, values_only=True) if r[0]]
+        heads = [l for l in lines if l.startswith("主贴")]
+        assert len(heads) == 1 and "@主题作者" in heads[0], heads
+        fresh = [l for l in lines if "🔥 新回复" in l]
+        assert sorted(l.split("@")[1].split()[0] for l in fresh) == ["u3", "u4", "u5"], fresh
+        # 05-06、10-08 那两楼不新 —— 主题按时间排在最后，楼层不在它下面，得按所属主题数
+        assert any("另有 2 条较早回复" in l for l in lines), lines
+
+        overview = {str(r[0]): r[1] for r in wb["概览"].iter_rows(values_only=True) if r and r[0]}
+        assert str(overview.get("近 7 天老帖新回复", "")).startswith("3 条"), overview
+        # 同一张表里不能「评论 0 条」紧挨着「老帖新回复 3 条」：主题之外的 5 楼都是它的评论
+        assert str(overview.get("帖子总数", "")) == "8（其中评论 5）", overview
+
+        details = wb[DETAIL_SHEET]
+        col = [c.value for c in details[1]].index("更新提醒") + 1
+        marked = [details.cell(row=r, column=col).value for r in range(2, details.max_row + 1)]
+        assert sum(1 for v in marked if v) == 3, marked
+
+
 class TestExportEndpointEndToEnd:
     """全站唯一的导出口 —— 真实 HTTP 打到真实落盘数据上"""
 

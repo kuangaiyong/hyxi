@@ -6938,6 +6938,43 @@ class TestFreshReplyDetectionEndToEnd:
         # 窗口越大命中越多，绝不会反过来
         assert len(self._mark(posts, 3)) <= len(self._mark(posts, 7)) <= len(self._mark(posts, 14))
 
+    # ===== 一源一串、楼层平铺入库（Tweakers：tweakers.js 一个父指针都不写） =====
+
+    def test_flat_thread_floors_are_replies_to_the_earliest_floor(self):
+        """主题 = 时间最早的那一楼，不是排第一的那条（真实存量库里主题排在第 63 条）。
+        同一批数据不说它是一源一串，就一条都不标 —— Facebook 没评论的主贴不能被当成谁的回复"""
+        from app.services.post_tree import mark_fresh_replies, post_key
+
+        old = self._post("old", "10-06-2026 10:00", source="src_tw")
+        topic = self._post("topic", "01-06-2026 10:00", source="src_tw")
+        new1 = self._post("new1", "15-08-2026 09:00", source="src_tw")
+        new2 = self._post("new2", "19-08-2026 12:00", source="src_tw")
+        posts = [old, topic, new1, new2]
+
+        marked = mark_fresh_replies(posts, 7, thread_sources={"src_tw"})
+        assert marked == {post_key(new1): 74, post_key(new2): 79}, marked
+        assert mark_fresh_replies(posts, 7) == {}, "不是一源一串的来源照旧只认有父贴的回复"
+
+    def test_a_flat_thread_whose_topic_is_inside_the_window_marks_nothing(self):
+        """整串都是新的 —— 与「主贴也在窗口内 → 不标」同一条规则"""
+        from app.services.post_tree import mark_fresh_replies
+
+        posts = [self._post("topic", "18-08-2026 10:00", source="src_tw"),
+                 self._post("f1", "19-08-2026 10:00", source="src_tw"),
+                 self._post("f2", "20-08-2026 10:00", source="src_tw")]
+        assert mark_fresh_replies(posts, 7, thread_sources={"src_tw"}) == {}
+
+    def test_a_thread_source_that_has_parent_pointers_keeps_the_normal_rule(self):
+        """结构化入库的串（有父指针）走原来那条判据，平铺兜底不介入 —— 否则一条新的主贴会被当成
+        「最早那一楼」的回复标出来。分支合并、全量重跑之后的数据就是这个样子"""
+        from app.services.post_tree import mark_fresh_replies, post_key
+
+        root = self._post("root", "01-06-2026 10:00", source="src_tw")
+        reply = self._post("r1", "19-08-2026 10:00", parent="root", source="src_tw")
+        new_root = self._post("new_root", "18-08-2026 10:00", source="src_tw")
+        marked = mark_fresh_replies([root, reply, new_root], 7, thread_sources={"src_tw"})
+        assert marked == {post_key(reply): 79}, marked
+
 
 class TestFreshReplyExportEndToEnd:
     """「老帖新回复」在导出报告里的呈现：明细列 + 高亮 + 独立工作表 + 双向跳转。
@@ -7087,6 +7124,31 @@ class TestFreshReplyExportEndToEnd:
         text = "\n".join(str(c.value or "") for row in ws.iter_rows() for c in row)
         assert "近 7 天老帖新回复" in text, text[:500]
         assert "2026-08-19 04:35" in text, "基准时间没写进报告"
+
+    def test_flat_thread_floors_are_grouped_under_their_topic(self):
+        """Tweakers 楼层平铺入库，新回复自己就是 level 0 —— 「挂到前面最近那个 level 0 下」认不出它，
+        这张表就建不出来。每一楼都带着 thread_root（主题那一行的下标），分组和「另有 N 条较早回复」都按它认"""
+        from app.services.excel_service import ExcelService, FRESH_SHEET
+
+        base = self._rows()[0]
+        rows = [
+            dict(base, index=1, username="u5", timestamp="2026-08-20 10:00",
+                 fresh="🔥 新回复（主贴 80 天前）", fresh_gap=80, thread_root=3),
+            dict(base, index=2, username="u4", timestamp="2026-08-19 10:00",
+                 fresh="🔥 新回复（主贴 79 天前）", fresh_gap=79, thread_root=3),
+            dict(base, index=3, username="u1", timestamp="2026-06-05 10:00", thread_root=3),
+            dict(base, index=4, username="主题作者", timestamp="2026-06-01 10:00", thread_root=3),
+        ]
+        assert ExcelService._fresh_threads(rows) == {3: [0, 1]}
+        # 楼层不排在主题下面（主题按时间沉在最后），「数到下一个 level 0 为止」会数出 0
+        assert ExcelService._older_reply_count(rows, 3, {0, 1}) == 1
+
+        ws = self._book(rows, self._meta(total=4, replies=3, fresh_count=2))[FRESH_SHEET]
+        lines = [str(r[0]) for r in ws.iter_rows(max_col=1, values_only=True) if r[0]]
+        heads = [l for l in lines if l.startswith("主贴")]
+        assert len(heads) == 1 and "@主题作者" in heads[0], lines
+        assert sum("🔥 新回复" in l for l in lines) == 2, lines
+        assert any("另有 1 条较早回复" in l for l in lines), lines
 
 
 class TestPortableDataSurvivesUpgradeEndToEnd:

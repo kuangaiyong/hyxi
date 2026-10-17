@@ -11,7 +11,7 @@ export async function fetchPosts(
 ): Promise<PostsResponse> {
   const params: Record<string, string | number | boolean> = { page, page_size: pageSize }
   if (search) params.search = search
-  // 「老帖新回复」的时间窗口。后端只接受 3/7/14，传别的会 400 ——
+  // 「近期新回复」的时间窗口。后端只接受 3/7/14，传别的会 400 ——
   // 那是有意的：这个数字会进报告文案，静默回落到默认值会让用户以为自己换了窗口
   if (freshDays) params.fresh_days = freshDays
   // 只保留串里有新回复的主贴。**必须由后端筛**：一页只有 50 个主贴，而新回复恰恰

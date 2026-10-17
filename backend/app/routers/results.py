@@ -121,7 +121,7 @@ def _url_sources() -> dict:
 
 
 def _thread_sources(task: dict = None) -> set:
-    """一源一串（`Collector.thread_kind == "thread"`，即 Tweakers）的来源 id，给「老帖新回复」认平铺楼层用。
+    """一源一串（`Collector.thread_kind == "thread"`，即 Tweakers）的来源 id，给「近期新回复」认平铺楼层用。
 
     注册表为准；来源被删掉后用任务里记下的 collector_id 兜底（同 _source_names）——
     否则删掉数据源之后，历史任务的「只看新回复」又变回空的。
@@ -185,8 +185,8 @@ async def get_posts(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     search: str = Query("", description="搜索关键词（匹配用户名、原文、翻译）"),
-    fresh_days: int = Query(FRESH_DAYS_DEFAULT, description="「老帖新回复」的时间窗口（天）"),
-    only_fresh: bool = Query(False, description="只保留串里有「老帖新回复」的主贴"),
+    fresh_days: int = Query(FRESH_DAYS_DEFAULT, description="「近期新回复」的时间窗口（天）：近 N 天内发的回复都算，只看回复时间"),
+    only_fresh: bool = Query(False, description="只保留串里有近 N 天新回复的主贴"),
 ):
     """获取分页帖子结果，支持全文搜索与「只看新回复」。
 
@@ -453,7 +453,7 @@ def _export_rows(task: dict, posts: list, results: list,
         gap = fresh.get(post_key(p))
         topic = topics.get(sid or "tweakers")
         rows.append({
-            # 「老主贴上的新回复」的提醒文案。排序把这类回复埋到了很后面，
+            # 「近期新回复」的提醒文案。排序把这类回复埋到了很后面，
             # 这一列是用户在明细表里唯一能扫到它的东西
             "fresh": f"🔥 新回复（主贴 {gap} 天前）" if gap is not None else "",
             "fresh_gap": gap if gap is not None else -1,
@@ -491,7 +491,7 @@ def _export_meta(task: dict, rows: list, sentiment: dict, posts: list = None,
         "sources": "、".join(dict.fromkeys(r["source"] for r in rows if r["source"])),
         "exported_at": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
         "total": len(rows),
-        # 平铺楼层也是评论（主题之外的每一楼），否则概览里「评论 0 条」会紧挨着「老帖新回复 N 条」
+        # 平铺楼层也是评论（主题之外的每一楼），否则概览里「评论 0 条」会紧挨着「近 N 天新回复 M 条」
         "replies": sum(1 for i, r in enumerate(rows)
                        if r["level"] > 0 or r.get("thread_root") not in (None, i)),
         "analyzed": sum(1 for r in rows if r["sentiment"] != UNANALYZED),
@@ -510,7 +510,7 @@ def _export_meta(task: dict, rows: list, sentiment: dict, posts: list = None,
 async def export_report(
     task_id: str,
     format: str = Query("xlsx"),
-    fresh_days: int = Query(FRESH_DAYS_DEFAULT, description="「老帖新回复」的时间窗口（天）"),
+    fresh_days: int = Query(FRESH_DAYS_DEFAULT, description="「近期新回复」的时间窗口（天）：近 N 天内发的回复都算，只看回复时间"),
 ):
     """导出原文 + 译文 + 舆情分析的单一报告。全站唯一的导出口。
 

@@ -687,7 +687,7 @@ function mediaUrl(rel: string): string {
     <div class="flex items-center justify-between mb-4">
       <h2 style="font-size: 18px; font-weight: 600;">📊 舆情分析</h2>
       <div class="flex items-center gap-2">
-        <!-- 「老帖新回复」的展示已经整体搬到任务结果页，这里只剩这一个选择器：
+        <!-- 「近期新回复」的展示已经整体搬到任务结果页，这里只剩这一个选择器：
              它决定**导出报告**里「近期新回复」工作表和「更新提醒」列用哪个窗口。
              不能删 —— 导出入口全站只有这一个，删了报告窗口就锁死在后端默认的 7 天 -->
         <div class="fresh-days" title="只影响导出报告里的「近期新回复」工作表">

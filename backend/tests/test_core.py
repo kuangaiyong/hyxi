@@ -1969,7 +1969,7 @@ def _export_meta(**over):
         "exported_at": "2026-08-05 11:00:00", "total": 1, "replies": 0, "analyzed": 1,
         "time_start": "2026-05-22 17:06", "time_end": "2026-05-22 17:06",
         "summary": {"top_dimensions": []}, "top_users": [],
-        # 窗口与基准会进概览表；不给的话那一行会显示成「近  天老帖新回复」
+        # 窗口与基准会进概览表；不给的话那一行会显示成「近  天新回复」
         "fresh_days": 7, "fresh_count": 0, "fresh_baseline": "",
     }
     meta.update(over)
@@ -6814,13 +6814,14 @@ class TestFreshReplyDetectionEndToEnd:
         # 那条（08-15 的回复挂在 06-06 的主贴上）实测的天数一致
         assert marked[post_key(reply)] == 69, marked
 
-    def test_reply_on_a_root_that_is_also_new_is_not_marked(self):
-        """整串都是新的 —— 它本来就排在最前面，没被埋，标了反而稀释重点"""
+    def test_reply_on_a_root_that_is_also_new_is_marked_too(self):
+        """只看回复时间（2026-10-16 用户定的口径）：主贴新不新不再参与判断。
+        以前「整串都新 → 不标」让窗口越宽、主贴越容易落进窗口，结果反而变少（3 天有、7 天没有）"""
         from app.services.post_tree import post_key
 
         root = self._post("root", "18-08-2026 10:00")
         reply = self._post("r1", "19-08-2026 09:00", parent="root")
-        assert post_key(reply) not in self._mark([root, reply])
+        assert self._mark([root, reply]) == {post_key(reply): 0}
 
     def test_old_reply_on_an_old_root_is_not_marked(self):
         from app.services.post_tree import post_key
@@ -6874,8 +6875,8 @@ class TestFreshReplyDetectionEndToEnd:
         b_reply = self._post("r1", "19-08-2026 09:00", parent="root", source="src_b")
 
         marked = self._mark([a_root, a_reply, b_root, b_reply])
-        assert post_key(a_reply) in marked, "src_a 的老帖新回复没标出来"
-        assert post_key(b_reply) not in marked, "src_b 整串都是新的，不该被 src_a 带标"
+        # 两条回复都新，但各自按**自己来源**的主贴算天数 —— 串了源就会拿错主贴、算错天数
+        assert marked == {post_key(a_reply): 69, post_key(b_reply): 0}, marked
 
     def test_baseline_is_the_newest_post_not_now(self):
         """基准取数据集里最新的帖子，不是 datetime.now()。
@@ -6955,14 +6956,53 @@ class TestFreshReplyDetectionEndToEnd:
         assert marked == {post_key(new1): 74, post_key(new2): 79}, marked
         assert mark_fresh_replies(posts, 7) == {}, "不是一源一串的来源照旧只认有父贴的回复"
 
-    def test_a_flat_thread_whose_topic_is_inside_the_window_marks_nothing(self):
-        """整串都是新的 —— 与「主贴也在窗口内 → 不标」同一条规则"""
+    def test_a_flat_thread_whose_topic_is_inside_the_window_still_marks_its_new_floors(self):
+        """只看回复时间：主题自己也在窗口内时，窗口里的楼层照样是新回复（主题自己永远不算）"""
+        from app.services.post_tree import mark_fresh_replies, post_key
+
+        topic = self._post("topic", "18-08-2026 10:00", source="src_tw")
+        f1 = self._post("f1", "19-08-2026 10:00", source="src_tw")
+        f2 = self._post("f2", "20-08-2026 10:00", source="src_tw")
+        assert mark_fresh_replies([topic, f1, f2], 7, thread_sources={"src_tw"}) == {
+            post_key(f1): 1, post_key(f2): 2}
+
+    def test_wider_windows_never_drop_a_reply(self):
+        """3 天 ⊆ 7 天 ⊆ 14 天（用户实测报过：近 3 天有的回复，近 7 天、近 14 天里反而没有）。
+        按旧规则「主贴也得早于窗口」，窗口一放宽，主贴就可能落进窗口，回复跟着被踢出去"""
         from app.services.post_tree import mark_fresh_replies
 
-        posts = [self._post("topic", "18-08-2026 10:00", source="src_tw"),
-                 self._post("f1", "19-08-2026 10:00", source="src_tw"),
-                 self._post("f2", "20-08-2026 10:00", source="src_tw")]
-        assert mark_fresh_replies(posts, 7, thread_sources={"src_tw"}) == {}
+        posts = []
+        for day in range(1, 21):                      # 主贴每天一条
+            root = self._post(f"r{day}", f"{day:02d}-08-2026 10:00")
+            posts.append(root)
+            for lag in (1, 2, 5, 9):                  # 主贴之后 1 / 2 / 5 / 9 天各一条回复
+                if day + lag <= 20:
+                    posts.append(self._post(f"r{day}-{lag}", f"{day + lag:02d}-08-2026 12:00", parent=f"r{day}"))
+        got = {d: set(mark_fresh_replies(posts, d)) for d in (3, 7, 14)}
+        assert got[3] and got[3] <= got[7] <= got[14], {d: len(v) for d, v in got.items()}
+
+    def test_the_users_real_case_is_in_every_window(self):
+        """便携包真实数据里的那一串（2026-10-16 实测）：主贴 12-09 00:33，两条回复 14-09，基准 15-09 15:44。
+        旧规则下 3 天有、7 天和 14 天都没有"""
+        from app.services.post_tree import post_key
+
+        root = self._post("root", "12-09-2026 00:33")
+        r1 = self._post("r1", "14-09-2026 00:56", parent="root")
+        r2 = self._post("r2", "14-09-2026 03:24", parent="root")
+        newest = self._post("newest", "15-09-2026 15:44")
+        for days in (3, 7, 14):
+            marked = self._mark([root, r1, r2, newest], days)
+            assert post_key(r1) in marked and post_key(r2) in marked, (days, marked)
+
+    def test_base_can_be_given_explicitly(self):
+        """邮件按「当前时间」往前算，不按数据集里最新一条 —— 定时摘要要的是「这一天里有什么新的」"""
+        from datetime import datetime
+        from app.services.post_tree import mark_fresh_replies, post_key
+
+        root = self._post("root", "01-08-2026 10:00")
+        reply = self._post("r1", "19-08-2026 09:00", parent="root")
+        assert mark_fresh_replies([root, reply], 1, base=datetime(2026, 8, 19, 20, 0)) == {post_key(reply): 17}
+        assert mark_fresh_replies([root, reply], 1, base=datetime(2026, 8, 25, 20, 0)) == {}, "基准之前一天以外的不算"
 
     def test_a_thread_source_that_has_parent_pointers_keeps_the_normal_rule(self):
         """结构化入库的串（有父指针）走原来那条判据，平铺兜底不介入 —— 否则一条新的主贴会被当成
@@ -7064,8 +7104,8 @@ class TestFreshReplyExportEndToEnd:
         assert "老主贴作者 的原文" in text, "主贴原文没带进来"
         assert "老主贴作者 的译文" in text, "主贴译文没带进来"
         assert "新回复作者" in text and "主贴 69 天前" in text
-        # 不相干的那个新主贴串不该混进来
-        assert "新主贴作者" not in text, "整串都是新的，不该进聚焦区"
+        # 没有新回复标记的那串不该混进来
+        assert "新主贴作者" not in text, "没有新回复的串不该进聚焦区"
 
     def test_focus_sheet_does_not_drag_in_the_older_replies(self):
         """热帖有十几条旧回复，全搬过来就长得没法一口气读完 —— 给跳转就够了"""
@@ -7122,7 +7162,7 @@ class TestFreshReplyExportEndToEnd:
         """不写的话「这次和上次为什么不一样」无从解释"""
         ws = self._book()["概览"]
         text = "\n".join(str(c.value or "") for row in ws.iter_rows() for c in row)
-        assert "近 7 天老帖新回复" in text, text[:500]
+        assert "近 7 天新回复" in text, text[:500]
         assert "2026-08-19 04:35" in text, "基准时间没写进报告"
 
     def test_flat_thread_floors_are_grouped_under_their_topic(self):

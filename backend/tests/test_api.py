@@ -797,7 +797,7 @@ class TestOnlyFreshFilterEndToEnd:
             # B：整串都旧 —— 任何窗口都不该命中
             post("rb", "05-06-2026 10:00", "老主贴B"),
             post("rb1", "06-06-2026 10:00", "旧回复B 独特词乙", "rb"),
-            # C：主贴本身就在窗口内 —— 整串都新，本来就排在最前面，不算「被埋」
+            # C：主贴本身也在窗口内 —— 只看回复时间（2026-10-16 起），它的新回复照样算
             post("rc", "18-08-2026 10:00", "新主贴C"),
             post("rc1", "20-08-2026 10:00", "新回复C", "rc"),
             # D：老主贴 + 5 天前的回复 —— 7 天窗口命中、3 天窗口不该命中
@@ -832,22 +832,24 @@ class TestOnlyFreshFilterEndToEnd:
         return sorted(p["content"] for p in data["posts"])
 
     def test_only_fresh_keeps_just_the_threads_with_new_replies(self):
-        """不开筛选是 4 串，开了只剩「老主贴 + 窗口内新回复」那两串"""
+        """不开筛选是 4 串，开了只剩窗口内有新回复的那三串（整串都旧的 B 不在）"""
         assert self._posts(page_size=200)["total"] == 4
 
         data = self._posts(page_size=200, only_fresh=True, fresh_days=7)
-        assert data["total"] == 2, self._roots(data)
-        assert self._roots(data) == ["老主贴A", "老主贴D"]
+        assert data["total"] == 3, self._roots(data)
+        assert self._roots(data) == ["新主贴C", "老主贴A", "老主贴D"]
         # total 必须跟着过滤走，否则分页器会显示出翻不到的页码
-        assert len(data["posts"]) == 2
+        assert len(data["posts"]) == 3
 
     def test_the_window_actually_narrows_the_result(self):
-        """3 天窗口把 5 天前那条回复排除掉。
+        """3 天窗口把 5 天前那条回复排除掉，且 3 天的结果一定是 7 天的子集。
 
         窗口只是个装饰的话，这条和上面那条会一模一样地绿。
         """
         data = self._posts(page_size=200, only_fresh=True, fresh_days=3)
-        assert self._roots(data) == ["老主贴A"], self._roots(data)
+        assert self._roots(data) == ["新主贴C", "老主贴A"], self._roots(data)
+        wider = self._posts(page_size=200, only_fresh=True, fresh_days=7)
+        assert set(self._roots(data)) <= set(self._roots(wider))
 
     def test_only_fresh_and_search_are_combined_with_and(self):
         """两个条件同时给就都生效 —— 搜到的那串不新，结果必须是空的"""
@@ -1003,8 +1005,8 @@ class TestOnlyFreshFlatThreadEndToEnd:
         assert any("另有 2 条较早回复" in l for l in lines), lines
 
         overview = {str(r[0]): r[1] for r in wb["概览"].iter_rows(values_only=True) if r and r[0]}
-        assert str(overview.get("近 7 天老帖新回复", "")).startswith("3 条"), overview
-        # 同一张表里不能「评论 0 条」紧挨着「老帖新回复 3 条」：主题之外的 5 楼都是它的评论
+        assert str(overview.get("近 7 天新回复", "")).startswith("3 条"), overview
+        # 同一张表里不能「评论 0 条」紧挨着「新回复 3 条」：主题之外的 5 楼都是它的评论
         assert str(overview.get("帖子总数", "")) == "8（其中评论 5）", overview
 
         details = wb[DETAIL_SHEET]
@@ -1232,8 +1234,9 @@ class TestExportEndpointEndToEnd:
         resp = self.client.get(f"/api/v1/tasks/{self.task_id}/export", params={"format": "xlsx"})
         assert resp.status_code == 200
         wb = load_workbook(BytesIO(resp.content))
-        # 这批帖子都没有配图，所以不该多出一张「配图」表
-        assert wb.sheetnames == ["概览", "帖子明细"]
+        # 这批帖子都没有配图，所以不该多出一张「配图」表。两条评论都在最新一帖的 7 天内，
+        # 只看回复时间（2026-10-16 起）它们就是新回复，所以有「近期新回复」表
+        assert wb.sheetnames == ["概览", "近期新回复", "帖子明细"]
         ws = wb["帖子明细"]
         assert ws.max_row == 5                       # 表头 + 4 条
         # 按列名定位，别写死列号 —— 加一列就得改一遍测试，改漏了还查不出来
@@ -1568,7 +1571,8 @@ class TestImagesInExportAndApiEndToEnd:
                                params={"format": "xlsx"})
         assert resp.status_code == 200
         wb = load_workbook(BytesIO(resp.content))
-        assert wb.sheetnames == ["概览", "帖子明细", IMAGE_SHEET]
+        # bob 那条回复与主贴同一天、就在最新一帖的 7 天内 —— 只看回复时间（2026-10-16 起）它是新回复
+        assert wb.sheetnames == ["概览", "近期新回复", "帖子明细", IMAGE_SHEET]
         assert len(wb["帖子明细"]._images) == 1, "明细行里没有缩略图"
         assert len(wb[IMAGE_SHEET]._images) == 1, "配图表里没有大图"
 

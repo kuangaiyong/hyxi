@@ -16,7 +16,7 @@ const taskId = computed(() => route.params.id as string)
 const currentPage = ref(1)
 const pageSize = 50
 const searchText = ref('')
-// 「老帖新回复」：主贴按时间倒序排，今天发在两个月前主贴上的回复会被排到两个月前的
+// 「近期新回复」：主贴按时间倒序排，今天发在两个月前主贴上的回复会被排到两个月前的
 // 位置去，用户根本翻不到。这个开关把它们挑出来。
 // **筛选在后端做**：一页只有 50 个主贴，在前端筛只能筛出当前页里的 —— 而它们恰恰
 // 就在后面几页，等于什么都没做。
@@ -379,7 +379,7 @@ function getStatusText(): string {
           <button
             class="btn btn-sm fresh-toggle"
             :class="{ on: onlyFresh }"
-            title="只看老主贴上的新回复 —— 它们因为主贴时间倒序被压在后面几页"
+            title="只看近 N 天内发的新回复 —— 老主贴上的新回复会因为主贴时间倒序被压在后面几页"
             @click="toggleOnlyFresh"
           >🔥 只看新回复</button>
           <div v-if="onlyFresh" class="fresh-days">
@@ -408,7 +408,7 @@ function getStatusText(): string {
         <p v-if="onlyFresh && searchText.trim()">
           近 {{ freshDays }} 天内没有匹配「{{ searchText.trim() }}」的新回复
         </p>
-        <p v-else-if="onlyFresh">近 {{ freshDays }} 天内没有老帖收到新回复</p>
+        <p v-else-if="onlyFresh">近 {{ freshDays }} 天内没有新回复</p>
         <p v-else>没有匹配「{{ searchText.trim() }}」的帖子</p>
         <p class="hint">
           {{ onlyFresh ? '换个时间窗口，或关掉「只看新回复」看全部帖子' : '换个关键词，或点「清除」看全部帖子' }}
@@ -505,7 +505,7 @@ function getStatusText(): string {
                 <span
                   v-if="r.fresh_reply"
                   class="fresh-tag"
-                  :title="`老主贴上的新回复：主贴发表于 ${r.days_since_root} 天前`"
+                  :title="`近期新回复：主贴发表于 ${r.days_since_root} 天前`"
                 >🔥 新回复 · 主贴 {{ r.days_since_root }} 天前</span>
                 <span class="text-sm text-secondary">{{ postTime(r) }}</span>
                 <span class="grow" />
@@ -634,7 +634,7 @@ function getStatusText(): string {
   font-size: 12px;
   color: var(--text-secondary);
 }
-/* 已采 X · 原帖 Y。对不上时用和「老帖新回复」同一套暖色：要人多看一眼，但不是报错 */
+/* 已采 X · 原帖 Y。对不上时用和「近期新回复」同一套暖色：要人多看一眼，但不是报错 */
 .completeness {
   padding: 1px 8px;
   border-radius: 10px;
@@ -756,7 +756,7 @@ function getStatusText(): string {
   object-fit: contain;
 }
 
-/* ===== 老主贴上的新回复 =====
+/* ===== 近期新回复 =====
    页面上的展示只在这里（舆情页那套面板已整体拆除）。颜色与 Excel 报告里的暖色
    一致（#F59E0B / #B45309），页面和报告看到的是同一个视觉信号 */
 /* 筛完一条不剩时的占位。搜索栏在它上方照常渲染 ——

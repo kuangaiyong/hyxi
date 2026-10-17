@@ -23,7 +23,7 @@ class Collector:
     # 一个来源里装的是什么：
     #   "feed"   一个来源 = 许多条主贴，每条主贴底下挂自己的评论与回复（Facebook 小组）
     #   "thread" 一个来源 = **一个讨论串**：一条主题 + 按时间平铺的回复（Tweakers 论坛）
-    # 「老帖新回复」按它认平铺入库的楼层（见 post_tree.flat_thread_starts）。
+    # 「近期新回复」按它认平铺入库的楼层（见 post_tree.flat_thread_starts）。
     # 站点知识留在声明里，Python 与前端都不需要按 collector_id 分支
     thread_kind: str = "feed"
     # 不进「新增数据源」的采集器下拉框。留给没有真实站点、只服务于本地 fixture 的采集器；

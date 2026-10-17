@@ -54,7 +54,7 @@ EXPORT_HEADER_FONT = Font(name=FONT_NAME, size=11, bold=True, color="FFFFFF")
 EXPORT_LABEL_FONT = Font(name=FONT_NAME, size=10, bold=True)
 EXPORT_BODY_FONT = Font(name=FONT_NAME, size=10)
 REPLY_FILL = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
-# 「老主贴上的新回复」整行上暖色。**优先级高于 REPLY_FILL** —— 两个底色叠在一起
+# 「近期新回复」整行上暖色。**优先级高于 REPLY_FILL** —— 两个底色叠在一起
 # 就都看不出来了，命中时只上这一个
 FRESH_FILL = PatternFill(start_color="FFF3E0", end_color="FFF3E0", fill_type="solid")
 FRESH_FONT = Font(name=FONT_NAME, size=10, bold=True, color="B45309")
@@ -80,7 +80,7 @@ EXPORT_CENTERED = {"index", "level", "timestamp", "sentiment", "intensity"}
 EXPORT_COLUMNS = [
     ("index", "序号"), ("source", "来源"), ("level", "层级"),
     ("username", "用户名"), ("timestamp", "发布时间"),
-    # 「老主贴上的新回复」的提醒。排序按主贴时间从新到旧，这类回复因此被排到了
+    # 「近期新回复」的提醒。排序按主贴时间从新到旧，这类回复因此被排到了
     # 很后面（真实数据里 163 行的报告，4 条命中落在 #68/#133/#134/#147），
     # 这一列是用户在明细表里唯一能扫到它们的东西
     ("fresh", "更新提醒"),
@@ -437,7 +437,7 @@ class ExcelService:
             row += 1
         return anchors
 
-    # ===== 近期新回复：老主贴上的新动静，单独成表 =====
+    # ===== 近期新回复：近 N 天内发的回复，按讨论串单独成表 =====
     #
     # 出口按「主贴发表时间从新到旧」排、评论跟着自己的主贴走，于是今天发在两个月前
     # 主贴上的回复会被排到两个月前的位置去。真实数据里 163 行的报告，4 条命中落在
@@ -479,7 +479,8 @@ class ExcelService:
         """
         ws.column_dimensions["A"].width = 96
         ws.column_dimensions["B"].width = 22
-        ws.cell(row=1, column=1, value=f"{FRESH_SHEET}（老主贴上的新回复，容易被时间倒序埋掉）"
+        ws.cell(row=1, column=1, value=f"{FRESH_SHEET}（近 {meta.get('fresh_days', '')} 天内发的回复，"
+                                       f"按讨论串分组 —— 老主贴上的新回复在明细表里会被时间倒序埋掉）"
                 ).font = EXPORT_TITLE_FONT
         sub = ws.cell(
             row=2, column=1,
@@ -629,7 +630,7 @@ class ExcelService:
             ("最晚发布时间", meta.get("time_end") or "-"),
             # 窗口和基准**必须写进报告**：不写的话「这次和上次为什么不一样」无从解释。
             # 基准是数据集内最新的帖子时间，不是导出时刻 —— 报告因此自洽、可复现
-            (f"近 {meta.get('fresh_days', '')} 天老帖新回复",
+            (f"近 {meta.get('fresh_days', '')} 天新回复",
              f"{meta.get('fresh_count', 0)} 条"
              + (f"（基准 {meta['fresh_baseline']}，见「{FRESH_SHEET}」表）"
                 if meta.get("fresh_baseline") else "")),
@@ -736,7 +737,7 @@ class ExcelService:
                 cell.alignment = CENTER_ALIGN if key in EXPORT_CENTERED else CONTENT_ALIGN
                 # 只有评论行上底色。再叠一层隔行斑马纹，两种底色互相掩盖，
                 # 反而看不出哪行是评论。
-                # 「老帖新回复」优先：它就是要在一屏评论里跳出来的那一行
+                # 「近期新回复」优先：它就是要在一屏评论里跳出来的那一行
                 if item.get("fresh"):
                     cell.fill = FRESH_FILL
                 elif level:

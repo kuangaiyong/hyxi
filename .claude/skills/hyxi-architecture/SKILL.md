@@ -98,7 +98,7 @@ DELETE /api/v1/tasks/{id}             取消运行中 / force=true 删除已结�
 POST   /api/v1/tasks/{id}/retry       重跑终态任务（复用原描述创建新任务，返回新 id）；?full=true 全量重跑
 GET    /api/v1/tasks/{id}/events      SSE 实时进度流
 
-GET    /api/v1/tasks/{id}/posts        帖子查询（**按主贴分页**，评论在 replies 里，**主贴按时间倒序**；?fresh_days=3|7|14 标出老帖新回复，?only_fresh=true 只留有新回复的串）
+GET    /api/v1/tasks/{id}/posts        帖子查询（**按主贴分页**，评论在 replies 里，**主贴按时间倒序**；?fresh_days=3|7|14 标出近 N 天的新回复（只看回复时间），?only_fresh=true 只留有新回复的串）
 GET    /api/v1/tasks/{id}/posts/{idx}  单条帖子详情（0-based）
 GET    /api/v1/tasks/{id}/stats        任务统计（含 untranslated_count 还缺译文的条数、translating 是否正在补译）
 GET    /api/v1/tasks/{id}/export       **唯一的导出口**（?format=xlsx|csv&fresh_days=3|7|14）

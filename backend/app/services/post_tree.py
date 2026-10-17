@@ -90,7 +90,7 @@ def flat_thread_starts(posts: List[dict], thread_sources: Collection[str]) -> Di
     Tweakers 一个来源就是一个主题（`Collector.thread_kind == "thread"`），但 tweakers.js 一个父指针
     都不写，楼层全部按主贴入库 —— 哪些是回复只能在这里认：**时间最早的那一楼就是主题**（真站实测：
     主题是第 1 页第一条，即全串最早的一楼）。不能按 seq / 页码挑：真实存量库里主题排在第 63 条。
-    没采第 1 页时取到的是已采到的最早楼层，只会比真主题晚，判「主题在窗口外」时偏保守。
+    没采第 1 页时取到的是已采到的最早楼层，只会比真主题晚，「主贴 N 天前」会少算几天。
     时间读不出的楼层不参与挑选。
 
     来源里只要有一条父指针（结构化入库的串）就不在此列，走 mark_fresh_replies 原来那条判据。
@@ -108,28 +108,33 @@ def flat_thread_starts(posts: List[dict], thread_sources: Collection[str]) -> Di
 
 
 def mark_fresh_replies(posts: List[dict], days: int = FRESH_DAYS_DEFAULT,
-                       thread_sources: Collection[str] = ()) -> Dict[str, int]:
-    """找出「老主贴上的新回复」，返回 {回复的 post_key: 距其主贴的天数}。
+                       thread_sources: Collection[str] = (),
+                       base: Optional[datetime] = None) -> Dict[str, int]:
+    """找出「近 N 天的新回复」，返回 {回复的 post_key: 距其顶层主贴的天数}。
 
     出口按「主贴发表时间从新到旧」排、评论跟着自己的主贴走（见 order_by_thread），
     于是**今天发在两个月前主贴上的回复，会被排到两个月前的位置去**，用户根本翻不到。
     真实数据里有一条 08-15 的回复挂在 06-06 的主贴上，排在第 40 多个主贴之后。
 
-    判据：这条是回复 且 它的时间 >= 基准-days 且 它的**顶层主贴**时间 < 基准-days。
+    判据：这条是回复 且 它的时间 >= 基准-days。**只看回复时间**，主贴新不新不参与判断 ——
+    以前还要求「主贴早于窗口」，窗口一放宽主贴就可能落进窗口，于是近 3 天有的回复近 7 天
+    反而没有（用户实测报过，2026-10-16 改）。现在窗口越宽结果越多，3 天 ⊆ 7 天 ⊆ 14 天。
 
-    三条边界都是有意为之：
-    · **主贴也在窗口内 → 不标**。整串都是新的，它本来就排在最前面，没被埋
-    · **时间读不出来 → 不标**（回复和主贴任一为空都算）。早期采集读不到 tooltip 时是
-      故意留空的，这批帖子实际很新 —— 但那是推测，宁可漏标也不能凭空标一条出来
+    两条边界：
+    · **时间读不出来 → 不标**（回复和主贴任一为空都算；主贴的时间用来算「主贴 N 天前」）。
+      早期采集读不到 tooltip 时是故意留空的 —— 宁可漏标也不能凭空标一条出来
     · **父贴不在本批数据里的回复 → 不标**。build_tree() 已把它按主贴处理，它就不是回复
 
     判定按**顶层主贴**算（thread_of 已把嵌套回复归到顶层），跨来源用 post_key。
 
     `thread_sources`：一源一串的来源 id（Tweakers）。它们平铺入库的楼层没有父指针，上面那条判据
     一条都认不出来，于是「只看新回复」对 Tweakers 恒为空（用户实测报过）。这些楼层按「同一主题下的
-    回复」判，主题见 flat_thread_starts()，判据与三条边界完全相同。
+    回复」判，主题见 flat_thread_starts()，判据与边界完全相同。
+
+    `base`：缺省是数据集里最新一条的时间（结果页和导出用它，报告隔多久打开都自洽）；
+    邮件通知传当前时间 —— 定时摘要要的是「这一天里有什么新的」。
     """
-    base = baseline_time(posts)
+    base = base or baseline_time(posts)
     if not base:
         return {}
     cutoff = base - timedelta(days=days)
@@ -153,7 +158,7 @@ def mark_fresh_replies(posts: List[dict], days: int = FRESH_DAYS_DEFAULT,
         root_at = parse_time(root.get("timestamp"))
         if not reply_at or not root_at:
             continue
-        if reply_at >= cutoff and root_at < cutoff:
+        if reply_at >= cutoff:
             fresh[post_key(post)] = (reply_at - root_at).days
     return fresh
 

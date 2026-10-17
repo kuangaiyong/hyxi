@@ -20,6 +20,9 @@ class TweakersCollector(Collector):
     # 一个来源 = 一个 thread = **一条主题 + 按时间平铺的回复**。tweakers.js 不写父指针，
     # 楼层全部按主贴入库 ——「近期新回复」靠这个把它们认成同一主题下的回复
     thread_kind = "thread"
+    # data-datetime 是服务器渲染好的荷兰本地时间，不带时区、也不随浏览器时区变（本机 IP 被封，未在真站核实，
+    # 按荷兰站点推定）。宿主机是上海时间，差 6~7 小时 —— 邮件通知的「近 N 天」不换算就整体偏掉
+    timestamp_tz = "Europe/Amsterdam"
     param_fields = [
         {
             "name": "thread_id",

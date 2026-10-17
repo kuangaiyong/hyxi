@@ -10,7 +10,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from app.config import settings
-from app.services import storage
+from app.services import notify_service, storage
 from app.services.orchestrator import orchestrator
 from app.services.progress_manager import progress_manager
 
@@ -95,6 +95,12 @@ class SchedulerService:
                 self._add_job(cfg)
             except Exception as e:
                 logger.error("定时任务 %s 配置无效，已跳过: %s", cfg.get("id"), e)
+
+        # 邮件通知的每天定时：job 也存在 apscheduler_jobs 里，但以邮件通知的配置为准重挂一遍。坏配置同样只跳过自己
+        try:
+            notify_service.sync_schedule(self.scheduler)
+        except Exception as e:
+            logger.error("邮件通知的定时发送配置无效，已跳过: %s", e)
 
     def shutdown(self):
         try:

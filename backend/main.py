@@ -19,6 +19,7 @@ from app.routers import tasks as tasks_router
 from app.routers import results as results_router
 from app.routers import schedules as schedules_router
 from app.routers import sources as sources_router
+from app.routers import notify as notify_router
 from app.services.scheduler_service import scheduler_service
 from app.services.source_service import seed_default_sources
 
@@ -83,6 +84,7 @@ app.include_router(tasks_router.router, dependencies=_protected)
 app.include_router(results_router.router, dependencies=_protected)
 app.include_router(schedules_router.router, dependencies=_protected)
 app.include_router(sources_router.router, dependencies=_protected)
+app.include_router(notify_router.router, dependencies=_protected)
 
 
 @app.get("/api/v1/media/{rel_path:path}", dependencies=_protected)

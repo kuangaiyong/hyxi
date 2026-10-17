@@ -206,6 +206,60 @@ class TaskStats(BaseModel):
     translating: bool = False
 
 
+# ===== 邮件通知 =====
+
+class NotifyConfigInput(BaseModel):
+    """保存 / 测试邮件通知配置。password 留空 = 沿用已保存的（只在 SMTP 服务器和用户名都没改时）"""
+    recipients: List[str] = Field(default_factory=list, max_length=50)
+    source_ids: List[str] = Field(default_factory=list, max_length=50)
+    days: Optional[int] = Field(None, description="新回复时间窗口（天）；不设置 = 近 1 天")
+    schedule_enabled: bool = False
+    schedule_time: str = Field("09:00", max_length=5)
+    smtp_host: str = Field("", max_length=255)
+    smtp_port: int = Field(25, ge=1, le=65535)
+    smtp_ssl_port: int = Field(465, ge=1, le=65535)
+    use_ssl: bool = True
+    sender: str = Field("", max_length=254)
+    username: str = Field("", max_length=254)
+    password: str = Field("", max_length=500)
+
+
+class NotifyConfigPublic(BaseModel):
+    """邮件通知配置出口。密码只回「有没有」，明文与密文都不出后端"""
+    recipients: List[str] = Field(default_factory=list)
+    source_ids: List[str] = Field(default_factory=list)
+    days: Optional[int] = None
+    schedule_enabled: bool = False
+    schedule_time: str = "09:00"
+    smtp_host: str = ""
+    smtp_port: int = 25
+    smtp_ssl_port: int = 465
+    use_ssl: bool = True
+    sender: str = ""
+    username: str = ""
+    has_password: bool = False
+    is_configured: bool = False
+
+
+class NotifyRun(BaseModel):
+    """一次发送的结果"""
+    trigger: str                # manual 手动「立即发送」/ schedule 每天定时
+    outcome: str                # sent 已发送 / skipped 没有新回复 / failed 失败
+    message: str = ""
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    reply_count: int = 0
+    subject: str = ""
+    attachment: bool = False
+
+
+class NotifyStatus(BaseModel):
+    running: bool = False
+    progress: str = ""
+    last: Optional[NotifyRun] = None
+    next_run: Optional[str] = None
+
+
 # ===== SSE 事件 =====
 
 class SSEEvent(BaseModel):

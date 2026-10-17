@@ -82,6 +82,7 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
     ├── app/routers/results.py     帖子查询(含搜索)/统计/唯一导出口 + 舆情触发与查询
     ├── app/routers/schedules.py   定时任务 CRUD + 预设 + 手动触发
     ├── app/routers/sources.py     数据源 CRUD + 采集器清单 + 凭据录入/清除
+    ├── app/routers/notify.py      邮件通知：配置 / 测试邮件 / 立即发送 / 运行状态
     │
     ├── app/services/orchestrator.py    任务编排引擎（核心，含等待队列，全局单例）
     ├── app/services/llm_service.py     LLM API 客户端（_retry_with_backoff 指数退避）
@@ -95,6 +96,7 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
     ├── app/services/vision_service.py     多模态图片理解（只服务于舆情，翻译不用）
     ├── app/services/sentiment_service.py  LLM 舆情分析（3 条/批，结论按帖子身份落库）
     ├── app/services/excel_service.py   openpyxl 生成双语 Excel + 舆情报告
+    ├── app/services/notify_service.py  邮件通知（选新回复 → 补译 → HTML 邮件 → SMTP；每天定时）
     ├── app/services/storage.py         SQLite 存储层（全部持久化，见「持久化」一节）
     ├── app/services/progress_manager.py SSE 事件广播 (asyncio.Queue pub/sub 单例)
     └── app/services/scheduler_service.py APScheduler（SQLAlchemyJobStore，Asia/Shanghai）
@@ -118,7 +120,7 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
 | `sentiment_results` | **舆情结论，按 `(source_id, fingerprint)` 存** |
 | `sources` / `credentials` | 数据源与加密凭据，`ON DELETE CASCADE` |
 | `post_aliases` | 被归并掉的指纹 → 规范身份。`known_fingerprints()` 必须并上它，否则采集器每轮把编辑过的帖子当新帖、重新回源下载配图 |
-| `app_config` | LLM 配置，按 `llm.api_key` / `llm.base_url` / `llm.model_name` 分列；多模态模型同形，换 `vision.` 前缀 |
+| `app_config` | LLM 配置，按 `llm.api_key` / `llm.base_url` / `llm.model_name` 分列；多模态模型同形，换 `vision.` 前缀。邮件通知是 `notify.settings`（JSON）+ `notify.password_enc`（SMTP 密码密文），最近一次发送结果在 `notify_status.last` —— **不能挂在 `notify.` 下**，`set_app_config` 按前缀整组覆盖 |
 | `schedules` | 定时任务业务配置 |
 | `apscheduler_jobs` | APScheduler 自建，调度触发器 |
 
@@ -157,6 +159,11 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 生成后写进项目根 `.env`（已 gitignore）。**没配密钥时后端拒绝保存凭据并返回 400，不会静默降级成明文落库** —— 平台账号被盗的后果远大于可随时轮换的 LLM key。密钥换了以后旧密文解不开，`decrypt()` 会明说「与保存时的密钥不一致，请重新录入凭据」。
 
 凭据**只进不出**：`SourcePublic` 只回 `has_credential` 和 `credential_username`，任何端点都不会把密码或密文读回去；`get_credential_secret()` 仅供采集器子进程的启动路径调用。`CollectorRunner` 也**不再把命令行 emit 到 SSE 和任务日志**（旧 `ScraperService` 会），密码既不进 argv 也不进 job 文件。
+
+**邮件通知的 SMTP 密码走同一套**（`notify_service`）：加密落库、`NotifyConfigPublic` 只回 `has_password`。
+另加一条：密码留空 = 沿用已保存的，**只限 SMTP 服务器和用户名都没改** —— 换了服务器还沿用，等于把「只进不出」的
+密码交给那台新服务器，能调接口的人就能从自己搭的 SMTP 上套出来。发信时证书严格校验；外部服务器既不走 SSL
+又不支持 STARTTLS 时拒绝登录（本机回环地址上的中继除外，E2E 的收件端靠这一条）。
 
 `source_service._validate_params()` 只保留 `Collector.param_fields` 声明过的键 —— params 会原样进 job 文件，放任未知键通过等于给了一条绕过声明往采集脚本塞参数的路。
 
@@ -203,6 +210,8 @@ submit 按钮、Arkose 人机验证）、小组页 DOM 实测结论，以及已�
 ```
 
 `fingerprint` = `SHA256("username|timestamp|content[:100]")` 取前 16 位十六进制，由 Node 端 `makeFingerprint()` 生成，是增量去重和跨文件结果合并的唯一锚点。`timestamp` 落盘始终是荷兰格式 `dd-mm-yyyy HH:MM`，只在 API 出口由 `_normalize_timestamp()` 转 ISO。
+它**不带时区**：Facebook 是浏览器按宿主机（上海）时区渲染的，Tweakers 是服务器给的荷兰时间（`Collector.timestamp_tz`）。
+同一来源内互相比没问题；**拿「现在」去比之前必须按来源换算**，否则窗口整体偏 6~7 小时（邮件通知评审时发现）。
 
 **指纹不含来源，Python 侧一律用 `post_tree.post_key()` = `source:fingerprint` 做索引键。** 只用 fingerprint 会让两个平台的同名空内容帖互相覆盖 —— 翻译结果串源、舆情结论盖到别人头上。指纹算法本身**一个字符都不能动**：改了历史数据全部失配，已翻译的帖子会被判成新帖重新付费翻译。历史数据没有 `source` 字段，`post_key()` 缺省填 `tweakers`，完全兼容。
 
@@ -224,6 +233,7 @@ submit 按钮、Arkose 人机验证）、小组页 DOM 实测结论，以及已�
 - `/api/v1/tasks/{id}/sentiment`、`/export` —— 舆情结论与导出（导出只有这一个口）
 - `/api/v1/sources*` —— 数据源增删改查、`authorize` 人工登录、凭据（写入即加密，只出不进）
 - `/api/v1/schedules*`、`/api/v1/config*`、`/api/v1/media/{path}` —— 定时任务、LLM 配置、正文图
+- `/api/v1/notify/*` —— 邮件通知：`config`（GET / PUT / DELETE）、`test` 测试邮件、`send` 立即发送（后台跑）、`status`
 
 ## 任务流水线
 
@@ -258,7 +268,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 
 ## 测试
 
-**500 个测试，交付前必须全部 PASSED**（本机实测 `test_impact.py build` 500 条全过，2026-10-15，697 秒）。但**全量只在最后一次代码改动之后跑一次**
+**533 个测试，交付前必须全部 PASSED**（本机实测 `test_impact.py build` 533 条全过，2026-10-17，760 秒）。但**全量只在最后一次代码改动之后跑一次**
 —— 质量红线的另一半是：它之前的每一轮改动，都要跑到受影响的范围。
 
 ### 什么时候跑什么（在仓库根目录）
@@ -267,7 +277,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 |---|---|---|---|
 | 写用例、红 → 绿 → 反向验证 | 那一两条 | `pytest backend\tests\test_core.py::TestX::test_y` | 秒级~1 分钟 |
 | 一轮修改收尾 | 受影响的用例 | `python scripts\test_impact.py run` | 改舆情服务：151 条 **46 秒**；改采集脚本：82 条 9 分 40 秒（其中 54 条浏览器，省不掉） |
-| 想先要个快信号 | 快道（不起浏览器的 442 条） | `pytest backend\tests -m "not browser" -n 3 --dist loadgroup` | **48 秒**（当时 407 条） |
+| 想先要个快信号 | 快道（不起浏览器的 475 条） | `pytest backend\tests -m "not browser" -n 3 --dist loadgroup` | **48 秒**（当时 407 条） |
 | **交付前（最后一次代码改动之后）** | 全量 + 刷新映射 | `python scripts\test_impact.py build` | 约 12 分钟，全过才写映射，和代码一起提交 |
 | 只要全量结论、不刷映射 | 全量 | `pytest backend\tests -n 3 --dist loadgroup` | **10 分 30 秒左右**（连跑 3 轮 10:30 / 10:29 / 12:02；串行 31 分钟） |
 
@@ -286,7 +296,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 先 `Skill(hyxi-test-infra)`** —— 映射怎么建、为什么按进程归属覆盖率、会话级护栏各防什么，都在那里。
 
 **前端没有单元测试框架**（package.json 里无 vitest / jest / @vue/test-utils），
-七条前端回归靠真浏览器守，都在 `frontend/e2e/` 下：
+八条前端回归靠真浏览器守，都在 `frontend/e2e/` 下：
 
 | 脚本 | 命令 | 守的是 |
 |---|---|---|
@@ -297,6 +307,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 | `access_key_flow.js` | `npm run e2e:key` | 被 401 挡住后照提示填服务访问密钥：找得到、首屏可见、填错明说、填对当场生效 |
 | `results_thread_structure.js` | `npm run e2e:thread` | 回复全部展开且顺序同原帖、层级缩进与「回复 某某」、「已采 X · 原帖 Y」对账（没有第 2 层回复的数据时退出码 2） |
 | `results_backfill_translation.js` | `npm run e2e:backfill` | 补译提示条：N 与 `/stats`、出口三处一致；没待补译时不显示；`E2E_BACKFILL_CLICK=1` 才点按钮（真调模型） |
+| `notify_settings.js` | `npm run e2e:notify` | 邮件通知页：测试邮件真到达脚本自带的本机 SMTP 收件端、保存刷新后都在且密码读不回、改了没保存不许「立即发送」、立即发送三种结局各有硬断言；已有配置时退出码 2（密码只进不出，覆盖了还原不回），收尾调接口清除 |
 
 真 Chrome、真前后端、无 mock，**要求两个服务都起着**（先跑 `.\start.ps1`），所以它们
 进不了 pytest。都自己从 `/tasks` 里挑任务，不写死任何 ID；密钥从项目根 `.env` 读。

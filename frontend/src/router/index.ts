@@ -32,6 +32,11 @@ const routes = [
     component: () => import('@/views/ScheduleView.vue'),
   },
   {
+    path: '/notify',
+    name: 'Notify',
+    component: () => import('@/views/NotifyView.vue'),
+  },
+  {
     path: '/tasks/:id/progress',
     name: 'TaskProgress',
     component: () => import('@/views/TaskProgressView.vue'),

@@ -26,6 +26,9 @@ class Collector:
     # 「近期新回复」按它认平铺入库的楼层（见 post_tree.flat_thread_starts）。
     # 站点知识留在声明里，Python 与前端都不需要按 collector_id 分支
     thread_kind: str = "feed"
+    # 落盘时间戳是哪个时区的墙上时间（时间戳本身不带时区）。None = 宿主机本地时间 —— 浏览器按宿主机时区
+    # 渲染时间（Facebook 那样，见 CLAUDE.md「时区跟随宿主机」）。邮件通知拿「现在」去比之前，先换到这个时区
+    timestamp_tz: Optional[str] = None
     # 不进「新增数据源」的采集器下拉框。留给没有真实站点、只服务于本地 fixture 的采集器；
     # get_collector() 照样能解析出来，已注册的数据源和回归测试不受影响
     internal: bool = False

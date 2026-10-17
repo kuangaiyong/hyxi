@@ -70,6 +70,10 @@ class _Handler(BaseHTTPRequestHandler):
             # 内容是什么不重要 —— 这个分支存在的意义是「翻译这一步到底有没有真的发出去」
             n = len(re.findall(r"^\[\d+\]$", user_msg, re.M))
             self.server.translated.append(n)
+            if any(t in user_msg for t in self.server.fail_texts):
+                # 含指定内容的翻译请求一律 400，复刻「模型总拒译某一条」：批量里有它整批失败，单条重译时只它失败
+                self._reply(400, {"error": {"message": "refused for test"}})
+                return
             gate = self.server.translate_gate
             if gate is not None and len(self.server.translated) > self.server.gate_after:
                 # 卡住第 gate_after 个及以后的翻译请求，让测试在「翻译进行到一半」的时刻检查状态
@@ -133,8 +137,11 @@ class LLMSite:
     def __init__(self, port: int = 0, drop_separator: bool = False, batch_empty: bool = False,
                  retry_reply: str = None, reasoning_floor: int = 0,
                  translate_gate: threading.Event = None, gate_after: int = 0,
-                 sentiment_gate: threading.Event = None, max_tokens_limit: int = 0):
+                 sentiment_gate: threading.Event = None, max_tokens_limit: int = 0,
+                 fail_texts: tuple = ()):
         self._port = port
+        # 翻译请求里含其中任何一段就回 400
+        self.fail_texts = fail_texts
         # True 时批量结果整段返回、不带分隔符，走「parts 不够」那条路
         self.drop_separator = drop_separator
         # 翻译：batch_empty 让批量请求回空内容（推理把预算吃光，全部落进单条重译）；
@@ -175,6 +182,7 @@ class LLMSite:
         self._server.sentiment_gate = self.sentiment_gate
         self._server.sentiment_blocked = self.sentiment_blocked
         self._server.max_tokens_limit = self.max_tokens_limit
+        self._server.fail_texts = self.fail_texts
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         return "http://127.0.0.1:{}".format(self._server.server_address[1])

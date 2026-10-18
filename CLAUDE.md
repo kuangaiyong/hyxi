@@ -114,13 +114,13 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
 
 | 表 | 用途 |
 |------|------|
-| `posts` | 帖子。`seq` 承担改造前「数组下标即顺序」的全部语义 |
+| `posts` | 帖子。`seq` 承担改造前「数组下标即顺序」的全部语义。`notified_at` 是这条帖子随一封**发送成功**的邮件发出去的时间（没发过是 NULL）：只由邮件通知在投递成功后写、清除邮件通知配置时整列清空，采集不碰它 —— 邮件通知按它补发「之前没发出去的」，提前写或被采集冲掉都会让内容漏发或重发 |
 | `tasks` | 任务记录（plan / result / logs 是形状可变的不透明块，留在 JSON 列里） |
 | `sentiment_runs` | 某个任务最近一次触发分析的时间，只此一列 |
 | `sentiment_results` | **舆情结论，按 `(source_id, fingerprint)` 存** |
 | `sources` / `credentials` | 数据源与加密凭据，`ON DELETE CASCADE` |
 | `post_aliases` | 被归并掉的指纹 → 规范身份。`known_fingerprints()` 必须并上它，否则采集器每轮把编辑过的帖子当新帖、重新回源下载配图 |
-| `app_config` | LLM 配置，按 `llm.api_key` / `llm.base_url` / `llm.model_name` 分列；多模态模型同形，换 `vision.` 前缀。邮件通知是 `notify.settings`（JSON）+ `notify.password_enc`（SMTP 密码密文），最近一次发送结果在 `notify_status.last` —— **不能挂在 `notify.` 下**，`set_app_config` 按前缀整组覆盖 |
+| `app_config` | LLM 配置，按 `llm.api_key` / `llm.base_url` / `llm.model_name` 分列；多模态模型同形，换 `vision.` 前缀。邮件通知是 `notify.settings`（JSON）+ `notify.password_enc`（SMTP 密码密文），最近一次发送结果在 `notify_status.last`，补发起点（按来源各一个：它第一次进邮件那一轮的窗口起点，之后不动）在 `notify_marks.anchors` —— **都不能挂在 `notify.` 下、也不能互相挂**，`set_app_config` 按前缀整组覆盖 |
 | `schedules` | 定时任务业务配置 |
 | `apscheduler_jobs` | APScheduler 自建，调度触发器 |
 
@@ -164,6 +164,10 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 另加一条：密码留空 = 沿用已保存的，**只限 SMTP 服务器和用户名都没改** —— 换了服务器还沿用，等于把「只进不出」的
 密码交给那台新服务器，能调接口的人就能从自己搭的 SMTP 上套出来。发信时证书严格校验；外部服务器既不走 SSL
 又不支持 STARTTLS 时拒绝登录（本机回环地址上的中继除外，E2E 的收件端靠这一条）。
+
+**改邮件通知「哪些帖子进这一封」之前先读 `docs/features/email-notify.md` 的「设计」一节。**补发曾两次拿时间去推
+「这条发没发过」（先是入库时间，再是每轮挪动的水位线），两次都被评审找出漏法、推翻重来。现在的做法是直接记
+`posts.notified_at`，并给每个来源钉一个不动的起点。改回「按时间推」看着更简单，那几种漏法会原样回来。
 
 `source_service._validate_params()` 只保留 `Collector.param_fields` 声明过的键 —— params 会原样进 job 文件，放任未知键通过等于给了一条绕过声明往采集脚本塞参数的路。
 
@@ -268,7 +272,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 
 ## 测试
 
-**533 个测试，交付前必须全部 PASSED**（本机实测 `test_impact.py build` 533 条全过，2026-10-17，760 秒）。但**全量只在最后一次代码改动之后跑一次**
+**554 个测试，交付前必须全部 PASSED**（本机实测 `test_impact.py build` 554 条全过，2026-10-18，824 秒）。但**全量只在最后一次代码改动之后跑一次**
 —— 质量红线的另一半是：它之前的每一轮改动，都要跑到受影响的范围。
 
 ### 什么时候跑什么（在仓库根目录）
@@ -277,7 +281,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 |---|---|---|---|
 | 写用例、红 → 绿 → 反向验证 | 那一两条 | `pytest backend\tests\test_core.py::TestX::test_y` | 秒级~1 分钟 |
 | 一轮修改收尾 | 受影响的用例 | `python scripts\test_impact.py run` | 改舆情服务：151 条 **46 秒**；改采集脚本：82 条 9 分 40 秒（其中 54 条浏览器，省不掉） |
-| 想先要个快信号 | 快道（不起浏览器的 475 条） | `pytest backend\tests -m "not browser" -n 3 --dist loadgroup` | **48 秒**（当时 407 条） |
+| 想先要个快信号 | 快道（不起浏览器的 496 条） | `pytest backend\tests -m "not browser" -n 3 --dist loadgroup` | **48 秒**（当时 407 条） |
 | **交付前（最后一次代码改动之后）** | 全量 + 刷新映射 | `python scripts\test_impact.py build` | 约 12 分钟，全过才写映射，和代码一起提交 |
 | 只要全量结论、不刷映射 | 全量 | `pytest backend\tests -n 3 --dist loadgroup` | **10 分 30 秒左右**（连跑 3 轮 10:30 / 10:29 / 12:02；串行 31 分钟） |
 
@@ -326,7 +330,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests\test_core.py::TestSearchFilteringEndToEnd -v
 ```
 
-测试文件自己做了 `sys.path.insert`；`conftest.py` / `pytest.ini` 只放上面那几道会话级护栏。覆盖：任务生命周期持久化、舆情解析、摘要构建、时间戳归一化、Excel 生成、帖子 ID 提取、指纹去重、增量逻辑、LLM 工具函数、舆情 Excel、搜索过滤、原子写入、日志配置、API 端点集成（TestClient 真实请求）。
+测试文件自己做了 `sys.path.insert`；`conftest.py` / `pytest.ini` 只放上面那几道会话级护栏。
 
 ## 前端
 

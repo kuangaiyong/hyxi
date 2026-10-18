@@ -18,7 +18,7 @@ const DAY_OPTIONS: { value: number | null; label: string }[] = [
 ]
 const OUTCOME: Record<NotifyRun['outcome'], { label: string; badge: string }> = {
   sent: { label: '已发送', badge: 'badge-completed' },
-  skipped: { label: '没有新回复，未发送', badge: 'badge-pending' },
+  skipped: { label: '没有新内容，未发送', badge: 'badge-pending' },
   failed: { label: '失败，未发送', badge: 'badge-failed' },
 }
 
@@ -211,7 +211,7 @@ function poll() {
       <div class="card">
         <div class="card-header">📧 发什么、发给谁</div>
         <p class="text-secondary text-sm mb-4">
-          把所选数据源里近几天的<strong>新回复</strong>（原文 + 译文）发到邮箱。邮件只读<strong>已经采集到</strong>的数据，
+          把所选数据源里近几天的<strong>新回复和新主贴</strong>（原文 + 译文）发到邮箱。邮件只读<strong>已经采集到</strong>的数据，
           不会触发采集 —— 想收到当天的新回复，把采集的定时任务排在发送时间之前。
         </p>
 
@@ -243,11 +243,12 @@ function poll() {
           </select>
           <p class="text-secondary text-sm" style="margin-top: 6px;">
             从发送那一刻往前算；回复发在这段时间里就算新回复，主贴新不新不管（同结果页「只看新回复」）。
-            邮件里每条新回复都带上它的主贴，方便看懂在回什么。
+            邮件里每条新回复都带上它的主贴，方便看懂在回什么；这段时间里新发的主贴（没人回复的也算）标「🆕 新主贴」。
           </p>
           <p class="text-secondary text-sm" style="margin-top: 4px;" data-testid="notify-gap-hint">
-            按回复的<strong>发表时间</strong>算：采集之后、发送之前发表的回复，这一封里还没采到，
-            下一封又可能已经超出窗口而漏掉。把采集的定时任务排在发送前、挨得越近越好，或者选更宽的窗口。
+            按<strong>发表时间</strong>算，但不会漏：从开始发这个来源算起，采集晚了、某次发送失败而没发出去的，下一封会补上
+            （读不出发表时间的帖子判断不了新旧，不在其列；取消勾选再勾回来，从勾回来那天重新算），
+            并标明「补发：之前没发出」；窗口比发送间隔长时，前几封已经发过的标「已发过」。想收得及时，把采集的定时任务排在发送前。
           </p>
         </div>
 
@@ -259,7 +260,7 @@ function poll() {
           <div v-if="scheduleEnabled" class="flex items-center gap-2" style="margin-top: 6px;">
             <span class="text-sm text-secondary">每天</span>
             <input v-model="scheduleTime" type="time" class="form-input" style="width: auto;" data-testid="notify-schedule-time" />
-            <span class="text-sm text-secondary">发送（没有新回复的那天不发）</span>
+            <span class="text-sm text-secondary">发送（没有新内容的那天不发）</span>
           </div>
         </div>
       </div>
@@ -361,9 +362,9 @@ function poll() {
         </div>
         <p class="text-secondary text-sm" style="margin-top: 12px;">
           「发送测试邮件」用上面填的设置（不必先保存）；「立即发送」用已保存的配置。
-          新回复缺译文的会先自动补译（用「LLM 配置」里的模型），翻译失败重试 3 次仍不成功就不发，原因写在下面；
-          作上下文的主贴翻不成不影响发送，只放原文。
-          新回复超过 20 条时，正文只列最新 20 条，完整内容放进 HTML 附件。
+          新回复、新主贴缺译文的会先自动补译（用「LLM 配置」里的模型），翻译失败重试 3 次仍不成功就不发，原因写在下面；
+          作上下文的老主贴和补发的帖子翻不成不影响发送，只放原文。
+          新内容超过 20 条时，正文只列最新 20 条，完整内容放进 HTML 附件。
         </p>
       </div>
 

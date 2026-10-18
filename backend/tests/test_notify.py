@@ -5,6 +5,7 @@ TLS 证书现生成）、真路由函数与后台作业。帖子时间按「现�
 """
 import asyncio
 import ipaddress
+import json
 import os
 import shutil
 import socket
@@ -120,7 +121,8 @@ class _NotifyBase:
         """两个来源：Facebook 串结构 + Tweakers 平铺楼层。全都带译文，不需要模型。
 
         近 1 天：C1、C2（回复的回复）、C5（新主贴上的新回复）、F2；近 3 天再加 C3、F3；近 14 天再加 C4。
-        R3 是新主贴但没有回复 —— 它本身不是「新回复」，哪个窗口都不该出现。F1 是 50 天前的楼层
+        新主贴：R2（带新回复）、R3（没有回复）—— 新主贴也进邮件（2026-10-17 用户让我定的：没人回复的新主贴
+        以前哪封都不会出现，舆情工具不能有这个盲区）。R1 是 40 天前的主贴，只作上下文。F1 是 50 天前的楼层
         """
         self._seed([
             post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
@@ -148,6 +150,11 @@ class _NotifyBase:
         resp = self.client.put("/api/v1/notify/config", json=payload)
         assert resp.status_code == 200, resp.text
         return resp.json()
+
+    def _send(self, site, **over):
+        """保存配置（收件端指向 site）并立即发送一轮，等它结束，返回发送状态"""
+        self._save(self._payload(site, **over))
+        return self._run(self._send_and_wait())
 
     async def _send_and_wait(self, timeout=120):
         from app.routers import notify as notify_router
@@ -363,11 +370,6 @@ class TestNotifySmtpEndToEnd(_NotifyBase):
 class TestNotifyDigestEndToEnd(_NotifyBase):
     """「立即发送」整条链路：选新回复（基准 = 当前时间）→ 组 HTML → 真 SMTP 收到"""
 
-    def _send(self, site, **over):
-        self._save(self._payload(site, **over))
-        status = self._run(self._send_and_wait())
-        return status
-
     def test_the_default_window_is_one_day_back_from_now(self):
         import smtp_site
         self._seed_standard()
@@ -375,14 +377,18 @@ class TestNotifyDigestEndToEnd(_NotifyBase):
             status = self._send(site)
         assert status["last"]["outcome"] == "sent", status
         assert status["last"]["trigger"] == "manual" and status["last"]["reply_count"] == 4, status
+        assert status["last"]["root_count"] == 2, status
         html = self._html(site.message())
         for word in ("C1-orig", "C2-orig", "C5-orig", "F2-orig"):
             assert word in html, word
-        for word in ("C3-orig", "C4-orig", "F1-orig", "F3-orig", "R3-orig"):
+        for word in ("C3-orig", "C4-orig", "F1-orig", "F3-orig"):
             assert word not in html, f"{word} 不在近 1 天里"
-        # 主贴是上下文：原文、译文都在，但不算新回复
-        for word in ("R1-orig", "R1-zh", "R2-orig", "T0-orig"):
+        # 老主贴是上下文：原文、译文都在，但不算新内容
+        for word in ("R1-orig", "R1-zh", "T0-orig"):
             assert word in html, word
+        # 新主贴（有没有回复都算）单独标出来
+        assert "R2-orig" in html and "R3-orig" in html
+        assert html.count("🆕 新主贴") == 2, html.count("🆕 新主贴")
 
     def test_wider_windows_add_older_replies_and_never_drop_any(self):
         import smtp_site
@@ -399,7 +405,7 @@ class TestNotifyDigestEndToEnd(_NotifyBase):
             seen[days] = extra
             assert f"近 {days} 天" in site.message()["Subject"], site.message()["Subject"]
         assert status["last"]["reply_count"] == 7, status
-        assert "F1-orig" not in html and "R3-orig" not in html
+        assert "F1-orig" not in html and "R3-orig" in html
 
     def test_the_mail_shows_source_original_and_translation_and_nothing_else(self):
         """标明来源；原文 + 译文；不要舆情、不要原文链接；帖子内容一律转义"""
@@ -428,7 +434,8 @@ class TestNotifyDigestEndToEnd(_NotifyBase):
         assert html.index("R2-orig") < html.index("R1-orig"), "主贴按发表时间从新到旧（同结果页）"
         assert html.index("C1-orig") < html.index("C2-orig"), "串里按发表先后"
         subject = msg["Subject"]
-        assert subject == "【HYXi 新回复】Facebook 公开小组「HYXi 用户群」等 2 个数据源 · 近 1 天 · 共 5 条", subject
+        assert subject == ("【HYXi】Facebook 公开小组「HYXi 用户群」等 2 个数据源 · 近 1 天 · "
+                           "新回复 5 条、新主贴 2 条"), subject
         assert self._attachments(msg) == []
 
     def test_the_subject_names_only_sources_that_have_new_replies(self):
@@ -440,7 +447,7 @@ class TestNotifyDigestEndToEnd(_NotifyBase):
         with smtp_site.SmtpSite() as site:
             self._send(site, source_ids=[TW, FB])
         msg = site.message()
-        assert msg["Subject"] == "【HYXi 新回复】Facebook 公开小组「HYXi 用户群」 · 近 1 天 · 共 1 条", msg["Subject"]
+        assert msg["Subject"] == "【HYXi】Facebook 公开小组「HYXi 用户群」 · 近 1 天 · 新回复 1 条", msg["Subject"]
         html = self._html(msg)
         assert "来自：Tweakers.net 论坛「Tweakers HYXi 主题」" in html and "近 1 天没有新回复" in html
 
@@ -461,6 +468,60 @@ class TestNotifyDigestEndToEnd(_NotifyBase):
         html = self._html(site.message())
         assert "F2-orig" in html, "20 小时前（荷兰时间）发的楼层不在近 1 天里"
         assert "F9-orig" not in html
+
+    def test_a_new_main_post_without_replies_is_in_the_mail_in_full(self):
+        """没人回复的新主贴以前哪封邮件都不会出现 —— 一条新发的负面帖没人接话，就永远通知不到（用户让我定：要进邮件）。
+        它是新内容本身而不是上下文：全文照登，不按老主贴的 600 字截断。丢了父贴的回复（reply_level > 0）不是主贴，不算"""
+        import smtp_site
+        long_text = "NEWPOST " * 120 + "THE-END"
+        self._seed([
+            post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),                         # 老主贴，没有新回复
+            post("n1", "u_n1", 5, long_text, "新主贴的译文"),
+            post("o1", "u_o1", 2, "ORPHAN-orig", "ORPHAN-zh", parent=None, level=1),  # 父贴没采到的回复
+        ])
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["outcome"] == "sent", status
+        assert status["last"]["root_count"] == 1 and status["last"]["reply_count"] == 0, status
+        msg = site.message()
+        assert msg["Subject"] == "【HYXi】Facebook 公开小组「HYXi 用户群」 · 近 1 天 · 新主贴 1 条", msg["Subject"]
+        html = self._html(msg)
+        assert "🆕 新主贴" in html and "THE-END" in html, "新主贴要全文照登"
+        assert "R1-orig" not in html and "ORPHAN-orig" not in html
+
+    def test_a_new_main_post_cut_from_the_body_is_only_context_there(self):
+        """新内容超过 20 条、新主贴本身没排进正文的最新 20 条、只是它下面的回复排进去了：正文里它只作上下文（截断），
+        全文在附件里 —— 不然一条很长的老新主贴会把正文撑长，截断提示的条数也对不上（评审发现）"""
+        import smtp_site
+        long_text = "NEWPOST " * 120 + "THE-END"
+        self._seed(
+            [post("old", "u_old", 30 * 24, "OLD-orig", "OLD-zh"),
+             post("n1", "u_n1", 20, long_text, "新主贴的译文"),
+             post("n1r", "u_n1r", 1 / 60, "N1R-orig", "N1R-zh", parent="n1", level=1)]
+            + [post(f"x{i:02d}", f"u_x{i:02d}", (i + 1) / 60, f"X{i:02d}-orig", f"X{i:02d}-zh", parent="old", level=1)
+               for i in range(1, 26)])
+        with smtp_site.SmtpSite() as site:
+            self._send(site, source_ids=[FB])
+        msg = site.message()
+        body = self._html(msg)
+        assert "N1R-orig" in body and "🆕 新主贴" in body, "回复排进了正文，它的新主贴要作上下文出现"
+        assert "THE-END" not in body, "没排进最新 20 条的新主贴不该在正文里全文照登"
+        (_, full), = self._attachments(msg)
+        assert "THE-END" in full
+
+    def test_a_tweakers_topic_is_never_a_new_main_post(self):
+        """Tweakers 一个来源就是用户挑好的一条主题，而「主题」只是采到的最早一楼（没采第 1 页时并不是真主题）——
+        不能当新主贴报。它下面的新楼层照常算新回复"""
+        from zoneinfo import ZoneInfo
+        import smtp_site
+        ams = datetime.now(ZoneInfo("Europe/Amsterdam")).replace(tzinfo=None)
+        self._seed([dict(post(fp, f"u_{fp}", 0, content, content + "-zh", src=TW),
+                         timestamp=(ams - timedelta(hours=h)).strftime("%d-%m-%Y %H:%M"))
+                    for fp, h, content in (("t0", 10, "T0-orig"), ("f1", 5, "F1-orig"))])
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site, source_ids=[TW])
+        assert status["last"]["reply_count"] == 1 and status["last"]["root_count"] == 0, status
+        assert "🆕 新主贴" not in self._html(site.message())
 
     def _seed_many(self, n):
         self._seed([post("root", "u_root", 30 * 24, "ROOT-orig", "ROOT-zh")] + [
@@ -572,6 +633,19 @@ class TestNotifyTranslationEndToEnd(_NotifyBase):
         stored = {p["fingerprint"]: p for p in self.storage.load_posts([FB])}
         assert stored["c1"]["translation"] == "译文1", stored["c1"]
 
+    def test_a_new_main_post_that_cannot_be_translated_holds_back_the_mail(self):
+        """新主贴是新内容本身（老主贴才只是上下文），翻不成就和新回复一样：不发、说清楚"""
+        import smtp_site
+        self._seed([post("n1", "u_n1", 5, "UNTRANSLATABLE new post", "")])
+        server = self._llm_site().LLMSite(fail_texts=("UNTRANSLATABLE",))
+        with server as url, smtp_site.SmtpSite() as site:
+            self._configure_llm(url)
+            self._save(self._payload(site, source_ids=[FB]))
+            status = self._run(self._send_and_wait())
+        assert status["last"]["outcome"] == "failed", status
+        assert "翻译失败" in status["last"]["message"] and "没有发送" in status["last"]["message"], status
+        assert site.messages == []
+
     def test_clearing_the_config_while_a_send_is_running_is_refused(self):
         """评审发现：发送跑到一半点「清除」，这一轮照样用刚清掉的配置（连同密码）把信发出去，结束时还把发送记录写回来"""
         import smtp_site
@@ -659,3 +733,295 @@ class TestNotifyTranslationEndToEnd(_NotifyBase):
             second, status = self._run(main())
         assert second == 409, second
         assert status["last"]["outcome"] == "sent" and len(site.messages) == 1, status
+
+
+class TestNotifyCatchUpEndToEnd(_NotifyBase):
+    """补发：发表在这个来源的补发起点之后、还没随哪封发送成功的邮件发出去过的，这一封补上。
+    起点 = 这个来源第一次进邮件那一轮的窗口起点，之后不动。光按「近 N 天」时，采集晚了、某一轮发送失败、
+    采集停了几天，都会有一段内容哪封都进不去（三轮评审发现，2026-10-17 用户让我定：要修）。
+    判据是「发没发过」（posts.notified_at，只在发送成功后写），不拿时间反推"""
+
+    def _notified(self, fp):
+        conn = self.storage._get_conn()
+        try:
+            row = conn.execute("SELECT notified_at FROM posts WHERE source_id=? AND fingerprint=?",
+                               (FB, fp)).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+
+    def _mark_sent(self, *fps):
+        """这几条已经随某封邮件发出去过"""
+        self.storage.mark_notified([{"source": FB, "fingerprint": fp} for fp in fps],
+                                   (datetime.now() - timedelta(days=2)).isoformat(timespec="seconds"))
+
+    def _anchors(self):
+        return json.loads(self.storage.get_app_config("notify_marks").get("anchors") or "{}")
+
+    def _set_anchor(self, at, sid=FB):
+        """把这个来源的补发起点拨到 at（相当于它第一次进邮件是在那之前）"""
+        anchors = self._anchors()
+        anchors[sid] = at.isoformat(timespec="seconds")
+        self.storage.set_app_config("notify_marks", {"anchors": json.dumps(anchors)})
+
+    def test_only_a_mail_that_was_sent_marks_its_posts(self):
+        """新回复、新主贴随发送成功的邮件发出才记「发过」；作上下文的老主贴不记；没发出去的一轮什么都不记。
+        起点在第一轮就定下（哪怕那轮失败了），之后不动"""
+        import smtp_site
+        self._seed([post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+                    post("c1", "u_c1", 2, "C1-orig", "C1-zh", parent="r1", level=1),
+                    post("n1", "u_n1", 3, "N1-orig", "N1-zh")])
+        with smtp_site.SmtpSite(password="the-real-code") as site:     # 密码不对：这一轮发不出去
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["outcome"] == "failed", status
+        assert self._notified("c1") is None, "没发出去也记成发过了"
+        anchor = self._anchors()[FB]
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site, source_ids=[FB], password=PASSWORD)
+        assert status["last"]["outcome"] == "sent", status
+        assert self._notified("c1") and self._notified("n1"), "发出去的新回复、新主贴要记下"
+        assert self._notified("r1") is None, "老主贴只是上下文，没「发过」"
+        assert self._anchors()[FB] == anchor, "起点不该跟着每一轮挪"
+
+    def test_an_old_database_gets_the_column_and_old_rows_stay_unsent(self):
+        import sqlite3
+        old_db = os.path.join(self.tmpdir, "old.db")
+        conn = sqlite3.connect(old_db)
+        conn.execute("""CREATE TABLE posts (source_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+            seq INTEGER NOT NULL, username TEXT NOT NULL DEFAULT '', timestamp TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL DEFAULT '', translation TEXT NOT NULL DEFAULT '',
+            page_number INTEGER NOT NULL DEFAULT 1, message_id TEXT NOT NULL DEFAULT '',
+            parent_fingerprint TEXT, reply_level INTEGER NOT NULL DEFAULT 0,
+            images_json TEXT NOT NULL DEFAULT '[]', translated INTEGER NOT NULL DEFAULT 0, sentiment_at TEXT,
+            PRIMARY KEY (source_id, fingerprint))""")
+        conn.execute("INSERT INTO posts (source_id, fingerprint, seq, content) VALUES (?,?,?,?)",
+                     (FB, "legacy", 0, "旧帖"))
+        conn.commit()
+        conn.close()
+        self.storage.DB_PATH = old_db
+        self.storage.init_db()
+        conn = sqlite3.connect(old_db)
+        try:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(posts)")]
+            value = conn.execute("SELECT notified_at FROM posts WHERE fingerprint='legacy'").fetchone()[0]
+        finally:
+            conn.close()
+        assert "notified_at" in cols and value is None, (cols, value)
+
+    def test_merging_duplicate_rows_keeps_the_sent_mark(self):
+        """评审发现：重复行合并时「发过」只留在被删的那一行上的话，规范行还是空的，下一封会把它当「之前没发出」再补一遍"""
+        self.storage.upsert_posts(FB, [dict(post("a1", "u_dup", 2, "Zelfde bericht", "同一条"), message_id="m_dup")],
+                                  merge_by_message_id=False)
+        self.storage.upsert_posts(FB, [dict(post("a2", "u_dup", 2, "Zelfde bericht!", "同一条"), message_id="m_dup")],
+                                  merge_by_message_id=False)
+        self._mark_sent("a2")
+        self.storage.merge_duplicate_posts()
+        rows = {p["fingerprint"] for p in self.storage.load_posts([FB])}
+        assert rows == {"a1"}, rows
+        assert self._notified("a1"), "合并后规范行丢了「发过」标记"
+
+    def test_a_reply_collected_after_the_last_mail_is_caught_up(self):
+        """照真实时序摆数据：这个来源两天前就开始进邮件了。两条都是 25 小时前发的回复 —— OLD25 随上一封发出去了，
+        LATE 上一封时还没采到。光按「近 1 天」两条都超出窗口，LATE 却哪封都没进过，必须补上；OLD25 不能再发"""
+        import smtp_site
+        self._seed([
+            post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+            post("c1", "u_c1", 2, "C1-orig", "C1-zh", parent="r1", level=1),
+            post("old25", "u_old", 25, "OLD25-orig", "OLD25-zh", parent="r1", level=1),
+            post("late", "u_late", 25, "LATE-orig", "LATE-zh", parent="r1", level=1),
+        ])
+        self._mark_sent("old25")
+        self._set_anchor(datetime.now() - timedelta(hours=48))
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site, source_ids=[FB])
+        html = self._html(site.message())
+        assert "LATE-orig" in html and "补发" in html, "采集晚了的回复被漏掉了"
+        assert "OLD25-orig" not in html, "随上一封发过的不该再发一遍"
+        assert status["last"]["reply_count"] == 2, status       # C1（近 1 天里）+ LATE（补发）
+        assert self._notified("late"), "补发出去的也要记下，下一封不再补"
+
+    def test_what_a_failed_round_missed_comes_in_the_next_mail(self):
+        """评审发现：前一天那轮失败了（SMTP 临时不可用 / 服务停了一天），那一天窗口里的内容既不在今天的窗口里、
+        也早于上一封 —— 拿时间反推的话永远进不去。认「发没发过」就没有这道缝"""
+        import smtp_site
+        self._seed([
+            post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+            post("missed", "u_m", 36, "MISSED-orig", "MISSED-zh", parent="r1", level=1),  # 失败那轮窗口里的
+            post("sent36", "u_s", 36, "SENT36-orig", "SENT36-zh", parent="r1", level=1),
+        ])
+        self._mark_sent("sent36")
+        self._set_anchor(datetime.now() - timedelta(hours=72))
+        with smtp_site.SmtpSite() as site:
+            self._send(site, source_ids=[FB])
+        html = self._html(site.message())
+        assert "MISSED-orig" in html and "SENT36-orig" not in html, html[:1500]
+
+    def test_posts_collected_after_quiet_days_are_not_lost(self):
+        """评审发现：采集停了几天，这几天每轮都「没有新内容」；用会移动的水位线当下界的话，采集恢复后补进来的
+        已经落在下界之前。起点不动，就不会丢 —— 起点之前发表的不算（那时还没开始发这个来源）"""
+        import smtp_site
+        self._seed([post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh")])
+        self._set_anchor(datetime.now() - timedelta(hours=90))   # 不取整天：起点前不到一天的那段要靠精确比较挡住
+        with smtp_site.SmtpSite() as site:
+            quiet = self._send(site, source_ids=[FB])                      # 采集停着：这一轮什么都没有
+        assert quiet["last"]["outcome"] == "skipped", quiet
+        self._seed([post("back", "u_b", 60, "BACK-orig", "BACK-zh", parent="r1", level=1),     # 恢复后才采到
+                    post("before", "u_x", 93, "BEFORE-orig", "BEFORE-zh", parent="r1", level=1)])
+        with smtp_site.SmtpSite() as site:
+            self._send(site, source_ids=[FB], password="")
+        html = self._html(site.message())
+        assert "BACK-orig" in html and "BEFORE-orig" not in html, html[:1500]
+
+    def test_changing_the_window_does_not_lose_posts(self):
+        """评审发现：上一封按近 7 天发、之后改成近 1 天 —— 起点照旧，之前窗口里没发出去的照样补"""
+        import smtp_site
+        self._seed([
+            post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+            post("wide", "u_w", 24 * 4, "WIDE-orig", "WIDE-zh", parent="r1", level=1),
+        ])
+        self._set_anchor(datetime.now() - timedelta(days=8))
+        with smtp_site.SmtpSite() as site:
+            self._send(site, source_ids=[FB], days=None)
+        assert "WIDE-orig" in self._html(site.message())
+
+    def test_a_late_reply_that_cannot_be_translated_does_not_block_forever(self):
+        """补发的翻不成只放原文、照发 —— 它要是拦邮件，就会每轮都被挑出来、每轮都失败（评审发现）。
+        照发之后它记成「发过」，下一封不再补（起点不动，不记的话它会被一直补下去）"""
+        import smtp_site
+        self._seed([
+            post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+            post("late", "u_late", 25, "UNTRANSLATABLE late reply", "", parent="r1", level=1),
+        ])
+        self._set_anchor(datetime.now() - timedelta(hours=48))
+        server = self._llm_site().LLMSite(fail_texts=("UNTRANSLATABLE",))
+        with server as url, smtp_site.SmtpSite() as site:
+            self._configure_llm(url)
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["outcome"] == "sent", status
+        assert "补发的没翻成" in status["last"]["message"], status
+        html = self._html(site.message())
+        assert "UNTRANSLATABLE late reply" in html and "（尚未翻译）" in html and "补发" in html
+        with smtp_site.SmtpSite() as site:
+            again = self._send(site, source_ids=[FB], password="")
+        assert again["last"]["outcome"] == "skipped", "发过的补发帖子又被挑了出来"
+
+    def test_the_anchor_is_kept_per_source(self):
+        """起点按来源记：新加进来的来源从这一轮才开始，它首次采到的老帖子不是补发（评审发现）"""
+        from zoneinfo import ZoneInfo
+        import smtp_site
+        ams = datetime.now(ZoneInfo("Europe/Amsterdam")).replace(tzinfo=None)
+        self._seed([
+            post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+            post("late", "u_late", 25, "LATE-orig", "LATE-zh", parent="r1", level=1),
+        ] + [dict(post(fp, f"u_{fp}", 0, content, content + "-zh", src=TW),
+                  timestamp=(ams - timedelta(hours=h)).strftime("%d-%m-%Y %H:%M"))
+             for fp, h, content in (("t0", 60 * 24, "T0-orig"), ("f1", 25, "TWLATE-orig"))])
+        self._set_anchor(datetime.now() - timedelta(hours=48), sid=FB)     # 之前只发过 FB
+        with smtp_site.SmtpSite() as site:
+            self._send(site, source_ids=[FB, TW])
+        html = self._html(site.message())
+        assert "LATE-orig" in html, "FB 采集晚了的回复要补上"
+        assert "TWLATE-orig" not in html, "TW 这一轮才开始发，它的老楼层不是「补发」"
+
+    def test_deselecting_a_source_forgets_its_anchor(self):
+        """评审发现：取消勾选一个来源，过一阵再勾回来 —— 留着旧起点的话，这段时间的帖子会被当「补发」一股脑塞进来"""
+        import smtp_site
+        self._seed([post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+                    post("mid", "u_m", 10 * 24, "MID-orig", "MID-zh", parent="r1", level=1),
+                    post("c1", "u_c1", 2, "C1-orig", "C1-zh", parent="r1", level=1)])
+        self._set_anchor(datetime.now() - timedelta(days=30))
+        self._save(self._payload(source_ids=[TW]))                       # 取消勾选 FB
+        assert FB not in self._anchors()
+        with smtp_site.SmtpSite() as site:
+            self._send(site, source_ids=[FB, TW], password="")           # 又勾回来
+        html = self._html(site.message())
+        assert "C1-orig" in html and "MID-orig" not in html, html[:1500]
+
+    def test_a_post_whose_time_is_read_later_is_caught_up(self):
+        """入库那轮没读到发表时间（相对时间读不到时故意留空），上一封里自然没有它；之后重采补上了时间 ——
+        它没发过、发表在起点之后，补上（评审发现：拿入库时间反推时它哪封都进不去）"""
+        import smtp_site
+        self._seed([post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+                    dict(post("p1", "u_p1", 0, "Tijd onbekend", "时间未知", parent="r1", level=1), timestamp="")])
+        self._set_anchor(datetime.now() - timedelta(hours=48))
+        # 同一条（message_id 认得出来），这轮读到了时间：指纹跟着变，按 message_id 归并回原来那一行
+        self._seed([dict(post("p1-dated", "u_p1", 30, "Tijd onbekend", "时间未知", parent="r1", level=1),
+                         message_id="m_p1")])
+        with smtp_site.SmtpSite() as site:
+            self._send(site, source_ids=[FB])
+        assert "Tijd onbekend" in self._html(site.message())
+
+    def test_a_post_sent_before_is_tagged_when_the_window_repeats_it(self):
+        """窗口比发送间隔长时，同一条会连着出现在好几封里 —— 照用户定的窗口照列，但标「已发过」，读的人好跳过"""
+        import smtp_site
+        self._seed([post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+                    post("c1", "u_c1", 30, "C1-orig", "C1-zh", parent="r1", level=1),
+                    post("c2", "u_c2", 2, "C2-orig", "C2-zh", parent="r1", level=1)])
+        self._mark_sent("c1")
+        with smtp_site.SmtpSite() as site:
+            self._send(site, source_ids=[FB], days=3)
+        html = self._html(site.message())
+        assert "C1-orig" in html and "C2-orig" in html
+        tag = ">已发过</span>"                  # 只数标签：标题和抬头里还有一句「含已发过 1 条」
+        assert html.count(tag) == 1 and html.index(tag) < html.index("C1-orig"), html[:1500]
+
+    def test_a_window_full_of_posts_already_sent_sends_nothing(self):
+        """评审发现：近 7 天窗口、每天发一封，采集停了的那几天窗口里全是前几封发过的 —— 照样每天发一封全是「已发过」的信。
+        页面上写的是「没有新内容的那天不发」：只有首次出现的才算新内容"""
+        import smtp_site
+        self._seed([post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+                    post("c1", "u_c1", 30, "C1-orig", "C1-zh", parent="r1", level=1)])
+        self._mark_sent("c1")
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site, source_ids=[FB], days=7)
+        assert status["last"]["outcome"] == "skipped" and site.messages == [], status
+
+    def test_a_post_already_sent_that_cannot_be_translated_does_not_block(self):
+        """评审发现：一条早先作为补发、只带原文发出去的回复，改宽窗口后重新落进窗口；它翻不成也拦邮件的话，
+        接下来每一轮都失败 —— 而这条收件人早就收到过。已发过的和补发一样翻不成只放原文"""
+        import smtp_site
+        self._seed([post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+                    post("c1", "u_c1", 30, "UNTRANSLATABLE old reply", "", parent="r1", level=1),
+                    post("c2", "u_c2", 2, "C2-orig", "C2-zh", parent="r1", level=1)])
+        self._mark_sent("c1")
+        server = self._llm_site().LLMSite(fail_texts=("UNTRANSLATABLE",))
+        with server as url, smtp_site.SmtpSite() as site:
+            self._configure_llm(url)
+            status = self._send(site, source_ids=[FB], days=3)
+        assert status["last"]["outcome"] == "sent", status
+        assert "C2-orig" in self._html(site.message())
+
+    def test_clearing_the_config_forgets_what_was_sent(self):
+        """评审发现：「清除」不清「发过」标记 —— 换一批收件人重新配，他们一次都没收到过的帖子会被当成已发过（E2E 在开发库上跑完也会留痕）"""
+        self._seed([post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+                    post("c1", "u_c1", 2, "C1-orig", "C1-zh", parent="r1", level=1)])
+        self._save(self._payload())
+        self._mark_sent("c1")
+        assert self.client.delete("/api/v1/notify/config").status_code == 200
+        assert self._notified("c1") is None, "清除配置后「发过」标记还在"
+
+    def test_the_subject_and_header_say_what_is_outside_the_window(self):
+        """评审发现：标题和抬头写着「近 1 天」，条数里却混着窗口外的补发 —— 读的人会以为窗口算错了。要写明含几条补发、几条已发过"""
+        import smtp_site
+        self._seed([post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+                    post("c1", "u_c1", 2, "C1-orig", "C1-zh", parent="r1", level=1),
+                    post("c0", "u_c0", 3, "C0-orig", "C0-zh", parent="r1", level=1),
+                    post("late", "u_late", 25, "LATE-orig", "LATE-zh", parent="r1", level=1)])
+        self._mark_sent("c0")
+        self._set_anchor(datetime.now() - timedelta(hours=48))
+        with smtp_site.SmtpSite() as site:
+            self._send(site, source_ids=[FB])
+        msg = site.message()
+        assert "含补发 1 条、已发过 1 条" in msg["Subject"], msg["Subject"]
+        assert "含补发 1 条、已发过 1 条" in self._html(msg)
+
+    def test_a_broken_anchor_record_does_not_break_sending(self):
+        """评审发现：记录一坏，每轮都在读它时失败，连发送记录都写不进去。坏了只当没有 —— 这一封不补发而已"""
+        import smtp_site
+        self._seed([post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+                    post("c1", "u_c1", 2, "C1-orig", "C1-zh", parent="r1", level=1)])
+        self.storage.set_app_config("notify_marks", {"anchors": "{这不是 JSON"})
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["outcome"] == "sent" and len(site.messages) == 1, status
+        assert FB in self._anchors(), "坏记录要换成好的"

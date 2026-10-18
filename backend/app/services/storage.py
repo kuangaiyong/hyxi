@@ -5,7 +5,7 @@ import json
 import sqlite3
 import logging
 from datetime import datetime
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Set
 from app.config import settings
 
 logger = logging.getLogger("hyxi.storage")
@@ -137,6 +137,9 @@ CREATE TABLE IF NOT EXISTS posts (
     -- 原帖数不比它多就不必再打开：差的那几条是被「最相关」藏掉的、删了没减数的，
     -- 再开也看不到（见 known_comment_counts）
     harvested_site_count INTEGER,
+    -- 这条帖子（作为新回复 / 新主贴）随一封**发送成功**的邮件发出去的时间，没发过是 NULL。
+    -- 邮件通知靠它补发「之前没发出去的」：采集晚了、某一轮失败、服务停了一天，都不漏也不重发。采集不碰它
+    notified_at        TEXT,
     PRIMARY KEY (source_id, fingerprint)
 );
 
@@ -177,6 +180,7 @@ def init_db():
         _drop_stored_summary(conn)
         _ensure_posts_image_desc(conn)
         _ensure_posts_comment_counts(conn)
+        _ensure_posts_notified(conn)
         _ensure_tasks_force_full(conn)
         conn.close()
         logger.info("SQLite 数据库初始化完成: %s", DB_PATH)
@@ -213,6 +217,19 @@ def _ensure_posts_comment_counts(conn) -> None:
             logger.info("posts.%s 已补齐", col)
         except Exception as e:
             logger.error("补 posts.%s 列失败: %s", col, e)
+
+
+def _ensure_posts_notified(conn) -> None:
+    """给既有库补上 posts.notified_at 列。理由同 _ensure_posts_image_desc。旧行是 NULL（没随邮件发过 —— 升级前本来就没有邮件通知）"""
+    cols = [d[1] for d in conn.execute("PRAGMA table_info(posts)")]
+    if "notified_at" in cols:
+        return
+    try:
+        conn.execute("ALTER TABLE posts ADD COLUMN notified_at TEXT")
+        conn.commit()
+        logger.info("posts.notified_at 已补齐")
+    except Exception as e:
+        logger.error("补 posts.notified_at 列失败: %s", e)
 
 
 def _ensure_tasks_force_full(conn) -> None:
@@ -1035,10 +1052,11 @@ def merge_duplicate_posts() -> None:
 
             parent = pick("parent_fingerprint")
             conn.execute(
+                # notified_at：任何一行随邮件发过就算发过 —— 只留在被删的那行上，邮件通知会把它当「之前没发出」再补发一遍
                 """UPDATE posts SET username=?, timestamp=?, content=?, page_number=?,
                    parent_fingerprint=?, reply_level=?, images_json=?, image_desc=?,
                    translation=?, translated=?, sentiment_at=?, site_comment_count=?,
-                   harvested_site_count=?
+                   harvested_site_count=?, notified_at=COALESCE(notified_at, ?)
                    WHERE source_id=? AND fingerprint=?""",
                 (
                     pick("username"), pick("timestamp"), pick("content"),
@@ -1048,6 +1066,7 @@ def merge_duplicate_posts() -> None:
                     pick("translation") or "", 1 if pick("translated") else 0,
                     pick("sentiment_at"), pick("site_comment_count"),
                     pick("harvested_site_count"),
+                    next((r["notified_at"] for r in extras if r.get("notified_at")), None),
                     src, canonical["fingerprint"],
                 ),
             )
@@ -1080,10 +1099,11 @@ def merge_duplicate_posts() -> None:
                    translated = CASE WHEN translation = '' THEN ? ELSE translated END,
                    translation = CASE WHEN translation = '' THEN ? ELSE translation END,
                    sentiment_at = COALESCE(sentiment_at, ?),
-                   image_desc = CASE WHEN image_desc = '' THEN ? ELSE image_desc END
+                   image_desc = CASE WHEN image_desc = '' THEN ? ELSE image_desc END,
+                   notified_at = COALESCE(notified_at, ?)
                    WHERE source_id=? AND fingerprint=?""",
                 (r["translated"], r["translation"], r["sentiment_at"], r["image_desc"],
-                 r["source_id"], keep),
+                 r.get("notified_at"), r["source_id"], keep),
             )
             absorb(r["source_id"], r["fingerprint"], keep)
             merged += 1
@@ -1399,6 +1419,43 @@ def upsert_posts(source_id: str, posts: List[dict], drop_empty: bool = True,
     except Exception:
         logger.exception("写入帖子失败 source=%s", source_id)
         raise
+    finally:
+        conn.close()
+
+
+def notified_fingerprints(source_id: str) -> Set[str]:
+    """这个来源里随邮件发出去过的帖子指纹"""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT fingerprint FROM posts WHERE source_id = ? AND notified_at IS NOT NULL", (source_id,)
+        ).fetchall()
+        return {r["fingerprint"] for r in rows}
+    finally:
+        conn.close()
+
+
+def mark_notified(posts: List[dict], at: str) -> int:
+    """记下这些帖子已随邮件发出（只在邮件真的发送成功之后调）。已经记过的保留第一次的时间"""
+    conn = _get_conn()
+    try:
+        before = conn.total_changes
+        conn.executemany(
+            "UPDATE posts SET notified_at=? WHERE source_id=? AND fingerprint=? AND notified_at IS NULL",
+            [(at, p.get("source") or "tweakers", p.get("fingerprint")) for p in posts],
+        )
+        conn.commit()
+        return conn.total_changes - before
+    finally:
+        conn.close()
+
+
+def clear_notified() -> None:
+    """清掉全部「随邮件发过」标记（清除邮件通知配置时用：换一批收件人，他们一次都没收到过）"""
+    conn = _get_conn()
+    try:
+        conn.execute("UPDATE posts SET notified_at=NULL WHERE notified_at IS NOT NULL")
+        conn.commit()
     finally:
         conn.close()
 

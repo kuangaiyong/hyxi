@@ -12,6 +12,7 @@ import asyncio
 import html
 import ipaddress
 import json
+import math
 import re
 import smtplib
 import ssl
@@ -43,6 +44,8 @@ logger = get_logger(__name__)
 CONFIG_PREFIX = "notify"
 # **不能挂在 notify. 下面**：set_app_config 按前缀整组覆盖，保存一次配置就会把发送记录一起删掉
 STATUS_PREFIX = "notify_status"
+# 补发起点：{来源: 起点}（这个来源第一次进邮件那一轮的窗口起点，之后不动）。单独一个前缀，写发送记录时不会把它冲掉
+MARKS_PREFIX = "notify_marks"
 # 每天定时发送在 APScheduler 里的 job id。配置只有一份，job 也只该有一个
 JOB_ID = "notify-daily"
 
@@ -184,12 +187,13 @@ def save_config(payload: dict) -> dict:
         "settings": json.dumps(cfg, ensure_ascii=False),
         "password_enc": password_enc,
     })
+    _forget_anchors(cfg["source_ids"])
     sync_schedule()
     return public_config()
 
 
 def delete_config() -> dict:
-    """连同发送记录一起清：旧配置的记录留着只会误导（「已发送给 2 个收件人」说的是已经删掉的那份）。
+    """连同发送记录、补发起点和「发过」标记一起清：旧配置的记录留着只会误导（「已发送给 2 个收件人」说的是已经删掉的那份）。
 
     正在发送时不许清：那一轮手里拿着配置的快照（连同密码），清了照样把信发出去，结束时还会把发送记录写回来
     """
@@ -197,6 +201,9 @@ def delete_config() -> dict:
         raise NotifyBusy("正在发送，等这一轮结束再清除 —— 现在清，它照样会用这份配置把信发出去")
     storage.delete_app_config(CONFIG_PREFIX)
     storage.delete_app_config(STATUS_PREFIX)
+    storage.delete_app_config(MARKS_PREFIX)
+    # 「发过」也一起忘掉：换一批收件人重新配时，他们一次都没收到过（E2E 在开发库上跑完也靠这一步不留痕）
+    storage.clear_notified()
     sync_schedule()
     return public_config()
 
@@ -303,6 +310,43 @@ async def _run(trigger: str) -> dict:
     return record
 
 
+def _raw_anchors() -> Dict[str, str]:
+    raw = storage.get_app_config(MARKS_PREFIX).get("anchors")
+    try:
+        anchors = json.loads(raw) if raw else {}
+    except ValueError:
+        anchors = {}
+    return anchors if isinstance(anchors, dict) else {}
+
+
+def _anchors(source_ids: List[str], now: datetime, days: int) -> Dict[str, datetime]:
+    """{来源 id: 补发起点}。起点 = 这个来源第一次进邮件那一轮的窗口起点，**之后一直不动**：
+    补发就是「起点之后发表、还没随邮件发出去过」的全部 —— 不管中间采集停了几天、哪一轮失败、天数改过几次。
+    （三轮评审：拿每轮都会移动的水位线当下界，总有一种情况漏 —— 采集停摆比窗口长时，「没有新内容」的那几轮把下界挪过头了）
+    这一轮才第一次出现的来源就地起一个；记录坏了也当作没有、就地重起（只是这一轮不补发），不让每一轮都在这里失败
+    """
+    raw = _raw_anchors()
+    out: Dict[str, datetime] = {}
+    changed = False
+    for sid in source_ids:
+        try:
+            out[sid] = datetime.fromisoformat(raw[sid])
+        except (KeyError, TypeError, ValueError):
+            out[sid] = now - timedelta(days=days)
+            raw[sid] = out[sid].isoformat(timespec="seconds")
+            changed = True
+    if changed:
+        storage.set_app_config(MARKS_PREFIX, {"anchors": json.dumps(raw)})
+    return out
+
+
+def _forget_anchors(keep: List[str]) -> None:
+    """取消勾选的来源忘掉起点：再勾回来时从那一刻重新算，不然这段时间的旧帖会被当「补发」一股脑塞进来（评审发现）"""
+    raw = _raw_anchors()
+    if set(raw) - set(keep):
+        storage.set_app_config(MARKS_PREFIX, {"anchors": json.dumps({k: v for k, v in raw.items() if k in keep})})
+
+
 async def _send_digest(now: datetime) -> dict:
     cfg = load_config()
     if not cfg["saved"]:
@@ -315,28 +359,45 @@ async def _send_digest(now: datetime) -> dict:
     dropped = len(cfg["source_ids"]) - len(sources)
     note = f"（已跳过 {dropped} 个被删除的数据源）" if dropped else ""
 
-    sections = collect_fresh(sources, days, now)
-    total = _count(sections)
-    if not total:
-        return {"outcome": "skipped", "message": f"近 {days} 天没有新回复，这次没有发送邮件{note}"}
+    sections = collect_fresh(sources, days, now, _anchors([s["id"] for s in sources], now, days))
+    replies, roots = _counts(sections)
+    if not replies + roots:
+        return {"outcome": "skipped", "message": f"近 {days} 天没有新回复和新主贴，这次没有发送邮件{note}"}
+    late_n, repeat_n = _extras(sections)
+    if repeat_n == replies + roots:
+        # 窗口里全是前几封发过的（窗口比发送间隔长、这几天又没新东西）：不发 —— 页面上写的是「没有新内容的那天不发」（评审发现）
+        return {"outcome": "skipped",
+                "message": f"近 {days} 天没有首次出现的新回复和新主贴（窗口里的 {repeat_n} 条前几封都发过），这次没有发送邮件{note}"}
 
-    failed, roots_failed, reason = await _backfill(sections)
+    failed, roots_failed, late_failed, seen_failed, reason = await _backfill(sections)
     if failed:
         return {
-            "outcome": "failed", "reply_count": total,
-            "message": f"有 {failed} 条新回复翻译失败（已重试 {TRANSLATE_RETRIES} 次），这次没有发送邮件。"
+            "outcome": "failed", "reply_count": replies, "root_count": roots,
+            "message": f"有 {failed} 条新回复 / 新主贴翻译失败（已重试 {TRANSLATE_RETRIES} 次），这次没有发送邮件。"
                        f"原因：{reason}。到「LLM 配置」页点「测试连接」检查后，再回来点「立即发送」",
         }
+    if seen_failed:
+        note = f"（另有 {seen_failed} 条已发过的没翻成，邮件里只放了原文）{note}"
+    if late_failed:
+        note = f"（另有 {late_failed} 条补发的没翻成，邮件里只放了原文）{note}"
     if roots_failed:
         note = f"（另有 {roots_failed} 条主贴没翻成，邮件里只放了原文）{note}"
 
     _state["progress"] = "正在发送邮件"
     msg = build_message(cfg, sections, days, now)
     await asyncio.to_thread(deliver, cfg, msg)
+    # 信已经发出去了，下面记账失败也不能报成「发送失败」—— 只是下一封可能把这几条当补发再发一遍
+    try:
+        sent = [r["post"] for s in sections for t in s["threads"] for r in t["replies"]]
+        sent += [t["root"] for s in sections for t in s["threads"] if t.get("new_root")]
+        storage.mark_notified(sent, now.isoformat(timespec="seconds"))
+    except Exception:
+        logger.exception("邮件已发出，但记录「哪些帖子发过」失败")
+        note = f"（记录哪些帖子已发出时出错，下一封可能重复其中几条）{note}"
     return {
-        "outcome": "sent", "reply_count": total, "subject": str(msg["Subject"]),
-        "attachment": total > BODY_LIMIT,
-        "message": f"已发送给 {len(cfg['recipients'])} 个收件人，共 {total} 条新回复{note}",
+        "outcome": "sent", "reply_count": replies, "root_count": roots,
+        "subject": str(msg["Subject"]), "attachment": replies + roots > BODY_LIMIT,
+        "message": f"已发送给 {len(cfg['recipients'])} 个收件人：{_label(replies, roots)}{note}",
     }
 
 
@@ -356,11 +417,27 @@ def _source_now(collector: Optional[Collector], now: datetime) -> datetime:
     return now.astimezone(ZoneInfo(tz)).replace(tzinfo=None) if tz else now
 
 
-def collect_fresh(sources: List[dict], days: int, now: datetime) -> List[dict]:
-    """每个来源一节：{source, collector_name, threads: [{root, replies: [{post, reply_to}]}]}。
+def _is_new_root(post: dict, base: datetime, days: int) -> bool:
+    """近 N 天发的顶层主贴。丢了父贴的回复（reply_level > 0）也排在树根，但它不是主贴（同结果页的徽标判据）"""
+    if post.get("parent_fingerprint") or int(post.get("reply_level") or 0):
+        return False
+    at = parse_time(post.get("timestamp"))
+    return bool(at) and at >= base - timedelta(days=days)
 
-    判据就是结果页「只看新回复」那一个（mark_fresh_replies），基准换成 now（换到来源时间戳的时区）。主贴按发表时间从新到旧
-    （同结果页和导出），串里的新回复按发表先后。主贴只作上下文 —— 回复脱离主贴读不懂，但主贴本身不算新回复
+
+def collect_fresh(sources: List[dict], days: int, now: datetime,
+                  anchors: Optional[Dict[str, datetime]] = None) -> List[dict]:
+    """每个来源一节：{source, collector_name, threads: [{root, new_root, late_root, repeat_root,
+    replies: [{post, reply_to, late, repeat}]}]}。
+
+    新回复的判据就是结果页「只看新回复」那一个（mark_fresh_replies），基准换成 now（换到来源时间戳的时区）。
+    另外两样也进邮件（2026-10-17 用户让我定）：
+    · **新主贴**：近 N 天发的顶层主贴，没有回复也算 —— 不然一条新发的负面帖没人接话，就哪封都不出现。
+      Tweakers 那种一源一串的来源没有新主贴：主题是用户挑好的那一条，而且只是采到的最早一楼
+    · **补发**（late）：发表在这个来源的补发起点（anchors[来源]，见 _anchors）之后、还没随哪封发送成功的邮件发出去过
+      （posts.notified_at 为空）的回复和新主贴。采集晚了、某一轮失败、采集停了几天，都落在这一条里
+    窗口里的条目要是前几封已经发过（窗口比发送间隔长时会这样），照用户定的窗口照列，标「已发过」（repeat）方便跳过。
+    老主贴只作上下文 —— 回复脱离主贴读不懂。主贴按发表时间从新到旧（同结果页和导出），串里的新回复按发表先后
     """
     sections = []
     for source in sources:
@@ -368,21 +445,50 @@ def collect_fresh(sources: List[dict], days: int, now: datetime) -> List[dict]:
         collector = _collector(source)
         posts = storage.load_posts([sid])
         flat = {sid} if collector and collector.thread_kind == "thread" else set()
-        fresh = mark_fresh_replies(posts, days, flat, base=_source_now(collector, now))
+        base = _source_now(collector, now)
+        floor = base - timedelta(days=days)
+        anchor = (anchors or {}).get(sid)
+        start = min(floor, _source_now(collector, anchor)) if anchor else floor
+        # 一次组树挑全部候选：窗口和补发都在「起点之后」里（起点最晚也就是窗口起点），再按时间、发没发过分开
+        span = max(days, math.ceil((base - start).total_seconds() / 86400))
+        marked = mark_fresh_replies(posts, span, flat, base=base)
+        by_key = {post_key(p): p for p in posts}
+        sent = storage.notified_fingerprints(sid)
+        reply_keys = {k for k in marked if parse_time(by_key[k].get("timestamp")) >= floor}
+        root_keys = set() if flat else {post_key(p) for p in posts if _is_new_root(p, base, days)}
+        late_replies, late_roots = set(), set()
+        for p in posts:
+            key = post_key(p)
+            at = parse_time(p.get("timestamp"))
+            if not at or at < start or p.get("fingerprint") in sent or key in reply_keys or key in root_keys:
+                continue
+            if key in marked:
+                late_replies.add(key)
+            elif not flat and _is_new_root(p, base, span):
+                late_roots.add(key)
+        reply_keys |= late_replies
+        root_keys |= late_roots
         starts = flat_thread_starts(posts, flat)
         threads = thread_of(posts)
-        by_key = {post_key(p): p for p in posts}
         groups: Dict[str, dict] = {}
+
+        def group(root: dict) -> dict:
+            return groups.setdefault(post_key(root), {"root": root, "replies": [], "new_root": False,
+                                                      "late_root": False, "repeat_root": False})
+
         for p in posts:
-            if post_key(p) not in fresh:
-                continue
-            # 有父指针的走讨论串（串首就是顶层主贴）；Tweakers 平铺的楼层挂在主题楼层下
-            root = threads[post_key(p)][0] if p.get("parent_fingerprint") else starts[sid]
-            parent = by_key.get(parent_key(p))
-            # 第 2 层起写明回的是谁（同结果页）；直接回主贴的不用写
-            reply_to = parent["username"] if parent and post_key(parent) != post_key(root) else ""
-            groups.setdefault(post_key(root), {"root": root, "replies": []})["replies"].append(
-                {"post": p, "reply_to": reply_to or ""})
+            key = post_key(p)
+            repeat = p.get("fingerprint") in sent
+            if key in root_keys:
+                group(p).update(new_root=True, late_root=key in late_roots, repeat_root=repeat)
+            elif key in reply_keys:
+                # 有父指针的走讨论串（串首就是顶层主贴）；Tweakers 平铺的楼层挂在主题楼层下
+                root = threads[key][0] if p.get("parent_fingerprint") else starts[sid]
+                parent = by_key.get(parent_key(p))
+                # 第 2 层起写明回的是谁（同结果页）；直接回主贴的不用写
+                reply_to = parent["username"] if parent and post_key(parent) != post_key(root) else ""
+                group(root)["replies"].append({"post": p, "reply_to": reply_to,
+                                               "late": key in late_replies, "repeat": repeat})
         ordered = sorted(groups.values(), key=lambda g: sort_time(g["root"].get("timestamp")), reverse=True)
         for g in ordered:
             g["replies"].sort(key=lambda r: parse_time(r["post"].get("timestamp")))
@@ -391,8 +497,35 @@ def collect_fresh(sources: List[dict], days: int, now: datetime) -> List[dict]:
     return sections
 
 
-def _count(sections: List[dict]) -> int:
-    return sum(len(t["replies"]) for s in sections for t in s["threads"])
+def _counts(sections: List[dict]) -> Tuple[int, int]:
+    """(新回复条数, 新主贴条数)"""
+    replies = sum(len(t["replies"]) for s in sections for t in s["threads"])
+    roots = sum(1 for s in sections for t in s["threads"] if t.get("new_root"))
+    return replies, roots
+
+
+def _label(replies: int, roots: int) -> str:
+    parts = ([f"新回复 {replies} 条"] if replies else []) + ([f"新主贴 {roots} 条"] if roots else [])
+    return "、".join(parts) or "没有新内容"
+
+
+def _extras(sections: List[dict]) -> Tuple[int, int]:
+    """(补发条数, 前几封已发过的条数)，新回复和新主贴一起数"""
+    late = repeat = 0
+    for s in sections:
+        for t in s["threads"]:
+            if t.get("new_root"):
+                late += bool(t.get("late_root"))
+                repeat += bool(t.get("repeat_root"))
+            late += sum(1 for r in t["replies"] if r.get("late"))
+            repeat += sum(1 for r in t["replies"] if r.get("repeat"))
+    return late, repeat
+
+
+def _extras_note(late: int, repeat: int) -> str:
+    """标题和抬头写着「近 N 天」，条数里却有窗口外的补发、有前几封发过的 —— 不说明的话读的人会以为窗口算错了（评审发现）"""
+    parts = ([f"补发 {late} 条"] if late else []) + ([f"已发过 {repeat} 条"] if repeat else [])
+    return f"（含{'、'.join(parts)}）" if parts else ""
 
 
 # ===== 补译 =====
@@ -409,19 +542,34 @@ async def _claim(source_ids: List[str]) -> None:
         await asyncio.sleep(1)
 
 
-async def _backfill(sections: List[dict]) -> Tuple[int, int, str]:
-    """要显示的帖子缺译文的先补，返回 (没翻成的新回复条数, 没翻成的主贴条数, 原因)。
+async def _backfill(sections: List[dict]) -> Tuple[int, int, int, int, str]:
+    """要显示的帖子缺译文的先补，返回 (没翻成的：新内容, 老主贴, 补发, 已发过, 原因)。
 
-    新回复和它们的主贴一起翻，但**只有新回复翻不成才拦住邮件**：主贴只是上下文，一条总被拒译的老主贴不能让
-    每天的邮件都发不出去（评审发现），它在邮件里只放原文。翻完还有失败的就整轮再翻，最多再翻 TRANSLATE_RETRIES 轮
-    （用户定的）。译者每轮已经对失败条目单条重译过一次，这里的重试是隔一轮再来：模型临时抽风、限流退避用完这类情况，
-    下一轮往往就过了
+    全都一起翻，但**只有按窗口挑出来、首次发出的新内容（新回复、新主贴）翻不成才拦住邮件**（用户定的）。其余翻不成只放原文：
+    · 作上下文的老主贴 —— 一条总被拒译的老主贴不能让每天的邮件都发不出去（评审发现）
+    · 补发的 —— 补发起点不动，它没发出去就会一直被挑出来；它要是拦邮件，就每轮都失败、永远发不出去（评审发现）。
+      按窗口挑出来的过了窗口会自己掉出去，所以只有它们拦得起
+    · 前几封已发过的 —— 收件人早就收到过；它要是拦邮件，改宽窗口后一条早先只带原文发出去的就能让邮件连着失败（评审发现）
+    翻完还有失败的就整轮再翻，最多再翻 TRANSLATE_RETRIES 轮（用户定的）。译者每轮已经对失败条目单条重译过一次，
+    这里的重试是隔一轮再来：模型临时抽风、限流退避用完这类情况，下一轮往往就过了
     """
-    replies = {post_key(r["post"]): r["post"] for s in sections for t in s["threads"] for r in t["replies"]}
-    roots = {post_key(t["root"]): t["root"] for s in sections for t in s["threads"]}
-    pending = [p for p in {**roots, **replies}.values() if needs_translation(p)]
+    required: Dict[str, dict] = {}
+    context: Dict[str, dict] = {}
+    late: Dict[str, dict] = {}
+    seen: Dict[str, dict] = {}
+
+    def bucket(is_late: bool, is_repeat: bool) -> Dict[str, dict]:
+        return late if is_late else seen if is_repeat else required
+
+    for s in sections:
+        for t in s["threads"]:
+            root = t["root"]
+            (bucket(t.get("late_root"), t.get("repeat_root")) if t.get("new_root") else context)[post_key(root)] = root
+            for r in t["replies"]:
+                bucket(r.get("late"), r.get("repeat"))[post_key(r["post"])] = r["post"]
+    pending = [p for p in {**context, **late, **seen, **required}.values() if needs_translation(p)]
     if not pending:
-        return 0, 0, ""
+        return 0, 0, 0, 0, ""
     source_ids = sorted({p.get("source") or "tweakers" for p in pending})
     await _claim(source_ids)
     try:
@@ -450,9 +598,11 @@ async def _backfill(sections: List[dict]) -> Tuple[int, int, str]:
             for p in translated:
                 p.setdefault("_processed", {})["translated"] = True
             storage.save_translations(translated)
-        failed_replies = sum(1 for p in replies.values() if needs_translation(p))
-        failed_roots = sum(1 for k, p in roots.items() if k not in replies and needs_translation(p))
-        return failed_replies, failed_roots, (warnings[0] if warnings else "模型返回的都是空内容")
+        def failed(bucket: Dict[str, dict]) -> int:
+            return sum(1 for p in bucket.values() if needs_translation(p))
+
+        return (failed(required), failed(context), failed(late), failed(seen),
+                warnings[0] if warnings else "模型返回的都是空内容")
     finally:
         orchestrator.release_translation(source_ids, CLAIM_OWNER)
 
@@ -466,6 +616,8 @@ _ZH = "margin:4px 0 0;color:#111827;font-size:14px;line-height:1.6"
 _CARD = "border:1px solid #e5e7eb;border-radius:8px;padding:12px 14px;margin:0 0 12px"
 _REPLY = "margin:12px 0 0 14px;padding:2px 0 2px 10px;border-left:3px solid #f59e0b"
 _BADGE = "display:inline-block;padding:0 6px;border-radius:4px;background:#eef2ff;color:#4338ca;font-size:12px"
+_NEW_BADGE = "display:inline-block;padding:0 6px;border-radius:4px;background:#fff7ed;color:#c2410c;font-size:12px"
+_LATE_TAG = "display:inline-block;padding:0 6px;border-radius:4px;background:#f1f5f9;color:#475569;font-size:12px"
 
 
 def _esc(text: str) -> str:
@@ -499,34 +651,49 @@ def _body_html(post: dict, clip: Optional[int] = None) -> str:
 
 def _thread_html(thread: dict) -> str:
     root = thread["root"]
-    head = (f'<div><span style="{_BADGE}">主贴</span> <b>{_esc(root.get("username"))}</b> '
-            f'<span style="{_META}">{_esc(_time(root))}</span></div>')
+    new = thread.get("new_root")
+    badge = f'<span style="{_NEW_BADGE}">🆕 新主贴</span>' if new else f'<span style="{_BADGE}">主贴</span>'
+    head = (f'<div>{badge} <b>{_esc(root.get("username"))}</b> '
+            f'<span style="{_META}">{_esc(_time(root))}</span>'
+            f'{_tags(thread.get("late_root"), new and thread.get("repeat_root"))}</div>')
     replies = []
     for r in thread["replies"]:
         p = r["post"]
         to = f' <span style="{_META}">回复 {_esc(r["reply_to"])}</span>' if r["reply_to"] else ""
         replies.append(
             f'<div class="reply" style="{_REPLY}"><div>↳ <b>{_esc(p.get("username"))}</b>{to} '
-            f'<span style="{_META}">{_esc(_time(p))}</span></div>{_body_html(p)}</div>')
-    return f'<div class="thread" style="{_CARD}">{head}{_body_html(root, ROOT_CLIP)}{"".join(replies)}</div>'
+            f'<span style="{_META}">{_esc(_time(p))}</span>{_tags(r.get("late"), r.get("repeat"))}</div>'
+            f'{_body_html(p)}</div>')
+    # 新主贴是新内容本身，全文照登；老主贴只是上下文，太长截断。正文截取时没排进最新那几条、只因为它的回复排进去了
+    # 才出现的新主贴（clip_root），在正文里也只是上下文 —— 全文在附件里
+    body = _body_html(root, None if new and not thread.get("clip_root") else ROOT_CLIP)
+    return f'<div class="thread" style="{_CARD}">{head}{body}{"".join(replies)}</div>'
+
+
+def _tags(late: bool, repeat: bool) -> str:
+    """补发的标一下：它的发表时间已经在窗口外，不说明的话读的人会以为窗口算错了。
+    前几封已经发过的也标一下：窗口比发送间隔长时同一条会连着出现几封，读的人好跳过"""
+    if late:
+        return f' <span style="{_LATE_TAG}">补发：之前没发出</span>'
+    return f' <span style="{_LATE_TAG}">已发过</span>' if repeat else ""
 
 
 def _section_html(section: dict, days: int) -> str:
-    shown = sum(len(t["replies"]) for t in section["threads"])
-    total = section.get("total", shown)
+    replies, roots = section.get("counts") or _counts([section])
     title = f'来自：{_esc(section["collector_name"])}「{_esc(section["source"].get("name"))}」'
-    count = f"{total} 条新回复" + (f"（正文列最新 {shown} 条，其余见附件）" if shown < total else "")
+    count = _label(replies, roots) + ("（正文只列了其中最新的一部分，其余见附件）" if section.get("truncated") else "")
     if section["threads"]:
         body = "".join(_thread_html(t) for t in section["threads"])
-    elif total:
-        body = f'<p style="{_META}">这 {total} 条比正文里的都早，见附件</p>'
+    elif replies or roots:
+        body = f'<p style="{_META}">这些比正文里的都早，见附件</p>'
     else:
-        body = f'<p style="{_META}">近 {days} 天没有新回复</p>'
+        body = f'<p style="{_META}">近 {days} 天没有新回复和新主贴</p>'
     return (f'<h3 style="margin:20px 0 8px;font-size:15px">{title}'
             f'<span style="{_META};font-weight:normal"> · {count}</span></h3>{body}')
 
 
-def render_html(sections: List[dict], days: int, now: datetime, title: str, total: int, note: str = "") -> str:
+def render_html(sections: List[dict], days: int, now: datetime, title: str,
+                counts: Tuple[int, int], note: str = "", extras: str = "") -> str:
     """一份完整的 HTML 文档：邮件正文和附件都用它（附件要能单独用浏览器打开）。样式全部内联 —— 邮件客户端常把 <style> 剥掉"""
     start = (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
     end = now.strftime("%Y-%m-%d %H:%M")
@@ -535,8 +702,8 @@ def render_html(sections: List[dict], days: int, now: datetime, title: str, tota
         f'<title>{_esc(title)}</title></head>'
         '<body style="margin:0;padding:16px;background:#ffffff">'
         f'<div style="{_FONT};max-width:760px;margin:0 auto;color:#111827;font-size:14px">'
-        '<h2 style="margin:0 0 4px;font-size:18px">HYXi 新回复摘要</h2>'
-        f'<p style="{_META};margin:0 0 12px">近 {days} 天（{start} ～ {end}）· 共 {total} 条新回复 · 只含已采集到的数据</p>'
+        '<h2 style="margin:0 0 4px;font-size:18px">HYXi 新回复 / 新主贴摘要</h2>'
+        f'<p style="{_META};margin:0 0 12px">近 {days} 天（{start} ～ {end}）· {_label(*counts)}{extras} · 只含已采集到的数据</p>'
         f'{note}{"".join(_section_html(s, days) for s in sections)}'
         f'<p style="{_META};margin-top:20px">由 HYXi 舆情分析平台发送 · 生成于 {end}</p>'
         '</div></body></html>'
@@ -544,26 +711,38 @@ def render_html(sections: List[dict], days: int, now: datetime, title: str, tota
 
 
 def _newest(sections: List[dict], limit: int) -> List[dict]:
-    """只留最新的 limit 条新回复。来源、串的结构不变，空了的串去掉；每节记下原来的条数，标题照实说"""
-    stamped = [(parse_time(r["post"].get("timestamp")), id(r))
-               for s in sections for t in s["threads"] for r in t["replies"]]
-    keep = {rid for _, rid in sorted(stamped, key=lambda x: x[0], reverse=True)[:limit]}
+    """只留最新的 limit 条新内容（新回复和新主贴放在一起按时间排）。来源、串的结构不变，空了的串去掉；
+    每节记下原来的条数和「截过没有」，标题照实说"""
+    stamped = []
+    for s in sections:
+        for t in s["threads"]:
+            if t.get("new_root"):
+                stamped.append((parse_time(t["root"].get("timestamp")), id(t)))
+            stamped.extend((parse_time(r["post"].get("timestamp")), id(r)) for r in t["replies"])
+    keep = {i for _, i in sorted(stamped, key=lambda x: x[0], reverse=True)[:limit]}
     out = []
     for s in sections:
-        threads = [dict(t, replies=[r for r in t["replies"] if id(r) in keep]) for t in s["threads"]]
-        out.append(dict(s, threads=[t for t in threads if t["replies"]],
-                        total=sum(len(t["replies"]) for t in s["threads"])))
+        threads, shown = [], 0
+        for t in s["threads"]:
+            replies = [r for r in t["replies"] if id(r) in keep]
+            root_kept = bool(t.get("new_root")) and id(t) in keep
+            if replies or root_kept:
+                threads.append(dict(t, replies=replies, clip_root=not root_kept))
+                shown += len(replies) + root_kept
+        counts = _counts([s])
+        out.append(dict(s, threads=threads, counts=counts, truncated=shown < sum(counts)))
     return out
 
 
-def subject_for(sections: List[dict], days: int, total: int) -> str:
-    """只点有新回复的来源：选了却没有新回复的只在正文里说一声 —— 拿它打头的标题会让人以为新回复是从那来的
+def subject_for(sections: List[dict], days: int, counts: Tuple[int, int]) -> str:
+    """只点有新内容的来源：选了却没有的只在正文里说一声 —— 拿它打头的标题会让人以为新回复是从那来的
     （真实数据实测过：Tweakers 来源一条帖子都没有，标题却是「Tweakers…等 2 个数据源」）"""
     active = [s for s in sections if s["threads"]] or sections
     first = active[0]
     label = f'{first["collector_name"]}「{first["source"].get("name")}」'
     more = f"等 {len(active)} 个数据源" if len(active) > 1 else ""
-    return f"【HYXi 新回复】{label}{more} · 近 {days} 天 · 共 {total} 条"
+    # 前缀不写「新回复」：只有新主贴的那天会变成「【HYXi 新回复】… · 新主贴 1 条」，自相矛盾（评审发现）
+    return f"【HYXi】{label}{more} · 近 {days} 天 · {_label(*counts)}{_extras_note(*_extras(sections))}"
 
 
 def _new_message(cfg: dict, subject: str) -> EmailMessage:
@@ -577,22 +756,25 @@ def _new_message(cfg: dict, subject: str) -> EmailMessage:
 
 
 def build_message(cfg: dict, sections: List[dict], days: int, now: datetime) -> EmailMessage:
-    total = _count(sections)
-    subject = subject_for(sections, days, total)
+    counts = _counts(sections)
+    total = sum(counts)
+    subject = subject_for(sections, days, counts)
     msg = _new_message(cfg, subject)
     attach = total > BODY_LIMIT
-    filename = f"hyxi-new-replies-{now:%Y%m%d-%H%M}.html"
+    filename = f"hyxi-digest-{now:%Y%m%d-%H%M}.html"
     body_sections, note = sections, ""
     if attach:
         body_sections = _newest(sections, BODY_LIMIT)
         note = (f'<p style="margin:0 0 12px;padding:8px 10px;background:#fffbeb;border:1px solid #fde68a;'
-                f'border-radius:6px">新回复共 {total} 条，正文只列最新的 {BODY_LIMIT} 条；'
+                f'border-radius:6px">新内容共 {total} 条（{_label(*counts)}），正文只列最新的 {BODY_LIMIT} 条；'
                 f'完整的 {total} 条见附件「{filename}」（用浏览器打开）。</p>')
     msg.set_content(f"{subject}\n\n本邮件是 HTML 格式，请用支持 HTML 的邮件客户端查看"
                     + (f"；完整内容见附件 {filename}" if attach else "") + "。\n")
-    msg.add_alternative(render_html(body_sections, days, now, subject, total, note), subtype="html")
+    extras = _extras_note(*_extras(sections))
+    msg.add_alternative(render_html(body_sections, days, now, subject, counts, note, extras), subtype="html")
     if attach:
-        msg.add_attachment(render_html(sections, days, now, subject, total), subtype="html", filename=filename)
+        msg.add_attachment(render_html(sections, days, now, subject, counts, extras=extras),
+                           subtype="html", filename=filename)
     return msg
 
 

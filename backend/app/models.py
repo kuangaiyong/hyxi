@@ -244,11 +244,12 @@ class NotifyConfigPublic(BaseModel):
 class NotifyRun(BaseModel):
     """一次发送的结果"""
     trigger: str                # manual 手动「立即发送」/ schedule 每天定时
-    outcome: str                # sent 已发送 / skipped 没有新回复 / failed 失败
+    outcome: str                # sent 已发送 / skipped 没有新内容 / failed 失败
     message: str = ""
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     reply_count: int = 0
+    root_count: int = 0         # 新主贴条数（没有回复的新主贴也进邮件）
     subject: str = ""
     attachment: bool = False
 

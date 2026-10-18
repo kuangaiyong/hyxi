@@ -145,10 +145,11 @@ GET    /api/v1/sources/{id}/authorize/events 人工登录 SSE 进度流
 GET    /api/v1/notify/config         邮件通知配置（密码只回 has_password；is_configured 表示保存过）
 PUT    /api/v1/notify/config         保存（密码加密落库，留空 = 沿用已保存的，**只限 SMTP 服务器和用户名都没改**）；
                                      顺带照「每天定时发送」挂上 / 摘掉 APScheduler 的 notify-daily
-DELETE /api/v1/notify/config         清除配置、密码、每天定时和发送记录
+DELETE /api/v1/notify/config         清除配置、密码、每天定时、发送记录、补发起点和帖子上的「发过」标记；正在发 409
 POST   /api/v1/notify/test           用表单上的（不必先保存的）SMTP 设置发测试邮件；填得不对 400，发不出去 success=false + 原因
 POST   /api/v1/notify/send           用已保存的配置立即发一轮（后台跑，202）；没保存过 400，正在发 409
-GET    /api/v1/notify/status         running / progress / last（上一次的结果：sent / skipped / failed + 原因）/ next_run
+GET    /api/v1/notify/status         running / progress / last（上一次的结果：sent / skipped = 没有首次出现的新内容 / failed + 原因，
+                                     reply_count / root_count 分开计）/ next_run
 
 GET    /api/v1/media/{path}          回读采集下来的正文图（受同一套密钥保护）
 

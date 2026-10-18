@@ -28,6 +28,8 @@ export interface NotifyRun {
   started_at: string | null
   finished_at: string | null
   reply_count: number
+  /** 新主贴条数（没有回复的新主贴也进邮件） */
+  root_count: number
   subject: string
   attachment: boolean
 }

@@ -210,11 +210,6 @@ function poll() {
     <template v-else>
       <div class="card">
         <div class="card-header">📧 发什么、发给谁</div>
-        <p class="text-secondary text-sm mb-4">
-          把所选数据源里近几天的<strong>新回复和新主贴</strong>（原文 + 译文）发到邮箱。邮件只读<strong>已经采集到</strong>的数据，
-          不会触发采集 —— 想收到当天的新回复，把采集的定时任务排在发送时间之前。
-        </p>
-
         <div class="form-group">
           <label class="form-label" for="notify-recipients">收件人</label>
           <textarea
@@ -241,15 +236,6 @@ function poll() {
           <select id="notify-days" v-model="days" class="form-input" style="width: auto; min-width: 180px;" data-testid="notify-days">
             <option v-for="o in DAY_OPTIONS" :key="String(o.value)" :value="o.value">{{ o.label }}</option>
           </select>
-          <p class="text-secondary text-sm" style="margin-top: 6px;">
-            从发送那一刻往前算；回复发在这段时间里就算新回复，主贴新不新不管（同结果页「只看新回复」）。
-            邮件里每条新回复都带上它的主贴，方便看懂在回什么；这段时间里新发的主贴（没人回复的也算）标「🆕 新主贴」。
-          </p>
-          <p class="text-secondary text-sm" style="margin-top: 4px;" data-testid="notify-gap-hint">
-            按<strong>发表时间</strong>算，但不会漏：从开始发这个来源算起，采集晚了、某次发送失败而没发出去的，下一封会补上
-            （读不出发表时间的帖子判断不了新旧，不在其列；取消勾选再勾回来，从勾回来那天重新算），
-            并标明「补发：之前没发出」；窗口比发送间隔长时，前几封已经发过的标「已发过」。想收得及时，把采集的定时任务排在发送前。
-          </p>
         </div>
 
         <div class="form-group" style="margin-bottom: 0;">
@@ -260,19 +246,13 @@ function poll() {
           <div v-if="scheduleEnabled" class="flex items-center gap-2" style="margin-top: 6px;">
             <span class="text-sm text-secondary">每天</span>
             <input v-model="scheduleTime" type="time" class="form-input" style="width: auto;" data-testid="notify-schedule-time" />
-            <span class="text-sm text-secondary">发送（没有新内容的那天不发）</span>
+            <span class="text-sm text-secondary">发送</span>
           </div>
         </div>
       </div>
 
       <div class="card">
         <div class="card-header">📮 发件邮箱（SMTP）</div>
-        <p class="text-secondary text-sm mb-4">
-          <strong>QQ 邮箱</strong>：服务器 <code>smtp.qq.com</code>，勾选「使用 SSL」，SSL 端口 <code>465</code>；
-          用户名和发件人都填完整的 QQ 邮箱；密码填<strong>授权码</strong>（在 QQ 邮箱网页版的设置里开启 SMTP 服务后生成），
-          不是 QQ 登录密码。
-        </p>
-
         <div class="form-group">
           <label class="form-label" for="notify-smtp-host">SMTP 服务器</label>
           <input id="notify-smtp-host" v-model="smtpHost" type="text" class="form-input" placeholder="smtp.qq.com" data-testid="notify-smtp-host" />
@@ -294,9 +274,6 @@ function poll() {
             </label>
           </div>
         </div>
-        <p class="text-secondary text-sm" style="margin: -8px 0 16px;">
-          不勾 SSL 时连「端口」，服务器支持的话会先升级成加密连接（STARTTLS）；不支持加密的外部服务器不会发出密码。
-        </p>
 
         <div class="form-group">
           <label class="form-label" for="notify-sender">发件人邮箱</label>
@@ -317,9 +294,6 @@ function poll() {
             autocomplete="new-password"
             data-testid="notify-password"
           />
-          <p class="text-secondary text-sm" style="margin-top: 6px;">
-            加密后保存在本机，任何页面和接口都读不回来。改了服务器或用户名，要重新填写。
-          </p>
         </div>
 
         <div
@@ -360,12 +334,6 @@ function poll() {
           >清除</button>
           <span v-if="isConfigured && dirty" class="text-sm text-secondary">有未保存的修改，「立即发送」用的是已保存的配置</span>
         </div>
-        <p class="text-secondary text-sm" style="margin-top: 12px;">
-          「发送测试邮件」用上面填的设置（不必先保存）；「立即发送」用已保存的配置。
-          新回复、新主贴缺译文的会先自动补译（用「LLM 配置」里的模型），翻译失败重试 3 次仍不成功就不发，原因写在下面；
-          作上下文的老主贴和补发的帖子翻不成不影响发送，只放原文。
-          新内容超过 20 条时，正文只列最新 20 条，完整内容放进 HTML 附件。
-        </p>
       </div>
 
       <div class="card" data-testid="notify-status">

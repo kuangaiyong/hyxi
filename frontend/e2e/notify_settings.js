@@ -2,7 +2,7 @@
  * 「邮件通知」页 —— 真 Chrome、真前后端、真 SMTP（脚本自带一个本机收件端），无 mock。
  *
  * 守的是用户在这一页上的整段操作：
- *   1. 侧栏点得进来，标题对
+ *   1. 侧栏点得进来，标题对；配置卡片里不放说明文字（用户要求，保存后开着定时再查一次）
  *   2. 填好表单点「发送测试邮件」：收件端真的收到了，登录用的就是页面上填的用户名和密码
  *   3. 保存后刷新：填的都还在；密码框是空的、提示「已保存」；任何一次读配置的响应里都没有密码
  *   4. 改了没保存时「立即发送」点不了（它用的是已保存的配置，免得用户以为发的是眼前这份）
@@ -163,6 +163,29 @@ const waitToast = (page, re, ms = 8000) => page.waitForFunction(
 ).then(() => true, () => false);
 const byId = (page, id) => page.locator(`[data-testid="${id}"]`);
 
+/**
+ * 两张配置卡片里的说明文字（用户要求这一页不放）。标题、输入框、按钮不算；标签自己的文字是字段名，不算，
+ * 但标签里再套一层元素写的字照样算。allowed 逐段放行字段名（定时那一行的「每天」「发送」），多一个字都不行。
+ * 发送记录是结果，不在其列。
+ */
+const strayText = (page, allowed = []) => page.evaluate((allowed) => {
+    const out = [];
+    const cards = [...document.querySelectorAll('.card')]
+        .filter((c) => c.querySelector('[data-testid^="notify-"]') && c.dataset.testid !== 'notify-status');
+    for (const card of cards) {
+        const clone = card.cloneNode(true);
+        clone.querySelectorAll('.card-header, input, textarea, select, button').forEach((el) => el.remove());
+        clone.querySelectorAll('label').forEach((l) => [...l.childNodes]
+            .filter((n) => n.nodeType === Node.TEXT_NODE).forEach((n) => n.remove()));
+        const walker = document.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
+        for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+            const t = n.textContent.replace(/\s+/g, ' ').trim();
+            if (t && !allowed.includes(t)) out.push(t);
+        }
+    }
+    return out;
+}, allowed);
+
 async function main() {
     const sources = await preflight();
     const smtp = await startSmtp();
@@ -191,6 +214,10 @@ async function main() {
         await page.waitForURL('**/notify');
         await byId(page, 'notify-recipients').waitFor();
         check('页面标题是「邮件通知」', (await page.locator('.app-header h2').textContent()).trim() === '邮件通知');
+        // 表单一挂上就渲染，数据源要等接口回来；在那之前卡片里是「还没有数据源」的空态，不能拿来判
+        await page.locator('[data-testid="notify-source"]').first().waitFor();
+        const stray = await strayText(page);
+        check('配置卡片里只有标题、字段和按钮，没有说明文字', stray.length === 0, stray);
 
         console.log('\n场景二：填表、发送测试邮件，收件端真的收到');
         await byId(page, 'notify-recipients').fill(RECIPIENTS.join('\n'));
@@ -239,6 +266,8 @@ async function main() {
             configBodies.length >= 2 && configBodies.every((b) => !b.includes(PASSWORD)), configBodies.length);
         const nextRun = (await byId(page, 'notify-next-run').textContent()).trim();
         check('发送记录里显示下次定时发送的时间', /下次定时发送：.*07:30/.test(nextRun), nextRun);
+        const strayLater = await strayText(page, ['每天', '发送']);
+        check('保存过、开着定时：配置卡片里也没有说明文字', strayLater.length === 0, strayLater);
 
         console.log('\n场景四：改了没保存，「立即发送」点不了');
         const send = byId(page, 'notify-send');

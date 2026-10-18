@@ -311,7 +311,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 | `access_key_flow.js` | `npm run e2e:key` | 被 401 挡住后照提示填服务访问密钥：找得到、首屏可见、填错明说、填对当场生效 |
 | `results_thread_structure.js` | `npm run e2e:thread` | 回复全部展开且顺序同原帖、层级缩进与「回复 某某」、「已采 X · 原帖 Y」对账（没有第 2 层回复的数据时退出码 2） |
 | `results_backfill_translation.js` | `npm run e2e:backfill` | 补译提示条：N 与 `/stats`、出口三处一致；没待补译时不显示；`E2E_BACKFILL_CLICK=1` 才点按钮（真调模型） |
-| `notify_settings.js` | `npm run e2e:notify` | 邮件通知页：测试邮件真到达脚本自带的本机 SMTP 收件端、保存刷新后都在且密码读不回、改了没保存不许「立即发送」、立即发送三种结局各有硬断言；已有配置时退出码 2（密码只进不出，覆盖了还原不回），收尾调接口清除 |
+| `notify_settings.js` | `npm run e2e:notify` | 邮件通知页：配置卡片里不放说明文字（用户要求）、测试邮件真到达脚本自带的本机 SMTP 收件端、保存刷新后都在且密码读不回、改了没保存不许「立即发送」、立即发送三种结局各有硬断言；已有配置时退出码 2（密码只进不出，覆盖了还原不回），收尾调接口清除 |
 
 真 Chrome、真前后端、无 mock，**要求两个服务都起着**（先跑 `.\start.ps1`），所以它们
 进不了 pytest。都自己从 `/tasks` 里挑任务，不写死任何 ID；密钥从项目根 `.env` 读。

@@ -159,19 +159,19 @@ def _clean(payload: dict, saved: dict, require_sources: bool) -> dict:
 
     cfg["smtp_host"] = (cfg["smtp_host"] or "").strip()
     if not cfg["smtp_host"]:
-        raise ValueError("请填写 SMTP 服务器，例如 QQ 邮箱是 smtp.qq.com")
+        raise ValueError("请填写 SMTP 服务器")
     cfg["sender"] = (cfg["sender"] or "").strip()
     if not _valid_email(cfg["sender"]):
         raise ValueError("发件人邮箱格式不对")
     cfg["username"] = (cfg["username"] or "").strip()
     if not cfg["username"]:
-        raise ValueError("请填写 SMTP 用户名（QQ 邮箱填完整的邮箱地址）")
+        raise ValueError("请填写 SMTP 用户名（一般是完整的邮箱地址）")
 
     password = payload.get("password") or ""
     if password:
         cfg["password_enc"] = crypto.encrypt(password)   # 没配 TWEAKERS_SECRET_KEY 时抛 ValueError，不降级成明文
     elif not saved.get("password_enc"):
-        raise ValueError("请填写 SMTP 密码（QQ、163 等邮箱填「授权码」，不是登录密码）")
+        raise ValueError("请填写 SMTP 密码（不少邮箱要填「授权码」，不是登录密码）")
     elif (saved.get("smtp_host"), saved.get("username")) != (cfg["smtp_host"], cfg["username"]):
         # 留空沿用旧密码只限同一台服务器、同一个账号：换了服务器还沿用，等于把已保存的密码交给那台新服务器 ——
         # 能调接口的人就能借这个口子，把「只进不出」的密码从自己搭的 SMTP 服务器上套出来
@@ -855,7 +855,7 @@ def deliver(cfg: dict, msg: EmailMessage) -> None:
                     server.ehlo()
                 elif not _is_loopback(host):
                     raise NotifyError(f"SMTP 服务器 {where} 不支持加密连接（STARTTLS）。为了不明文传输密码，"
-                                      "请勾选「使用 SSL」并填 SSL 端口（QQ 邮箱是 465）")
+                                      "请勾选「使用 SSL」并填 SSL 端口（一般是 465）")
             _login(server, cfg["username"], password)
             server.send_message(msg)
     except NotifyError:
@@ -864,15 +864,16 @@ def deliver(cfg: dict, msg: EmailMessage) -> None:
         # 附上服务器原话：QQ 的 535 不只是密码错，没开 SMTP 服务、登录太频繁也是它
         said = _server_said(e, cfg["username"], password)
         if e.smtp_code == 535:
-            # 535 是服务器说凭据不对；QQ 在 SMTP 服务没开、登录太频繁时也回它，所以几种情况都列出来，不说「多半」
-            raise NotifyError(f"SMTP 登录被拒绝（535，服务器认为用户名或密码不对）。{said}。QQ、163 等邮箱这里要填"
+            # 535 是服务器说凭据不对；QQ 在 SMTP 服务没开、登录太频繁时也回它，所以几种情况都列出来，不说「多半」。
+            # 提示里不点名哪家邮箱（用户要求「QQ 字样都要去掉」）
+            raise NotifyError(f"SMTP 登录被拒绝（535，服务器认为用户名或密码不对）。{said}。不少邮箱这里要填"
                               "「授权码」而不是登录密码 —— 在邮箱网页版的设置里开启 SMTP 服务后生成；"
-                              "QQ 在 SMTP 服务没开启、登录太频繁时也回 535") from None
+                              "SMTP 服务没开启、登录太频繁时，也可能被这样拒绝") from None
         # 别的码不是「凭据不对」（454 临时失败、504 不支持这种方式……），照实报，不猜
         raise NotifyError(f"SMTP 登录被拒绝（{e.smtp_code}）。{said}") from None
     except smtplib.SMTPSenderRefused as e:
         raise NotifyError(f"发件人 {cfg['sender']} 被服务器拒绝（{e.smtp_code}）。"
-                          "QQ 等邮箱要求发件人邮箱和登录用户名是同一个") from None
+                          "不少邮箱要求发件人邮箱和登录用户名是同一个") from None
     except smtplib.SMTPRecipientsRefused as e:
         raise NotifyError(f"收件人被服务器拒绝：{'、'.join(e.recipients)}") from None
     except smtplib.SMTPException as e:

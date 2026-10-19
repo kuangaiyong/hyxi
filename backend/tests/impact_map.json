@@ -1,7 +1,7 @@
 {
 "version": 2,
-"built_at": "2026-10-19T10:38:34",
-"git_head": "2022d74d790084e83a7f8ba1f9eed0c7f7d32bf0",
+"built_at": "2026-10-19T11:33:38",
+"git_head": "95142dc0d4027e6df8502efc46c8d5eeb9f4ee0d",
 "tests": [
 "backend/tests/test_api.py::TestAPIEndpointsEndToEnd::test_404_for_nonexistent_task",
 "backend/tests/test_api.py::TestAPIEndpointsEndToEnd::test_cancel_task",
@@ -526,6 +526,7 @@
 "backend/tests/test_notify.py::TestNotifyConfigEndToEnd::test_bad_input_is_refused_with_the_reason",
 "backend/tests/test_notify.py::TestNotifyConfigEndToEnd::test_blank_password_keeps_the_saved_one_only_for_the_same_server_and_user",
 "backend/tests/test_notify.py::TestNotifyConfigEndToEnd::test_delete_clears_the_config_and_the_daily_job",
+"backend/tests/test_notify.py::TestNotifyConfigEndToEnd::test_no_message_names_a_mail_provider",
 "backend/tests/test_notify.py::TestNotifyConfigEndToEnd::test_password_is_stored_encrypted_and_never_comes_back",
 "backend/tests/test_notify.py::TestNotifyConfigEndToEnd::test_send_now_without_a_saved_config_is_refused",
 "backend/tests/test_notify.py::TestNotifyConfigEndToEnd::test_without_secret_key_the_password_is_not_saved",
@@ -1080,7 +1081,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/auth.py": [
 0,
@@ -1255,7 +1257,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/collectors/__init__.py": [
 0,
@@ -1551,7 +1554,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/collectors/base.py": [
 0,
@@ -1847,7 +1851,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/collectors/facebook_group.py": [
 0,
@@ -2143,7 +2148,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/collectors/group_feed.py": [
 0,
@@ -2439,7 +2445,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/collectors/tweakers.py": [
 0,
@@ -2735,7 +2742,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/logging_config.py": [
 0,
@@ -2959,7 +2967,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/models.py": [
 0,
@@ -3281,7 +3290,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/routers/__init__.py": [
 0,
@@ -3461,7 +3471,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/routers/config.py": [
 0,
@@ -3661,7 +3672,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/routers/notify.py": [
 0,
@@ -3836,7 +3848,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/routers/results.py": [
 0,
@@ -4037,7 +4050,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/routers/schedules.py": [
 0,
@@ -4212,7 +4226,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/routers/sources.py": [
 0,
@@ -4388,7 +4403,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/routers/tasks.py": [
 0,
@@ -4568,7 +4584,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/services/__init__.py": [
 0,
@@ -5059,7 +5076,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/services/collector_runner.py": [
 0,
@@ -5346,7 +5364,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/services/crypto.py": [
 0,
@@ -5624,7 +5643,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/services/excel_service.py": [
 0,
@@ -5874,7 +5894,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/services/llm_service.py": [
 0,
@@ -6196,7 +6217,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/services/llm_utils.py": [
 0,
@@ -6515,7 +6537,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/services/notify_service.py": [
 0,
@@ -6693,7 +6716,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/services/orchestrator.py": [
 0,
@@ -6915,7 +6939,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/services/post_tree.py": [
 0,
@@ -7275,7 +7300,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/services/progress_manager.py": [
 0,
@@ -7655,7 +7681,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/services/scheduler_service.py": [
 0,
@@ -7833,7 +7860,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/services/sentiment_service.py": [
 0,
@@ -8066,7 +8094,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/services/source_service.py": [
 0,
@@ -8344,7 +8373,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/services/storage.py": [
 0,
@@ -8828,7 +8858,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/services/translator_service.py": [
 0,
@@ -9141,7 +9172,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/app/services/vision_service.py": [
 0,
@@ -9445,7 +9477,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/main.py": [
 0,
@@ -9648,7 +9681,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/run_server.py": [
 300,
@@ -9782,13 +9816,13 @@
 513,
 516,
 517,
-553,
 554,
 555,
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/tests/fixtures/login_site.py": [
 172,
@@ -9860,7 +9894,6 @@
 517,
 518,
 519,
-526,
 527,
 528,
 529,
@@ -9872,7 +9905,7 @@
 535,
 536,
 537,
-541,
+538,
 542,
 543,
 544,
@@ -9890,7 +9923,8 @@
 556,
 557,
 558,
-559
+559,
+560
 ],
 "backend/tests/fixtures/tweakers_site/page_0.html": [
 249,
@@ -10500,7 +10534,7 @@
 "backend/app/services/excel_service.py": "d79af7c8ed8d5a9edc4e881474d5e5986690c56c",
 "backend/app/services/llm_service.py": "e3000911d890a2d715dd89ef221270a2de61e8c1",
 "backend/app/services/llm_utils.py": "c83876082f2e2601f8804fa11545109507ea1822",
-"backend/app/services/notify_service.py": "fc53c2c9f2f67c0ca081eb6008cb1db2c83dc107",
+"backend/app/services/notify_service.py": "6e1943e508d751699077ee4e469ce9dba0c1da58",
 "backend/app/services/orchestrator.py": "6af449bf669bc08f2e62c9fd4c9ba36c6e36597c",
 "backend/app/services/post_tree.py": "2a905c6e2c043f0bda4ada1d5be08e1fa077c676",
 "backend/app/services/progress_manager.py": "c9dc5e748a5f85c05d4e9cc2b38b92e3f3514fe6",
@@ -10511,7 +10545,7 @@
 "backend/app/services/translator_service.py": "3b0e0c46e38001e6b3f591c9df0f5be4499f5f43",
 "backend/app/services/vision_service.py": "b1e3f21ac1c141fe77d9f3a9ae6ec489f0207f52",
 "backend/app/utils/__init__.py": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
-"backend/main.py": "baf75e2b8efe2a0dd55317d8f0616cb4f2af2041",
+"backend/main.py": "16ef84a273d4826780e6fdd63a5283acf0590847",
 "backend/run_server.py": "c0f15dbdbb6110d57e2b9218b23023284c47f86c",
 "backend/tests/fixtures/fixture_site.py": "8fe9fe2c1530090aeb4d929a83a196e717c18346",
 "backend/tests/fixtures/golden_tweakers.json": "73f65758ec967801f5f8768b17410adae843614a",
@@ -10527,7 +10561,7 @@
 "backend/tests/test_api.py": "946b5bac29adb4a5823f535f8883f820f318efb6",
 "backend/tests/test_core.py": "b45d3b89c2b11cc5f3a86d4aecd331e47ebf6eb8",
 "backend/tests/test_impact.py": "5dad5fd89344d67fc4248d41543e366ee4cad25d",
-"backend/tests/test_notify.py": "be5c49b60eea18fc6e2cf988e1264303fdc0ba41",
+"backend/tests/test_notify.py": "ae51e8984af87d931f41dd938e4b40e9e33f939f",
 "collectors/facebook_group.js": "c63abc4fa57a2bdb4855394cdadf19f95d91dbfc",
 "collectors/group_feed.js": "f8e255229d63406d201d27576a0a1b0d39ff0733",
 "collectors/lib/auth.js": "07c6f4d382e7d14cf4f145ed7b54e970e6893f7e",

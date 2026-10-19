@@ -3,11 +3,14 @@
 真 SQLite（每条用例一个临时库）、真 HTTP 模型替身（llm_site）、真 SMTP（smtp_site：标准库写的本地邮件服务器，
 TLS 证书现生成）、真路由函数与后台作业。帖子时间按「现在往前几小时」现算，因为邮件的基准就是当前时间。
 """
+import ast
 import asyncio
 import base64
+import inspect
 import ipaddress
 import json
 import os
+import re
 import shutil
 import socket
 import sys
@@ -232,6 +235,22 @@ class TestNotifyConfigEndToEnd(_NotifyBase):
             assert resp.status_code == 400 and word in resp.json()["detail"], (change, resp.text)
         assert self.client.get("/api/v1/notify/config").json()["is_configured"] is False
 
+    def test_no_message_names_a_mail_provider(self):
+        """用户要求「QQ 字样都要去掉」（2026-10-19）：报错和提示里不点名哪家邮箱。
+        坏输入的报错在这里真触发一遍；发信时才有的几句（发件人被拒、服务器不支持加密）本机替身触发不了，
+        就把模块里所有给人看的字符串过一遍 —— 函数说明和注释记的是 QQ 的真实表现，不算"""
+        for change in ({"smtp_host": "  "}, {"username": ""}, {"password": ""}):
+            detail = self.client.put("/api/v1/notify/config", json=self._payload(**change)).json()["detail"]
+            assert not re.search(r"qq", detail, re.I), (change, detail)
+        tree = ast.parse(inspect.getsource(self.notify))
+        docstrings = {id(node.body[0].value) for node in ast.walk(tree)
+                      if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                      and node.body and isinstance(node.body[0], ast.Expr)
+                      and isinstance(node.body[0].value, ast.Constant)}
+        named = [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                 and id(n) not in docstrings and re.search(r"qq", n.value, re.I)]
+        assert named == [], named
+
     def test_without_secret_key_the_password_is_not_saved(self):
         self.cfg.settings.secret_key = ""
         resp = self.client.put("/api/v1/notify/config", json=self._payload())
@@ -358,6 +377,7 @@ class TestNotifySmtpEndToEnd(_NotifyBase):
         with smtp_site.SmtpSite(tls="ssl", password="the-real-code") as site:
             body = self._test_mail(site)
         assert body["success"] is False and "授权码" in body["message"], body
+        assert not re.search(r"qq", body["message"], re.I), body    # 用户要求不点名哪家邮箱
         assert site.messages == []
 
     def test_a_server_that_hangs_up_after_a_rejected_login_still_says_use_the_authorization_code(self):

@@ -84,7 +84,7 @@ class _Handler(socketserver.BaseRequestHandler):
                 lines = ["hyxi-test"]
                 if site.tls == "starttls" and not session["tls"]:
                     lines.append("STARTTLS")
-                lines.append("AUTH PLAIN")
+                lines.append("AUTH PLAIN" if site.auth_failure == "reply" else "AUTH LOGIN PLAIN")
                 for i, item in enumerate(lines):
                     send(("250 " if i == len(lines) - 1 else "250-") + item)
             elif cmd == "STARTTLS" and site.tls == "starttls" and not session["tls"]:
@@ -94,7 +94,25 @@ class _Handler(socketserver.BaseRequestHandler):
                 session["tls"] = True
             elif cmd == "AUTH":
                 mech, _, initial = arg.partition(" ")
-                if mech.upper() != "PLAIN":
+                mech = mech.upper()
+                if mech == "LOGIN" and site.auth_failure == "plain_rejected":
+                    if not initial:
+                        send("334 VXNlcm5hbWU6")    # Username:
+                        initial = r.readline().decode("ascii", "replace").strip()
+                    user = base64.b64decode(initial).decode("utf-8")
+                    send("334 UGFzc3dvcmQ6")        # Password:
+                    password = base64.b64decode(r.readline().strip()).decode("utf-8")
+                    site.auths.append({"user": user, "password": password, "tls": session["tls"], "mech": mech})
+                    if site.password is not None and password != site.password:
+                        send("535 5.7.8 Error: authentication failed")
+                        continue
+                    session["auth"] = user
+                    send("235 2.7.0 Authentication successful")
+                    continue
+                if mech != "PLAIN":
+                    if site.auth_failure == "reject_then_421":
+                        send("421 4.7.0 Too many errors, closing connection")
+                        return
                     send("504 5.5.4 unsupported mechanism")
                     continue
                 if not initial:
@@ -102,8 +120,22 @@ class _Handler(socketserver.BaseRequestHandler):
                     initial = r.readline().decode("ascii", "replace").strip()
                 _, user, password = base64.b64decode(initial).decode("utf-8").split("\0")
                 site.auths.append({"user": user, "password": password, "tls": session["tls"]})
+                if site.auth_failure == "plain_rejected":
+                    send("535 5.7.8 Error: authentication failed")    # 这个账号的 PLAIN 怎么都登不上
+                    continue
                 if site.password is not None and password != site.password:
+                    if site.auth_failure == "hang_up":
+                        return
+                    if site.auth_failure == "temp_fail_then_hang_up":
+                        send("454 4.7.0 Temporary authentication failure")
+                        return
+                    if site.auth_failure == "echo_credentials":
+                        login_form = base64.b64encode(password.encode("utf-8")).decode("ascii")
+                        send(f"535 5.7.8 authentication failed for {initial} ({password}) [{login_form}]")
+                        continue
                     send("535 5.7.8 Error: authentication failed")
+                    if site.auth_failure == "reply_then_hang_up":
+                        return
                     continue
                 session["auth"] = user
                 send("235 2.7.0 Authentication successful")
@@ -149,14 +181,28 @@ class SmtpSite:
     """with SmtpSite(tls="ssl", password="pw") as site: ...
 
     password 不是 None 时只认这个密码，其余一律 535（复刻「QQ 邮箱填了登录密码而不是授权码」）。
+    auth_failure 是密码不对时的表现：
+      reply                   回 535，连接留着（只通告 PLAIN）
+      reply_then_hang_up      回完 535 就挂断
+      hang_up                 一句不回直接挂断
+      temp_fail_then_hang_up  回 454（临时认证失败）就挂断
+      reject_then_421         PLAIN 回 535、连接留着；客户端换别的方式时回 421 再挂断
+      echo_credentials        回 535 时把收到的认证串、密码和密码的 base64（LOGIN 的形式）原样回显
+      plain_rejected          PLAIN 怎么都回 535，LOGIN 照常验密码（复刻「服务器只认其中一种方式」）
+    除 reply 外都像 smtp.qq.com 那样通告 LOGIN 和 PLAIN 两种方式。只有 plain_rejected 真的实现了 LOGIN；
+    其余模式下客户端用 LOGIN 只会收到 504（reject_then_421 是 421 后挂断）。
     messages：每封收到的信 {mail_from, rcpt_to, data, tls, auth}；auths：每次 AUTH 收到的用户名、密码、是否已加密。
     host 默认只听本机；要测「非本机地址」时传 "0.0.0.0"，再从局域网地址连进来。
     """
 
-    def __init__(self, tls: str = "none", password: str = None, host: str = "127.0.0.1"):
+    def __init__(self, tls: str = "none", password: str = None, host: str = "127.0.0.1",
+                 auth_failure: str = "reply"):
         assert tls in ("none", "ssl", "starttls"), tls
+        assert auth_failure in ("reply", "reply_then_hang_up", "hang_up", "temp_fail_then_hang_up",
+                                "reject_then_421", "echo_credentials", "plain_rejected"), auth_failure
         self.tls = tls
         self.password = password
+        self.auth_failure = auth_failure
         self.host = host
         self.messages = []
         self.auths = []

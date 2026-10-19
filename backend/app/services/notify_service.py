@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import base64
 import html
 import ipaddress
 import json
@@ -790,6 +791,48 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
+def _login(server: smtplib.SMTP, user: str, password: str) -> None:
+    """就是 smtplib.login()，只多一处：登录最终失败时，报真正被拒的那一次。
+
+    smtplib.login() 被拒后会换下一种方式再试（服务器只认其中一种时靠这个登上，不能去掉），失败时抛的是最后
+    一次的错，而第一次被拒之后的那次往往说明不了问题：QQ 邮箱拒绝时就挂断，第二次撞上断开的连接，535 被盖成
+    「Connection unexpectedly closed」（用户实测报过）；也有服务器再回个 421 才挂断。所以有 535 先报第一个
+    535，没有就报最后一次被拒（同 smtplib）；从没被拒过就断开的，照实报断开，不猜原因
+    """
+    rejected = []
+    auth = server.auth
+
+    def remember_rejection(*args, **kwargs):
+        try:
+            return auth(*args, **kwargs)
+        except smtplib.SMTPAuthenticationError as e:
+            rejected.append(e)
+            raise
+
+    server.auth = remember_rejection    # login() 逐个方式调的就是它
+    try:
+        server.login(user, password)
+    except (smtplib.SMTPAuthenticationError, smtplib.SMTPServerDisconnected):
+        if rejected:
+            raise next((e for e in rejected if e.smtp_code == 535), rejected[-1]) from None
+        raise
+
+
+def _server_said(e: smtplib.SMTPResponseException, user: str, password: str) -> str:
+    """服务器回复的原话，收成一行、截到 200 字；没说就讲明没说。
+
+    有的服务器拒绝时会回显收到的认证串（PLAIN 的 base64 里就是密码），而这句话会进发送记录、显示在页面上 ——
+    密码只进不出，先抹掉明文和它的两种 base64 形式
+    """
+    said = e.smtp_error.decode("utf-8", "replace") if isinstance(e.smtp_error, bytes) else str(e.smtp_error)
+    for secret in (base64.b64encode(f"\0{user}\0{password}".encode()).decode(),
+                   base64.b64encode(password.encode()).decode(), password):
+        if secret:
+            said = said.replace(secret, "***")
+    said = " ".join(said.split())[:200]
+    return f"服务器原话：{said}" if said else "服务器没有说明原因"
+
+
 def deliver(cfg: dict, msg: EmailMessage) -> None:
     """把信交给 SMTP 服务器（阻塞，调用方放进线程跑）。失败一律抛 NotifyError，消息是能照着改的人话。
 
@@ -813,13 +856,20 @@ def deliver(cfg: dict, msg: EmailMessage) -> None:
                 elif not _is_loopback(host):
                     raise NotifyError(f"SMTP 服务器 {where} 不支持加密连接（STARTTLS）。为了不明文传输密码，"
                                       "请勾选「使用 SSL」并填 SSL 端口（QQ 邮箱是 465）")
-            server.login(cfg["username"], password)
+            _login(server, cfg["username"], password)
             server.send_message(msg)
     except NotifyError:
         raise
     except smtplib.SMTPAuthenticationError as e:
-        raise NotifyError(f"SMTP 登录被拒绝（{e.smtp_code}）：用户名或密码不对。QQ、163 等邮箱这里要填「授权码」"
-                          "而不是登录密码 —— 在邮箱网页版的设置里开启 SMTP 服务后生成") from None
+        # 附上服务器原话：QQ 的 535 不只是密码错，没开 SMTP 服务、登录太频繁也是它
+        said = _server_said(e, cfg["username"], password)
+        if e.smtp_code == 535:
+            # 535 是服务器说凭据不对；QQ 在 SMTP 服务没开、登录太频繁时也回它，所以几种情况都列出来，不说「多半」
+            raise NotifyError(f"SMTP 登录被拒绝（535，服务器认为用户名或密码不对）。{said}。QQ、163 等邮箱这里要填"
+                              "「授权码」而不是登录密码 —— 在邮箱网页版的设置里开启 SMTP 服务后生成；"
+                              "QQ 在 SMTP 服务没开启、登录太频繁时也回 535") from None
+        # 别的码不是「凭据不对」（454 临时失败、504 不支持这种方式……），照实报，不猜
+        raise NotifyError(f"SMTP 登录被拒绝（{e.smtp_code}）。{said}") from None
     except smtplib.SMTPSenderRefused as e:
         raise NotifyError(f"发件人 {cfg['sender']} 被服务器拒绝（{e.smtp_code}）。"
                           "QQ 等邮箱要求发件人邮箱和登录用户名是同一个") from None

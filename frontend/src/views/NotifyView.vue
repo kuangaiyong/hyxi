@@ -255,7 +255,7 @@ function poll() {
         <div class="card-header">📮 发件邮箱（SMTP）</div>
         <div class="form-group">
           <label class="form-label" for="notify-smtp-host">SMTP 服务器</label>
-          <input id="notify-smtp-host" v-model="smtpHost" type="text" class="form-input" placeholder="smtp.qq.com" data-testid="notify-smtp-host" />
+          <input id="notify-smtp-host" v-model="smtpHost" type="text" class="form-input" data-testid="notify-smtp-host" />
         </div>
 
         <div class="flex gap-4">
@@ -277,11 +277,11 @@ function poll() {
 
         <div class="form-group">
           <label class="form-label" for="notify-sender">发件人邮箱</label>
-          <input id="notify-sender" v-model="sender" type="text" class="form-input" placeholder="例如 12345@qq.com" data-testid="notify-sender" />
+          <input id="notify-sender" v-model="sender" type="text" class="form-input" data-testid="notify-sender" />
         </div>
         <div class="form-group">
           <label class="form-label" for="notify-username">用户名</label>
-          <input id="notify-username" v-model="username" type="text" class="form-input" placeholder="QQ 邮箱填完整的邮箱地址" autocomplete="off" data-testid="notify-username" />
+          <input id="notify-username" v-model="username" type="text" class="form-input" autocomplete="off" data-testid="notify-username" />
         </div>
         <div class="form-group">
           <label class="form-label" for="notify-password">密码 / 授权码</label>
@@ -290,7 +290,7 @@ function poll() {
             v-model="password"
             type="password"
             class="form-input"
-            :placeholder="hasPassword ? '已保存，留空则不修改' : 'QQ、163 等邮箱填授权码'"
+            :placeholder="hasPassword ? '已保存，留空则不修改' : ''"
             autocomplete="new-password"
             data-testid="notify-password"
           />

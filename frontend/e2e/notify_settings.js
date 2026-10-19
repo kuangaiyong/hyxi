@@ -2,12 +2,13 @@
  * 「邮件通知」页 —— 真 Chrome、真前后端、真 SMTP（脚本自带一个本机收件端），无 mock。
  *
  * 守的是用户在这一页上的整段操作：
- *   1. 侧栏点得进来，标题对；配置卡片里不放说明文字（用户要求，保存后开着定时再查一次）
+ *   1. 侧栏点得进来，标题对；配置卡片里不放说明文字（用户要求，保存后开着定时再查一次）；
+ *      输入框的占位提示里没有 QQ 之类的邮箱厂商信息（用户要求）
  *   2. 填好表单点「发送测试邮件」：收件端真的收到了，登录用的就是页面上填的用户名和密码
  *   3. 保存后刷新：填的都还在；密码框是空的、提示「已保存」；任何一次读配置的响应里都没有密码
  *   4. 改了没保存时「立即发送」点不了（它用的是已保存的配置，免得用户以为发的是眼前这份）
  *   5. 点「立即发送」：按数据走三条路之一，每条都有硬断言 ——
- *      已发送（收件端收到、标题和发送记录一致）/ 没有新回复（明说、没发信）/ 失败（明说、没发信）
+ *      已发送（收件端收到、标题和发送记录一致）/ 没有新内容（明说、没发信）/ 失败（明说、没发信）
  *   6. 开了每天定时，发送记录里显示下次发送时间
  *
  * 收件端只听 127.0.0.1、不加密：后端对本机中继允许不加密登录，对外部服务器不允许（后端用例守那一条）。
@@ -218,6 +219,11 @@ async function main() {
         await page.locator('[data-testid="notify-source"]').first().waitFor();
         const stray = await strayText(page);
         check('配置卡片里只有标题、字段和按钮，没有说明文字', stray.length === 0, stray);
+        // 用户要求：输入框里不要出现 QQ 之类的邮箱厂商信息（占位提示也算）
+        const vendor = await page.$$eval('.card input, .card textarea', (els) => els
+            .map((e) => e.getAttribute('placeholder') || '')
+            .filter((p) => /qq|163|126|foxmail|sina|aliyun|gmail|outlook|hotmail|yahoo/i.test(p)));
+        check('输入框里没有 QQ 之类的邮箱厂商信息', vendor.length === 0, vendor);
 
         console.log('\n场景二：填表、发送测试邮件，收件端真的收到');
         await byId(page, 'notify-recipients').fill(RECIPIENTS.join('\n'));
@@ -296,7 +302,8 @@ async function main() {
             check('标题写明数据源和时间窗口', status.last.subject.includes(source.name)
                 && status.last.subject.includes('近 3 天'), status.last.subject);
         } else if (status.last.outcome === 'skipped') {
-            check('明说近 3 天没有新回复', /近 3 天没有新回复/.test(message), message);
+            // 两种「没新内容」：窗口里一条都没有；或者窗口里的前几封都发过（v1.15.0 起不再重发一封全是「已发过」的信）
+            check('明说近 3 天没有（首次出现的）新回复', /近 3 天没有(首次出现的)?新回复/.test(message), message);
             check('没有发信', newMails.length === 0, newMails.length);
         } else {
             check('失败时明说没有发送', /没有发送|失败/.test(message), message);

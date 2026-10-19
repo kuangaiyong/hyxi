@@ -4,6 +4,7 @@
 TLS 证书现生成）、真路由函数与后台作业。帖子时间按「现在往前几小时」现算，因为邮件的基准就是当前时间。
 """
 import asyncio
+import base64
 import ipaddress
 import json
 import os
@@ -358,6 +359,69 @@ class TestNotifySmtpEndToEnd(_NotifyBase):
             body = self._test_mail(site)
         assert body["success"] is False and "授权码" in body["message"], body
         assert site.messages == []
+
+    def test_a_server_that_hangs_up_after_a_rejected_login_still_says_use_the_authorization_code(self):
+        """用户在 QQ 邮箱上实测报过「SMTP 发送失败（smtp.qq.com:465）：Connection unexpectedly closed」（2026-10-18），
+        照着这句话什么也改不了。smtp.qq.com 通告 LOGIN 和 PLAIN 两种登录方式（本机探测过）；
+        报错不带「: timed out」，说明是对面主动断开。smtplib 先试 PLAIN，被拒（535）后连接断了，
+        它照样换 LOGIN 再试，撞上已断开的连接，抛出的错就把 535 盖住了。
+        断言里要有 535 和服务器原话：只说「授权码」的话，分不出是真收到了 535，还是把断开一律当成密码错"""
+        import smtp_site
+        with smtp_site.SmtpSite(tls="ssl", password="the-real-code", auth_failure="reply_then_hang_up") as site:
+            body = self._test_mail(site)
+        msg = body["message"]
+        assert body["success"] is False and "授权码" in msg and "535" in msg and "authentication failed" in msg, body
+        assert len(site.auths) == 1 and site.messages == [], site.auths
+
+    def test_a_server_that_hangs_up_without_a_reply_is_not_called_a_wrong_password(self):
+        """没收到 535 就断开（限流、服务器重启、网络断了），说不清原因就照实报断开 —— 说成「密码不对」
+        会把用户支去换授权码，换了照样失败"""
+        import smtp_site
+        with smtp_site.SmtpSite(tls="ssl", password="the-real-code", auth_failure="hang_up") as site:
+            body = self._test_mail(site)
+        msg = body["message"]
+        assert body["success"] is False and "Connection unexpectedly closed" in msg, body
+        assert "授权码" not in msg and "密码" not in msg, body
+
+    def test_a_rejection_other_than_535_is_not_called_a_wrong_password(self):
+        """只有 535 才是「凭据不对」。454（临时失败）、504（不支持这种方式）之类说成密码错，人会去换授权码，换了照样失败"""
+        import smtp_site
+        with smtp_site.SmtpSite(tls="ssl", password="the-real-code", auth_failure="temp_fail_then_hang_up") as site:
+            body = self._test_mail(site)
+        msg = body["message"]
+        assert body["success"] is False and "454" in msg and "Temporary authentication failure" in msg, body
+        assert "授权码" not in msg and "密码" not in msg, body
+
+    def test_a_535_is_not_hidden_by_a_later_rejection(self):
+        """第一种方式回 535，换第二种时服务器回 421 再挂断：smtplib 抛的是最后那个 421，真正的原因又被盖住"""
+        import smtp_site
+        with smtp_site.SmtpSite(tls="ssl", password="the-real-code", auth_failure="reject_then_421") as site:
+            body = self._test_mail(site)
+        msg = body["message"]
+        assert body["success"] is False and "535" in msg and "authentication failed" in msg, body
+        assert "421" not in msg, body
+
+    def test_a_server_echoing_the_credentials_never_puts_the_password_in_the_message(self):
+        """提示里附服务器原话。有的服务器拒绝时会回显收到的认证串（base64 里就是密码），
+        而这句提示会进发送记录、显示在页面上 —— 密码只进不出"""
+        import smtp_site
+        with smtp_site.SmtpSite(tls="ssl", password="the-real-code", auth_failure="echo_credentials") as site:
+            body = self._test_mail(site)
+        msg = body["message"]
+        plain = base64.b64encode(f"\0hyxi@example.test\0{PASSWORD}".encode()).decode()
+        login_form = base64.b64encode(PASSWORD.encode()).decode()
+        assert body["success"] is False and "535" in msg and "authentication failed" in msg, body
+        assert PASSWORD not in msg and plain not in msg and login_form not in msg, body
+
+    def test_a_server_that_only_accepts_the_second_login_method_still_lets_us_in(self):
+        """smtplib 被拒后换下一种方式再试，服务器只认其中一种时就靠它登上 —— 修 535 被盖住时不能把这个回退一起去掉
+        （评审时否掉过「只试一种方式」的写法，就是因为它）"""
+        import smtp_site
+        with smtp_site.SmtpSite(tls="ssl", password=PASSWORD, auth_failure="plain_rejected") as site:
+            body = self._test_mail(site)
+        assert body["success"] is True, body
+        assert [a.get("mech", "PLAIN") for a in site.auths] == ["PLAIN", "LOGIN"], site.auths
+        assert len(site.messages) == 1
 
     def test_an_unreachable_server_says_where_it_tried(self):
         with socket.socket() as s:

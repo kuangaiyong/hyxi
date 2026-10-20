@@ -1,7 +1,9 @@
 """邮件通知 —— 把所选数据源近 N 天的新回复（原文 + 译文）发到收件人邮箱。
 
 「新回复」和结果页「只看新回复」是同一个判据（post_tree.mark_fresh_replies），只是基准换成当前时间：
-结果页要的是报告隔多久打开都自洽，邮件要的是「这段时间里有什么新的」。邮件只读已采集的数据，不触发采集。
+结果页要的是报告隔多久打开都自洽，邮件要的是「这段时间里有什么新的」。
+发送前先看所选数据源今天有没有成功采集翻译过，没有就自动发起「采集 + 翻译」任务，跑完再挑新回复
+（每天定时一律如此；手动发送由页面的确认框决定）。
 
 配置存 app_config：`notify.settings`（JSON）+ `notify.password_enc`（SMTP 密码的密文。同数据源凭据：
 加密落库、只进不出）。最近一次发送的结果存 `notify_status.last`，页面靠它看到定时发送发没发成。
@@ -18,6 +20,7 @@ import re
 import smtplib
 import ssl
 import time
+import uuid
 from datetime import datetime, timedelta
 from email.errors import HeaderParseError
 from email.headerregistry import Address
@@ -31,7 +34,9 @@ from apscheduler.triggers.cron import CronTrigger
 
 from app.collectors import get_collector
 from app.collectors.base import Collector
+from app.config import settings
 from app.logging_config import get_logger
+from app.models import TaskStatus
 from app.services import crypto, source_service, storage
 from app.services.orchestrator import _BackfillProgress, _refresh_translations, orchestrator
 from app.services.post_tree import (
@@ -65,6 +70,13 @@ CLAIM_OWNER = "notify"
 # 同一来源正被别人翻译时最多等多久（任务超时的默认值也是 30 分钟）
 CLAIM_WAIT_SECONDS = 30 * 60
 SMTP_TIMEOUT = 30
+# 发送前自动发起的「采集 + 翻译」任务打的 scheduled_by 标记：任务列表里认得出是谁发起的
+AUTO_TASK_OWNER = "notify"
+# 等任务时多久看一次它的状态
+POLL_SECONDS = 0.5
+# 每天定时发送先让几秒，等同一时刻触发的定时采集把任务建出来（见 scheduled_send）
+SCHEDULE_GRACE_SECONDS = 2
+_UNFINISHED = (TaskStatus.PENDING, TaskStatus.PARSING, TaskStatus.RUNNING)
 
 _DEFAULTS = {
     "recipients": [], "source_ids": [], "days": None,
@@ -77,7 +89,7 @@ _EMAIL = re.compile(r'^[^@\s,;<>"]+@[^@\s,;<>"]+\.[^@\s,;<>"]+$')
 _HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 # 同一时刻只跑一轮。用普通字典不用 asyncio.Lock，理由同 orchestrator._translation_claims
-_state: Dict[str, Optional[str]] = {"running": None, "progress": ""}
+_state: Dict[str, Optional[str]] = {"running": None, "progress": "", "task_id": None}
 # asyncio 只弱引用任务，「立即发送」的后台作业要留强引用（同 orchestrator._backfill_jobs）
 _jobs: set = set()
 
@@ -253,20 +265,24 @@ def _next_run(scheduler) -> Optional[str]:
 
 async def scheduled_send() -> None:
     """APScheduler 回调。**必须是模块级函数**：job 存在库里，重启后靠「模块:函数名」找回来"""
+    # 定时采集设在同一时刻时，两个回调同时触发、谁先跑说不准：先让一让，等那边把任务建出来，
+    # 下面「先等正在运行的任务」才看得见它 —— 不然同一个来源会被采两遍，真站的请求量翻倍
+    await asyncio.sleep(SCHEDULE_GRACE_SECONDS)
     if not _begin():
         logger.warning("上一轮邮件还在发送，跳过这次定时发送")
         return
-    await _run("schedule")
+    await _run("schedule", collect=True)     # 每天定时一律先补采，不弹框（用户定的）
 
 
-def start_send() -> bool:
+def start_send(collect: bool = False) -> bool:
     """「立即发送」：起后台作业，立刻返回。已有一轮在跑就返回 False。
+    collect 是页面确认框里的选择：先把今天还没采集翻译过的数据源采一遍再发，还是直接用已有数据发
 
     运行标记必须在这里**同步**置上（同 start_backfill_translation）：等协程被调度起来再置的话，连点两下会起出两轮
     """
     if not _begin():
         return False
-    job = asyncio.create_task(_run("manual"))
+    job = asyncio.create_task(_run("manual", collect))
     _jobs.add(job)
     job.add_done_callback(_jobs.discard)
     return True
@@ -284,16 +300,25 @@ def status(scheduler=None) -> dict:
     return {
         "running": bool(_state["running"]),
         "progress": _state["progress"] if _state["running"] else "",
+        "task_id": _state["task_id"] if _state["running"] else None,
         "last": json.loads(raw["last"]) if raw.get("last") else None,
         "next_run": _next_run(scheduler if scheduler is not None else _global_scheduler()),
     }
 
 
-async def _run(trigger: str) -> dict:
-    """跑一轮并记下结果。后台作业和定时回调的异常没人接，这里一律变成一条 failed 记录"""
+async def _run(trigger: str, collect: bool = False) -> dict:
+    """跑一轮并记下结果。collect=True 时先补采今天还没采集翻译过的数据源，补采没成功就不发（用户定的）。
+    后台作业和定时回调的异常没人接，这里一律变成一条 failed 记录"""
     started = datetime.now()
+    task_ids: List[str] = []
     try:
-        result = await _send_digest(started)
+        failure = await _ensure_fresh(task_ids) if collect else None
+        if failure:
+            result = {"outcome": "failed", "message": f"{failure}，这次没有发送邮件"}
+        else:
+            _state["progress"] = "正在挑选新回复"
+            # 基准取补采之后的「现在」：补采那几分钟里发表的回复也算进窗口
+            result = await _send_digest(datetime.now())
     except Exception as e:
         logger.exception("邮件通知发送失败")
         result = {"outcome": "failed", "message": str(e)}
@@ -301,14 +326,109 @@ async def _run(trigger: str) -> dict:
         "trigger": trigger,
         "started_at": started.isoformat(timespec="seconds"),
         "finished_at": datetime.now().isoformat(timespec="seconds"),
+        "task_ids": task_ids,
         **result,
     }
     try:
         storage.set_app_config(STATUS_PREFIX, {"last": json.dumps(record, ensure_ascii=False)})
     finally:
-        _state.update(running=None, progress="")
+        _state.update(running=None, progress="", task_id=None)
     logger.info("邮件通知（%s）：%s %s", trigger, record["outcome"], record.get("message", ""))
     return record
+
+
+# ===== 发送前补采 =====
+
+def _done_today(task: dict, source_id: str, today) -> bool:
+    """今天 0 点以后成功完成、既采集了这个来源又做了翻译的任务（用户定的口径）。失败、取消、只采集没翻译的都不算"""
+    finished = task.get("completed_at")
+    if task.get("status") != TaskStatus.COMPLETED or not isinstance(finished, datetime) or finished.date() != today:
+        return False
+    steps = task.get("plan") or []
+    collected = any(s.get("action") == "collect" and s.get("status") == "completed"
+                    and (s.get("params") or {}).get("source_id") == source_id for s in steps)
+    return collected and any(s.get("action") == "translate" and s.get("status") == "completed" for s in steps)
+
+
+def _stale(sources: List[dict]) -> List[dict]:
+    """今天还没采集翻译过、要先采的。停用的数据源任务不碰它（用户定的），邮件里照用它已有的帖子"""
+    today = datetime.now().date()
+    tasks = list(orchestrator.tasks.values())
+    return [s for s in sources if s.get("enabled", True) and not any(_done_today(t, s["id"], today) for t in tasks)]
+
+
+def _selected_sources() -> List[dict]:
+    """配置里勾选、而且还在的数据源"""
+    registry = {s["id"]: s for s in source_service.list_sources()}
+    return [registry[sid] for sid in load_config()["source_ids"] if sid in registry]
+
+
+def _brief(source: dict) -> dict:
+    collector = _collector(source)
+    return {"id": source["id"], "name": source["name"],
+            "collector_name": collector.display_name if collector else source["collector_id"]}
+
+
+def precheck() -> dict:
+    """点「立即发送」前问一句：所选的（启用的）数据源里哪些今天还没采集翻译过，页面据此弹确认框"""
+    return {"stale": [_brief(s) for s in _stale(_selected_sources())]}
+
+
+async def _ensure_fresh(task_ids: List[str]) -> Optional[str]:
+    """今天还没成功采集翻译过的（启用的）数据源，各发起一个「采集 + 翻译」任务并等它跑完。
+    一个来源一个任务，失败了说得清是哪个。发起的任务号追加进 task_ids；有一个没成功就返回原因"""
+    minutes = settings.task_timeout_minutes
+    if not _stale(_selected_sources()):
+        return None      # 所选的今天都采集翻译过：不用补采，也不用等别的任务（评审发现）
+    # 先等正在排队、运行的任务：定时采集刚好在跑时，等它跑完它就算今天采过，不再重复采一遍。
+    # 任务还在解析阶段时看不出它采哪个来源，只能一律等
+    waited = 0.0
+    while any(t.get("status") in _UNFINISHED for t in orchestrator.tasks.values()):
+        if waited >= minutes * 60:
+            # 等到头了还有没跑完的就别再发起：它可能正采着同一个来源，再起一个就是把真站采两遍（评审发现）
+            return f"等了 {minutes} 分钟还有任务没跑完，没有补采"
+        _state["progress"] = "等待正在运行的任务结束"
+        await asyncio.sleep(POLL_SECONDS)
+        waited += POLL_SECONDS
+    # 前一个来源可能采了几十分钟，这期间被停用、被删掉的来源：任务执行时只认启用的来源（execute_task 对给定计划
+    # 也照样校验），会以「已停用或已删除」失败，这一轮按规则不发
+    for source in _stale(_selected_sources()):
+        task_id = str(uuid.uuid4())
+        orchestrator.create_task(
+            task_id, f"邮件通知自动发起：采集并翻译「{source['name']}」",
+            # source_name 只给任务列表显示用（同 _resolve_sources 补的那个）
+            plan=[{"action": "collect", "params": {"source_id": source["id"], "source_name": source["name"]}},
+                  {"action": "translate", "params": {"target_lang": "zh-CN"}}],
+            scheduled_by=AUTO_TASK_OWNER,
+        )
+        task_ids.append(task_id)
+        _state["task_id"] = task_id
+        orchestrator.run_task_async(task_id)
+        task = await _wait_task(task_id, source["name"], 2 * minutes * 60)
+        if task.get("status") != TaskStatus.COMPLETED:
+            if task.get("status") in _UNFINISHED:
+                # 超时了就别让它接着跑：这一轮不发，它采回来、翻好的没人用，还要付翻译费（评审发现）
+                orchestrator.cancel_task(task_id)
+                reason = f"超过 {2 * minutes} 分钟还没跑完，已取消"
+            elif task.get("status") == TaskStatus.CANCELLED:
+                reason = "任务被取消"
+            else:
+                reason = task.get("error_message") or "任务失败"
+            return f"自动采集「{source['name']}」没成功：{reason}（任务 {task_id[:8]}）"
+    _state["task_id"] = None
+    return None
+
+
+async def _wait_task(task_id: str, name: str, timeout: float) -> dict:
+    """等任务进入终态（或超时），一边把它进行到哪一步报给页面"""
+    waited = 0.0
+    while True:
+        task = orchestrator.get_task(task_id) or {}
+        if task.get("status") not in _UNFINISHED or waited >= timeout:
+            return task
+        _state["progress"] = f"正在采集并翻译「{name}」：{task.get('current_step') or '排队等待中'}"
+        await asyncio.sleep(POLL_SECONDS)
+        waited += POLL_SECONDS
 
 
 def _raw_anchors() -> Dict[str, str]:

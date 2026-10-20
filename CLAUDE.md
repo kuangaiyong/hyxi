@@ -237,7 +237,8 @@ submit 按钮、Arkose 人机验证）、小组页 DOM 实测结论，以及已�
 - `/api/v1/tasks/{id}/sentiment`、`/export` —— 舆情结论与导出（导出只有这一个口）
 - `/api/v1/sources*` —— 数据源增删改查、`authorize` 人工登录、凭据（写入即加密，只出不进）
 - `/api/v1/schedules*`、`/api/v1/config*`、`/api/v1/media/{path}` —— 定时任务、LLM 配置、正文图
-- `/api/v1/notify/*` —— 邮件通知：`config`（GET / PUT / DELETE）、`test` 测试邮件、`send` 立即发送（后台跑）、`status`
+- `/api/v1/notify/*` —— 邮件通知：`config`（GET / PUT / DELETE）、`test` 测试邮件、`precheck`（哪些数据源今天还没采集翻译过）、
+  `send` 立即发送（后台跑，`{"collect": true}` 先补采）、`status`
 
 ## 任务流水线
 
@@ -255,7 +256,10 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 - **LLM 只输出 `source_id`**，采集参数全部来自数据源自己，模型碰不到任何一个平台参数；
   起始页与「要采哪些来源」同样不由 LLM 最终决定
 - 新建任务、`POST /tasks/{id}/retry`、定时任务三条入口都走 `run_task_async` → `execute_task`，
-  规则对三者一致生效
+  规则对三者一致生效。第四个入口是邮件通知发送前的补采（`notify_service._ensure_fresh`）：同样走这两步，
+  但用**给定的计划**（`create_task(..., plan=..., scheduled_by="notify")`，只有采集 + 翻译），`execute_task` 见到预置计划
+  就跳过模型解析 —— 计划是代码定的，模型碰不到，也就不会被多加步骤。来源照样只认已启用的（停用、删除的直接失败），
+  在任务页重跑这种任务时沿用原计划
 
 展开约定（进度自报格式、prompt 的正反例、sentiment 判定实测）见 `Skill(hyxi-architecture)`。
 
@@ -272,7 +276,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 
 ## 测试
 
-**561 个测试，交付前必须全部 PASSED**（本机实测 `test_impact.py build` 561 条全过，2026-10-19，790 秒）。但**全量只在最后一次代码改动之后跑一次**
+**576 个测试，交付前必须全部 PASSED**（本机实测 `test_impact.py build` 576 条全过，2026-10-20，865 秒）。但**全量只在最后一次代码改动之后跑一次**
 —— 质量红线的另一半是：它之前的每一轮改动，都要跑到受影响的范围。
 
 ### 什么时候跑什么（在仓库根目录）
@@ -281,7 +285,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 |---|---|---|---|
 | 写用例、红 → 绿 → 反向验证 | 那一两条 | `pytest backend\tests\test_core.py::TestX::test_y` | 秒级~1 分钟 |
 | 一轮修改收尾 | 受影响的用例 | `python scripts\test_impact.py run` | 改舆情服务：151 条 **46 秒**；改采集脚本：82 条 9 分 40 秒（其中 54 条浏览器，省不掉） |
-| 想先要个快信号 | 快道（不起浏览器的 503 条） | `pytest backend\tests -m "not browser" -n 3 --dist loadgroup` | **48 秒**（当时 407 条） |
+| 想先要个快信号 | 快道（不起浏览器的 515 条） | `pytest backend\tests -m "not browser" -n 3 --dist loadgroup` | **48 秒**（当时 407 条） |
 | **交付前（最后一次代码改动之后）** | 全量 + 刷新映射 | `python scripts\test_impact.py build` | 约 12 分钟，全过才写映射，和代码一起提交 |
 | 只要全量结论、不刷映射 | 全量 | `pytest backend\tests -n 3 --dist loadgroup` | **10 分 30 秒左右**（连跑 3 轮 10:30 / 10:29 / 12:02；串行 31 分钟） |
 
@@ -311,7 +315,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 | `access_key_flow.js` | `npm run e2e:key` | 被 401 挡住后照提示填服务访问密钥：找得到、首屏可见、填错明说、填对当场生效 |
 | `results_thread_structure.js` | `npm run e2e:thread` | 回复全部展开且顺序同原帖、层级缩进与「回复 某某」、「已采 X · 原帖 Y」对账（没有第 2 层回复的数据时退出码 2） |
 | `results_backfill_translation.js` | `npm run e2e:backfill` | 补译提示条：N 与 `/stats`、出口三处一致；没待补译时不显示；`E2E_BACKFILL_CLICK=1` 才点按钮（真调模型） |
-| `notify_settings.js` | `npm run e2e:notify` | 邮件通知页：配置卡片里不放说明文字、占位提示里不带 QQ 等厂商信息（都是用户要求）、测试邮件真到达脚本自带的本机 SMTP 收件端、保存刷新后都在且密码读不回、改了没保存不许「立即发送」、立即发送三种结局各有硬断言；已有配置时退出码 2（密码只进不出，覆盖了还原不回），收尾调接口清除 |
+| `notify_settings.js` | `npm run e2e:notify` | 邮件通知页：配置卡片里不放说明文字、占位提示里不带 QQ 等厂商信息（都是用户要求）、测试邮件真到达脚本自带的本机 SMTP 收件端、保存刷新后都在且密码读不回、改了没保存不许「立即发送」、今天没采集翻译过所选数据源时必须弹确认框（由 `/precheck` 决定弹不弹；开发库的真数据源上**绝不点「先采集再发送」**，那一步改用临时建的、指向本机死端口的数据源来点，补采必然失败、不发信）、立即发送三种结局各有硬断言；已有配置时退出码 2（密码只进不出，覆盖了还原不回），收尾调接口清除 |
 
 真 Chrome、真前后端、无 mock，**要求两个服务都起着**（先跑 `.\start.ps1`），所以它们
 进不了 pytest。都自己从 `/tasks` 里挑任务，不写死任何 ID；密钥从项目根 `.env` 读。
@@ -319,6 +323,9 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 `start.ps1` 会跳过启动直接验证，于是 E2E 跑的还是改动前那份代码（实测踩过）。
 `e2e:stale` 是例外，它要的是**单端口形态**：`npm run build` 后把 `frontend/dist`
 拷成项目根的 `web/`，再让后端跑在 8000 上；条件不满足时它以退出码 2 说明原因。
+
+**E2E 里「出现了就断言、没出现就跳过」的分支，在旧代码上恒绿。** 该不该出现要先问接口，再断言它出没出现：
+`e2e:link` 的场景二之二、`e2e:notify` 的确认框都这样踩过（后者先查 `/precheck`，有要补采的数据源就**必须**弹框）。
 
 **整套 E2E 都是「打开一个全新页面 → 操作 → 断言」，唯独 `e2e:stale` 覆盖
 「页面已经开着、服务端变了」。** 那一类失败的共同特征是**静默** —— 不崩溃、不报错、

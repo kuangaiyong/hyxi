@@ -178,19 +178,24 @@ class TaskOrchestrator:
         except Exception as e:
             logger.error("持久化任务列表失败: %s", str(e))
 
-    def create_task(self, task_id: str, description: str, force_full: bool = False):
+    def create_task(self, task_id: str, description: str, force_full: bool = False,
+                    plan: Optional[List[dict]] = None, scheduled_by: Optional[str] = None):
         """注册新任务。
 
         force_full=True 时这一轮忽略全部增量标记：重新采集、重新翻译、重新分析舆情，
         配图也重新下载。只有「全量重跑」那个按钮会给 True —— 新建任务和定时任务
         一律走增量，否则每一轮定时都在重复付翻译和舆情的钱。
+
+        plan 给了就是代码定好的计划（邮件通知发送前的「采集 + 翻译」），执行时不交给模型解析：
+        不花一次解析的钱，也不会被模型多加「导出 Excel」「舆情」之类的步骤。scheduled_by 记谁发起的
         """
         self.tasks[task_id] = {
             "id": task_id,
             "status": TaskStatus.PENDING,
             "description": description,
             "force_full": bool(force_full),
-            "plan": [],
+            "plan": [dict(step, status="pending") for step in plan or []],
+            "_preset_plan": bool(plan),
             "progress": 0.0,
             "current_step": None,
             "result": None,
@@ -200,6 +205,8 @@ class TaskOrchestrator:
             "started_at": None,
             "completed_at": None,
         }
+        if scheduled_by:
+            self.tasks[task_id]["scheduled_by"] = scheduled_by
         self._persist()
 
     def get_task(self, task_id: str) -> Optional[dict]:
@@ -261,34 +268,45 @@ class TaskOrchestrator:
             if not llm_service:
                 raise Exception("请先配置 LLM API")
 
-            # ===== Step 0: 意图解析 =====
-            task["current_step"] = "解析任务意图"
-            self._persist()
-            await progress_manager.emit(task_id, "step_start", {
-                "step": -1,
-                "action": "parse_intent",
-                "message": "正在调用 LLM 解析任务意图...",
-            })
-
             enabled_sources = source_service.list_sources(enabled_only=True)
             for s in enabled_sources:
                 s["collector_name"] = get_collector(s["collector_id"]).display_name
 
-            plan_data = await llm_service.parse_intent(task["description"], enabled_sources)
+            if task.get("_preset_plan"):
+                # 代码定好的计划（见 create_task），不交给模型解析。来源照样只认已启用的（同 _resolve_sources）：
+                # 停用的意思就是任务不碰它，排队这会儿被停用、被删掉的都不采
+                plan = [PlanStep(**s) for s in task["plan"]]
+                valid = {s["id"] for s in enabled_sources}
+                gone = [s.params.get("source_id") for s in plan
+                        if s.action == "collect" and s.params.get("source_id") not in valid]
+                if gone:
+                    raise Exception(f"给定计划里的数据源已停用或已删除：{'、'.join(map(str, gone))}")
+                await self._task_log(task_id, "info", f"使用给定的计划，共 {len(plan)} 个步骤，不经模型解析")
+            else:
+                # ===== Step 0: 意图解析 =====
+                task["current_step"] = "解析任务意图"
+                self._persist()
+                await progress_manager.emit(task_id, "step_start", {
+                    "step": -1,
+                    "action": "parse_intent",
+                    "message": "正在调用 LLM 解析任务意图...",
+                })
 
-            plan = [PlanStep(**s) for s in plan_data.get("plan", [])]
-            plan, source_warnings = _resolve_sources(task, plan, enabled_sources)
-            for w in source_warnings:
-                await self._task_log(task_id, "warning", w)
-            task["plan"] = [s.model_dump() for s in plan]
-            self._persist()
+                plan_data = await llm_service.parse_intent(task["description"], enabled_sources)
 
-            await progress_manager.emit(task_id, "step_complete", {
-                "step": -1,
-                "action": "parse_intent",
-                "plan": [s.model_dump() for s in plan],
-                "message": f"解析完成，共 {len(plan)} 个步骤",
-            })
+                plan = [PlanStep(**s) for s in plan_data.get("plan", [])]
+                plan, source_warnings = _resolve_sources(task, plan, enabled_sources)
+                for w in source_warnings:
+                    await self._task_log(task_id, "warning", w)
+                task["plan"] = [s.model_dump() for s in plan]
+                self._persist()
+
+                await progress_manager.emit(task_id, "step_complete", {
+                    "step": -1,
+                    "action": "parse_intent",
+                    "plan": [s.model_dump() for s in plan],
+                    "message": f"解析完成，共 {len(plan)} 个步骤",
+                })
 
             if not plan:
                 raise Exception("无法解析任务意图，请更详细地描述您的需求。")
@@ -529,22 +547,27 @@ class TaskOrchestrator:
                     for sid, m in sources_meta.items()
                 ],
             }
-            task["status"] = TaskStatus.COMPLETED
+            # 中途被取消的保持「已取消」：cancel_task 已经置过状态，这里改成 completed 就把取消抹掉了，
+            # 任务列表上看着像跑完了，邮件通知判「今天采过没有」时也会把它当成采过（取消的不算）
+            cancelled = bool(task.get("_cancelled"))
+            task["status"] = TaskStatus.CANCELLED if cancelled else TaskStatus.COMPLETED
             self._persist()
 
             await progress_manager.emit(task_id, "task_complete", {
                 "task_id": task_id,
-                "status": "completed",
+                "status": "cancelled" if cancelled else "completed",
                 "result": task["result"],
             })
 
         except Exception as e:
-            task["status"] = TaskStatus.FAILED
+            # 已经被取消的，手头那一步随后抛了异常（采集器不看取消标记，照样跑完、跑挂）也还是「已取消」
+            cancelled = bool(task.get("_cancelled"))
+            task["status"] = TaskStatus.CANCELLED if cancelled else TaskStatus.FAILED
             task["error_message"] = str(e)
             self._persist()
             await progress_manager.emit(task_id, "task_complete", {
                 "task_id": task_id,
-                "status": "failed",
+                "status": "cancelled" if cancelled else "failed",
                 "error": str(e),
             })
             await progress_manager.emit(task_id, "error", {

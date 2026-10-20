@@ -66,6 +66,7 @@ BROWSER_CLASSES = {
     "TestTweakersCollectorGoldenEndToEnd",
     "TestGroupFeedCollectorEndToEnd",
     "TestThreadDialogExtractionEndToEnd",
+    "TestNotifyAutoCollectEndToEnd",
 }
 
 

@@ -44,6 +44,14 @@ def post(fp, user, hours_ago, content, translation="", parent=None, level=0, src
     }
 
 
+def collect_step(src, status="completed"):
+    return ("collect", {"source_id": src}, status)
+
+
+def translate_step(status="completed"):
+    return ("translate", {"target_lang": "zh-CN"}, status)
+
+
 def lan_ip() -> str:
     """本机一个非回环的 IPv4（用来模拟「远端」SMTP 服务器）。没有就返回空串"""
     try:
@@ -74,6 +82,10 @@ class _NotifyBase:
         self.client = TestClient(app)
         self.notify = notify_service
         self.orchestrator = orchestrator
+        # 编排器是进程里的单例：本条用例放进去的、自动发起的任务收尾时都要清掉，不然连累同一进程的下一条
+        self._tasks_before = set(orchestrator.tasks)
+        # 这两个数据源挂的是真采集器（Facebook / Tweakers）。会触发发送前补采的用例（每天定时、collect=True）
+        # 必须先 _mark_collected_today，否则补采会真的去连外网 —— 现在没配模型时任务在第一步前就失败了，别指望它
         storage.save_source({"id": FB, "name": "HYXi 用户群", "collector_id": "facebook_group",
                              "params": {"group_id": "123"}, "enabled": True,
                              "created_at": "2026-10-01T09:00:00"})
@@ -84,9 +96,12 @@ class _NotifyBase:
     def teardown_method(self):
         from app.services.scheduler_service import scheduler_service
         # 用例失败时作业可能没走到收尾；进程里的单例不清掉会连累同一 worker 的下一条
-        self.notify._state.update(running=None, progress="")
+        self.notify._state.update(running=None, progress="", task_id=None)
         for sid in (FB, TW):
             self.orchestrator._translation_claims.pop(sid, None)
+        for tid in set(self.orchestrator.tasks) - self._tasks_before:
+            self.orchestrator.tasks.pop(tid, None)
+            self.orchestrator._running_tasks.discard(tid)
         self.notify._remove_job(scheduler_service.scheduler)
         (self.cfg.settings.api_key, self.cfg.settings.secret_key,
          self.cfg.settings.data_dir, self.storage.DB_PATH) = self._old
@@ -142,6 +157,27 @@ class _NotifyBase:
             post("f2", "u_f2", 20, "F2-orig", "F2-zh", src=TW),
             post("f3", "u_f3", 2 * 24, "F3-orig", "F3-zh", src=TW),
         ])
+
+    def _task(self, tid, status, finished, steps, created=None):
+        """往编排器里放一条任务记录，形状同 _load_tasks 从库里读回来的（plan 是带 status 的步骤列表）"""
+        when = created or finished or datetime.now()
+        self.orchestrator.tasks[tid] = {
+            "id": tid, "status": status, "description": tid, "force_full": False,
+            "plan": [{"action": a, "params": p, "status": s} for a, p, s in steps],
+            "progress": 0.0, "current_step": None, "result": None, "error_message": None, "logs": [],
+            "created_at": when, "started_at": when, "completed_at": finished,
+        }
+
+    def _mark_collected_today(self, *source_ids):
+        """记上「今天已经成功采集并翻译过」的任务：发送前的补采就不会再去采它们"""
+        now = datetime.now()
+        for sid in source_ids:
+            self._task(f"done-{sid}", "completed", now, [collect_step(sid), translate_step()])
+
+    def _auto_tasks(self):
+        """邮件通知自动发起的任务"""
+        return [t for tid, t in self.orchestrator.tasks.items()
+                if tid not in self._tasks_before and t.get("scheduled_by") == "notify"]
 
     def _configure_llm(self, url):
         self.storage.set_app_config("llm", {"api_key": "sk-test", "base_url": url, "model_name": "test-model"})
@@ -647,8 +683,10 @@ class TestNotifyDigestEndToEnd(_NotifyBase):
         assert site.messages == []
 
     def test_the_scheduled_send_takes_the_same_path(self):
+        """每天定时发送前会先补采今天没采集翻译过的数据源（2026-10-20 起），这里两个都记成今天采过，只看发送那一段"""
         import smtp_site
         self._seed_standard()
+        self._mark_collected_today(FB, TW)
         with smtp_site.SmtpSite() as site:
             self._save(self._payload(site))
             self._run(self.notify.scheduled_send())
@@ -1109,3 +1147,325 @@ class TestNotifyCatchUpEndToEnd(_NotifyBase):
             status = self._send(site, source_ids=[FB])
         assert status["last"]["outcome"] == "sent" and len(site.messages) == 1, status
         assert FB in self._anchors(), "坏记录要换成好的"
+
+
+class TestNotifyCollectFirstEndToEnd(_NotifyBase):
+    """发送前先保证数据是新的（2026-10-20 用户要求）：所选数据源今天没成功采集翻译过，就先自动发起「采集 + 翻译」，
+    跑完再挑新回复。手动发送由页面的确认框决定（collect），每天定时一律先采。这里是不起浏览器的那一半：
+    口径判断、停用的不采、不带 collect 照旧、今天采过的不重采、先等正在跑的任务"""
+
+    def test_only_a_task_finished_today_with_collect_and_translate_done_counts(self):
+        """用户定的口径：今天 0 点以后成功完成、既采集了这个来源又翻译了的任务才算。
+        TW 下面四条一条都不算（昨天的、失败的、取消的、只采集没翻译的），FB 那条算"""
+        now = datetime.now()
+        yesterday = (now - timedelta(days=1)).replace(hour=23, minute=59)
+        self._task("ok-fb", "completed", now, [collect_step(FB), translate_step()])
+        self._task("old-tw", "completed", yesterday, [collect_step(TW), translate_step()])
+        self._task("failed-tw", "failed", now, [collect_step(TW), translate_step("failed")])
+        self._task("cancelled-tw", "cancelled", now, [collect_step(TW), translate_step()])
+        self._task("collect-only-tw", "completed", now, [collect_step(TW)])
+        self._save(self._payload())
+        resp = self.client.get("/api/v1/notify/precheck")
+        assert resp.status_code == 200, resp.text
+        assert [s["id"] for s in resp.json()["stale"]] == [TW], resp.json()
+
+    def test_a_disabled_source_is_skipped_not_collected(self):
+        """停用的数据源任务不碰它（用户定的）：不进「要先采集」；邮件里照用它已有的帖子"""
+        from app.services import source_service
+        source_service.update_source(TW, None, None, False)
+        self._save(self._payload())
+        body = self.client.get("/api/v1/notify/precheck").json()
+        assert [s["id"] for s in body["stale"]] == [FB], body
+
+    def test_sending_without_collect_starts_no_task(self):
+        """「直接用已有数据发送」和不带请求体的老调用：不发起任何任务，照旧直接发"""
+        import smtp_site
+        self._seed_standard()
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site)
+        assert status["last"]["outcome"] == "sent" and len(site.messages) == 1, status
+        assert self._auto_tasks() == [] and status["last"]["task_ids"] == [], status
+
+    def test_sources_collected_today_are_not_collected_again(self):
+        """每天定时一律先检查；两个来源今天都采集翻译过，就不再发起任务，直接发"""
+        import smtp_site
+        self._seed_standard()
+        self._mark_collected_today(FB, TW)
+        with smtp_site.SmtpSite() as site:
+            self._save(self._payload(site))
+            self._run(self.notify.scheduled_send())
+        last = self.notify.status()["last"]
+        assert last["outcome"] == "sent" and last["trigger"] == "schedule", last
+        assert self._auto_tasks() == [] and len(site.messages) == 1, last
+
+    def test_it_waits_for_a_running_task_before_deciding(self):
+        """定时采集刚好在跑时先等它跑完再判断：它跑完了，FB 就算今天采过，不再重复采一遍"""
+        import smtp_site
+        self._seed_standard()
+        now = datetime.now()
+        self._task("ok-tw", "completed", now, [collect_step(TW), translate_step()])
+        self._task("running-fb", "running", None, [collect_step(FB, "running"), translate_step("pending")],
+                   created=now)
+        seen = []
+
+        async def main():
+            job = asyncio.ensure_future(self.notify.scheduled_send())
+            for _ in range(200):
+                seen.append(self.notify.status()["progress"])
+                if "等待正在运行的任务结束" in seen[-1]:
+                    break
+                await asyncio.sleep(0.05)
+            task = self.orchestrator.tasks["running-fb"]     # 那个任务这时跑完了
+            task["plan"] = [{"action": a, "params": p, "status": "completed"}
+                            for a, p, _s in (collect_step(FB), translate_step())]
+            task.update(status="completed", completed_at=datetime.now())
+            await asyncio.wait_for(job, timeout=60)
+
+        with smtp_site.SmtpSite() as site:
+            self._save(self._payload(site))
+            self._run(main())
+        assert any("等待正在运行的任务结束" in p for p in seen), seen
+        last = self.notify.status()["last"]
+        assert last["outcome"] == "sent" and self._auto_tasks() == [], last
+
+    def test_a_scheduled_collection_firing_at_the_same_moment_is_waited_for(self):
+        """定时采集和每天邮件设在同一时刻：两个回调同时触发、谁先跑说不准。邮件先让两秒，
+        那边的任务建出来了它就等，不再把同一个来源采两遍（评审发现）"""
+        import smtp_site
+        self._seed_standard()
+        self._mark_collected_today(TW)
+        seen = []
+
+        async def main():
+            job = asyncio.ensure_future(self.notify.scheduled_send())
+            await asyncio.sleep(0.1)       # 同一时刻触发的定时采集这时才把任务建出来
+            self._task("cron-fb", "running", None, [collect_step(FB, "running"), translate_step("pending")],
+                       created=datetime.now())
+            for _ in range(200):
+                seen.append(self.notify.status()["progress"])
+                if "等待正在运行的任务结束" in seen[-1]:
+                    break
+                await asyncio.sleep(0.05)
+            task = self.orchestrator.tasks["cron-fb"]
+            task["plan"] = [{"action": a, "params": p, "status": "completed"}
+                            for a, p, _s in (collect_step(FB), translate_step())]
+            task.update(status="completed", completed_at=datetime.now())
+            await asyncio.wait_for(job, timeout=60)
+
+        with smtp_site.SmtpSite() as site:
+            self._save(self._payload(site))
+            self._run(main())
+        assert any("等待正在运行的任务结束" in p for p in seen), seen
+        assert self._auto_tasks() == [] and self.notify.status()["last"]["outcome"] == "sent"
+
+    def test_nothing_to_collect_means_no_waiting(self):
+        """所选的今天都采集翻译过：不用补采，也就不用等别的任务（评审发现：以前先等再判断，一个无关的长任务能拖住发送半小时）"""
+        import smtp_site
+        self._seed_standard()
+        self._mark_collected_today(FB, TW)
+        self._task("other-long", "running", None, [], created=datetime.now())
+        seen = []
+
+        async def main():
+            job = asyncio.ensure_future(self.notify.scheduled_send())
+            while not job.done():
+                seen.append(self.notify.status()["progress"])
+                await asyncio.sleep(0.05)
+            await asyncio.wait_for(job, timeout=10)
+
+        with smtp_site.SmtpSite() as site:
+            self._save(self._payload(site))
+            self._run(asyncio.wait_for(main(), timeout=15))
+        assert not any("等待正在运行的任务结束" in p for p in seen), seen
+        assert self.notify.status()["last"]["outcome"] == "sent"
+
+    def test_waiting_too_long_for_other_tasks_collects_nothing(self):
+        """等正在跑的任务等到头了还有没跑完的：不再发起补采 —— 它可能正采着同一个来源，再起一个就是把真站采两遍（评审发现）。
+        补采没做成，按用户定的规则这次不发"""
+        import smtp_site
+        self._seed_standard()
+        self._task("stuck", "running", None, [collect_step(FB, "running")], created=datetime.now())
+        old = self.cfg.settings.task_timeout_minutes
+        self.cfg.settings.task_timeout_minutes = 0.01      # 0.6 秒就算等到头
+        try:
+            with smtp_site.SmtpSite() as site:
+                self._save(self._payload(site))
+                self._run(self.notify.scheduled_send())
+        finally:
+            self.cfg.settings.task_timeout_minutes = old
+        last = self.notify.status()["last"]
+        assert last["outcome"] == "failed" and "还有任务没跑完" in last["message"], last
+        assert self._auto_tasks() == [] and site.messages == [], last
+
+    def test_an_auto_task_that_takes_too_long_is_cancelled(self):
+        """自动任务等到头还没跑完：这一轮不发，任务也取消掉 —— 别让它接着采、接着付翻译费，结果却没人用（评审发现）。
+        占住编排器唯一的并发名额，自动任务只能排队；这里没配模型，就算放出来也会在第一步之前失败，碰不到采集器"""
+        import smtp_site
+        self._seed_standard()
+        self._mark_collected_today(TW)
+        old = self.cfg.settings.task_timeout_minutes
+        self.cfg.settings.task_timeout_minutes = 0.01
+        self.orchestrator._running_tasks.add("someone-else")
+        try:
+            with smtp_site.SmtpSite() as site:
+                self._save(self._payload(site))
+                self._run(self.notify.scheduled_send())
+        finally:
+            self.cfg.settings.task_timeout_minutes = old
+            self.orchestrator._running_tasks.discard("someone-else")
+            while not self.orchestrator._task_queue.empty():
+                self.orchestrator._task_queue.get_nowait()
+        auto = self._auto_tasks()
+        assert len(auto) == 1 and auto[0]["status"] == "cancelled", [(t["id"], t["status"]) for t in auto]
+        last = self.notify.status()["last"]
+        assert last["outcome"] == "failed" and "已取消" in last["message"] and site.messages == [], last
+
+    def test_a_task_cancelled_midway_stays_cancelled(self):
+        """原有缺陷（评审发现）：任务中途被取消，跑完手头那一步后又被改回「已完成」。判「今天采过没有」时取消的不算，
+        被抹成已完成就会被当成采过。这里卡住翻译请求，在它翻到一半时取消"""
+        gate = threading.Event()
+        server = self._llm_site().LLMSite(translate_gate=gate)
+        self._seed([post("u1", "u_u1", 2, "Nog niet vertaald")])
+        try:
+            with server as url:
+                self._configure_llm(url)
+
+                async def main():
+                    self.orchestrator.create_task("cancel-me", "取消用例", plan=[{"action": "translate", "params": {}}])
+                    run = asyncio.ensure_future(self.orchestrator.execute_task("cancel-me"))
+                    for _ in range(600):
+                        if server.blocked:
+                            break
+                        await asyncio.sleep(0.05)
+                    assert server.blocked, "翻译请求一直没发出来"
+                    assert self.orchestrator.cancel_task("cancel-me")
+                    gate.set()
+                    await asyncio.wait_for(run, timeout=60)
+
+                self._run(main())
+        finally:
+            gate.set()
+        assert self.orchestrator.get_task("cancel-me")["status"] == "cancelled"
+
+    def test_retrying_an_auto_task_keeps_its_plan(self):
+        """在任务页重跑邮件通知自动发起的任务：沿用原计划，不把描述交给模型重新解析（评审发现）。
+        这里没配模型，新任务在第一步之前就失败，碰不到采集器 —— 只看它带着什么计划"""
+        self._task("auto-old", "failed", datetime.now(), [collect_step(FB, "failed"), translate_step("pending")])
+        self.orchestrator.tasks["auto-old"]["scheduled_by"] = "notify"
+        resp = self.client.post("/api/v1/tasks/auto-old/retry")
+        assert resp.status_code == 201, resp.text
+        new = self.orchestrator.get_task(resp.json()["id"])
+        assert [(s["action"], s["params"]) for s in new["plan"]] == [
+            ("collect", {"source_id": FB}), ("translate", {"target_lang": "zh-CN"})], new["plan"]
+        assert new.get("scheduled_by") == "notify" and new.get("_preset_plan") is True, new
+
+    def test_a_preset_plan_never_collects_a_disabled_source(self):
+        """给定计划照样只认启用的来源（评审发现）：排队这会儿被停用的，任务直接失败、说清原因，采集那一步根本不跑。
+        来源指向本机一个没人监听的端口：万一校验漏了，采集器也只会连到本机"""
+        server = self._llm_site().LLMSite()
+        self.storage.save_source({"id": "src_nf_off", "name": "停用的小组", "collector_id": "group_feed",
+                                  "params": {"group_id": "1", "base_url": "http://127.0.0.1:9"},
+                                  "enabled": False, "created_at": "2026-10-01T09:00:03"})
+        with server as url:
+            self._configure_llm(url)
+            self.orchestrator.create_task("off-plan", "停用来源用例",
+                                          plan=[{"action": "collect", "params": {"source_id": "src_nf_off"}},
+                                                {"action": "translate", "params": {}}])
+            self._run(self.orchestrator.execute_task("off-plan"))
+        task = self.orchestrator.get_task("off-plan")
+        assert task["status"] == "failed" and "已停用或已删除" in (task["error_message"] or ""), task.get("error_message")
+        assert [s["status"] for s in task["plan"]] == ["pending", "pending"], task["plan"]
+
+
+GF = "src_nf_group"
+
+
+class TestNotifyAutoCollectEndToEnd(_NotifyBase):
+    """自动补采的另一半：真 Chrome、真子进程采本地小组站点（fixture_site，group_feed 采集器），真模型替身翻译，
+    真 SMTP 收信。站点上的帖子时间是固定的（2026 年 6 月），进不了邮件的窗口 —— 邮件发的是事先放进库的近期回复，
+    站点那批用来证明「任务真的先采了、也真的翻了」"""
+
+    def _skip_unless_ready(self):
+        from app.config import settings
+        if shutil.which("node") is None:
+            pytest.skip("未安装 node")
+        if not os.path.exists(os.path.join(settings.project_root, "node_modules", "playwright", "package.json")):
+            pytest.skip("项目根目录未安装 playwright")
+
+    def _group_source(self, base_url):
+        self.storage.save_source({"id": GF, "name": "本地小组", "collector_id": "group_feed",
+                                  "params": {"group_id": "2407063016436085", "base_url": base_url},
+                                  "enabled": True, "created_at": "2026-10-01T09:00:02"})
+        self._seed([post("g1", "u_g1", 3, "G1-orig", "G1-zh", src=GF),
+                    post("g2", "u_g2", 1, "G2-orig", "G2-zh", parent="g1", level=1, src=GF)])
+
+    def test_a_source_not_collected_today_is_collected_and_translated_before_the_mail(self):
+        self._skip_unless_ready()
+        import fixture_site
+        import smtp_site
+        server = self._llm_site().LLMSite()
+        with fixture_site.FixtureSite() as base, server as llm_url, smtp_site.SmtpSite() as site:
+            self._configure_llm(llm_url)
+            self._group_source(base)
+            self._save(self._payload(site, source_ids=[GF]))
+            self._run(self.notify.scheduled_send())
+        auto = self._auto_tasks()
+        assert len(auto) == 1, [t["id"] for t in auto]
+        task = auto[0]
+        assert task["status"] == "completed", task.get("error_message")
+        assert [(s["action"], s["status"]) for s in task["plan"]] == [("collect", "completed"),
+                                                                      ("translate", "completed")]
+        assert task["plan"][0]["params"].get("source_name") == "本地小组", "任务列表靠它显示采了哪个来源"
+        assert "plan" not in server.seen, "给定的计划又交给模型解析了一遍"
+        collected = [p for p in self.storage.load_posts([GF]) if p["fingerprint"] not in ("g1", "g2")]
+        assert collected, "站点上的帖子没采进来"
+        assert all(p["translation"] for p in collected if p["content"]), "采进来的帖子任务没翻译"
+        last = self.notify.status()["last"]
+        assert last["outcome"] == "sent" and last["task_ids"] == [task["id"]], last
+        assert len(site.messages) == 1 and "G2-orig" in self._html(site.message())
+
+    def test_a_failed_collection_sends_nothing(self):
+        """用户定的：自动采集没成功就不发送，记录里写明哪个来源、原因和任务号。站点一直回 503（限流即停）"""
+        self._skip_unless_ready()
+        import fixture_site
+        import smtp_site
+        server = self._llm_site().LLMSite()
+        with fixture_site.FixtureSite(throttle_first=1000) as base, server as llm_url, \
+                smtp_site.SmtpSite() as site:
+            self._configure_llm(llm_url)
+            self._group_source(base)
+            self._save(self._payload(site, source_ids=[GF]))
+            self._run(self.notify.scheduled_send())
+        auto = self._auto_tasks()
+        assert len(auto) == 1 and auto[0]["status"] == "failed", [(t["id"], t["status"]) for t in auto]
+        last = self.notify.status()["last"]
+        assert last["outcome"] == "failed" and "没有发送" in last["message"] and "本地小组" in last["message"], last
+        assert auto[0]["id"][:8] in last["message"] and last["task_ids"] == [auto[0]["id"]], last
+        assert site.messages == []
+
+    def test_a_task_cancelled_while_its_step_fails_stays_cancelled(self):
+        """评审发现：采集器不看取消标记，取消后照样跑完、跑挂；那一步抛异常时 except 分支又把状态改成「失败」。
+        站点一直回 503，采集器起来以后必然失败；趁它还在起 Chrome 时取消"""
+        self._skip_unless_ready()
+        import fixture_site
+        server = self._llm_site().LLMSite()
+        with fixture_site.FixtureSite(throttle_first=1000) as base, server as llm_url:
+            self._configure_llm(llm_url)
+            self._group_source(base)
+
+            async def main():
+                self.orchestrator.create_task("cancel-collect", "取消用例",
+                                              plan=[{"action": "collect", "params": {"source_id": GF}},
+                                                    {"action": "translate", "params": {}}])
+                run = asyncio.ensure_future(self.orchestrator.execute_task("cancel-collect"))
+                for _ in range(400):
+                    if self.orchestrator.get_task("cancel-collect")["plan"][0]["status"] == "running":
+                        break
+                    await asyncio.sleep(0.05)
+                assert self.orchestrator.cancel_task("cancel-collect")
+                await asyncio.wait_for(run, timeout=120)
+
+            self._run(main())
+        task = self.orchestrator.get_task("cancel-collect")
+        assert task["plan"][0]["status"] == "failed", task["plan"]       # 采集那一步确实跑挂了
+        assert task["status"] == "cancelled", (task["status"], task.get("error_message"))

@@ -4,6 +4,7 @@ import uuid
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from app.models import TaskCreate, TaskResponse, TaskListResponse, TaskStatus
+from app.services import notify_service
 from app.services.orchestrator import orchestrator
 from app.services.progress_manager import progress_manager
 
@@ -70,7 +71,12 @@ async def retry_task(task_id: str, full: bool = False):
         raise HTTPException(status_code=400, detail="只能重试已完成、失败或取消的任务")
 
     new_id = str(uuid.uuid4())
-    orchestrator.create_task(new_id, task["description"], force_full=full)
+    # 邮件通知发送前自动发起的任务，计划是代码给的：重跑沿用原计划，不把描述交给模型重新解析（会多出步骤、挑错来源）
+    plan = None
+    if task.get("scheduled_by") == notify_service.AUTO_TASK_OWNER:
+        plan = [{"action": s["action"], "params": s.get("params") or {}} for s in task.get("plan") or []]
+    orchestrator.create_task(new_id, task["description"], force_full=full, plan=plan,
+                             scheduled_by=task.get("scheduled_by") if plan else None)
     orchestrator.run_task_async(new_id)
     new_task = orchestrator.get_task(new_id)
     return TaskResponse(**new_task)

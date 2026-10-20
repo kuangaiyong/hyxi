@@ -7,9 +7,13 @@
  *   2. 填好表单点「发送测试邮件」：收件端真的收到了，登录用的就是页面上填的用户名和密码
  *   3. 保存后刷新：填的都还在；密码框是空的、提示「已保存」；任何一次读配置的响应里都没有密码
  *   4. 改了没保存时「立即发送」点不了（它用的是已保存的配置，免得用户以为发的是眼前这份）
- *   5. 点「立即发送」：按数据走三条路之一，每条都有硬断言 ——
+ *   5. 点「立即发送」：所选数据源今天还没采集翻译过时先弹确认框（列出数据源、三个选项；点「取消」什么都不发；
+ *      **绝不点「先采集再发送」** —— 这里跑在开发库的真数据源上，会去真站采集；选「直接用已有数据发送」）。
+ *      然后按数据走三条路之一，每条都有硬断言 ——
  *      已发送（收件端收到、标题和发送记录一致）/ 没有新内容（明说、没发信）/ 失败（明说、没发信）
  *   6. 开了每天定时，发送记录里显示下次发送时间
+ *   7. 「先采集再发送」：临时建一个指向本机死端口的数据源（就算后端配了模型、任务真跑起来，采集器也只连本机），
+ *      补采必然失败 —— 这次不发、记录写明数据源和任务号、发送记录里有任务链接。收尾删掉临时数据源和那个任务
  *
  * 收件端只听 127.0.0.1、不加密：后端对本机中继允许不加密登录，对外部服务器不允许（后端用例守那一条）。
  * 收尾会调接口「清除」配置，开发库里不留痕。**已经有邮件通知配置时以退出码 2 拒跑** ——
@@ -202,6 +206,8 @@ async function main() {
     const page = await context.newPage();
     page.on('dialog', (d) => d.accept());
     const configBodies = [];
+    let tempSource = null;      // 场景六临时建的数据源，收尾删掉
+    let autoTasks = [];         // 场景六自动发起的任务，收尾删掉
     page.on('response', async (r) => {
         if (r.url().endsWith('/api/v1/notify/config')) {
             try { configBodies.push(await r.text()); } catch { /* 页面跳走时响应体可能已经拿不到 */ }
@@ -285,7 +291,28 @@ async function main() {
 
         console.log('\n场景五：立即发送，结果照实说');
         const before = smtp.mails.length;
+        const confirmBox = byId(page, 'notify-collect-confirm');
+        // 弹不弹由数据决定：接口说有今天没采集翻译过的数据源，就必须弹；没有就必须不弹
+        const pre = await (await api('/notify/precheck')).json();
         await send.click();
+        const asked = await confirmBox.waitFor({ timeout: 5000 }).then(() => true, () => false);
+        check(pre.stale.length ? '有今天没采集翻译过的数据源：弹出确认框' : '所选数据源今天都采集翻译过：不弹确认框',
+            asked === pre.stale.length > 0, { stale: pre.stale.map((s) => s.name), asked });
+        if (asked) {
+            const text = (await confirmBox.textContent()) || '';
+            check('确认框列出了今天还没采集翻译的数据源', text.includes(source.name), text);
+            const buttons = (await confirmBox.locator('button').allTextContents()).map((s) => s.trim());
+            check('确认框有三个选项', ['先采集再发送', '直接用已有数据发送', '取消'].every((b) => buttons.includes(b)),
+                buttons);
+            await byId(page, 'notify-collect-cancel').click();
+            await page.waitForTimeout(1500);
+            const after = await (await api('/notify/status')).json();
+            check('点「取消」：确认框关掉，什么都没发', !(await confirmBox.isVisible()) && !after.running
+                && !after.last && smtp.mails.length === before, { running: after.running, last: after.last });
+            await send.click();
+            await confirmBox.waitFor();
+            await byId(page, 'notify-collect-skip').click();     // 绝不点「先采集再发送」，理由见文件开头
+        }
         await page.waitForFunction(() => {
             const last = document.querySelector('[data-testid="notify-last-outcome"]');
             return last && !document.querySelector('[data-testid="notify-progress"]');
@@ -309,9 +336,47 @@ async function main() {
             check('失败时明说没有发送', /没有发送|失败/.test(message), message);
             check('失败时没有发信', newMails.length === 0, newMails.length);
         }
+
+        console.log('\n场景六：先采集再发送（临时数据源指向本机没人监听的端口：补采必然失败，碰不到外网）');
+        // 场景五用的是开发库的真数据源，那里绝不能点「先采集」；这里临时建一个只会连到本机的数据源来点它
+        tempSource = await (await api('/sources', { method: 'POST', body: JSON.stringify({
+            collector_id: 'group_feed', name: `E2E 本机小组 ${Date.now()}`,
+            params: { group_id: '1', base_url: 'http://127.0.0.1:9' }, enabled: true,
+        }) })).json();
+        check('建好了临时数据源', !!tempSource.id, tempSource);
+        await page.reload({ waitUntil: 'networkidle' });
+        await page.locator(`[data-testid="notify-source"][value="${tempSource.id}"]`).waitFor();
+        for (const box of await page.locator('[data-testid="notify-source"]').all()) {
+            if ((await box.getAttribute('value')) === tempSource.id) await box.check();
+            else await box.uncheck();
+        }
+        await byId(page, 'notify-save').click();
+        check('只勾临时数据源、保存', await waitToast(page, /已保存/), await toasts(page));
+        const prev = (await (await api('/notify/status')).json()).last;
+        const mailsBefore = smtp.mails.length;
+        await send.click();
+        await confirmBox.waitFor({ timeout: 10000 });
+        check('确认框列出了临时数据源', ((await confirmBox.textContent()) || '').includes(tempSource.name));
+        await byId(page, 'notify-collect-go').click();
+        let st = null;
+        for (let i = 0; i < 600; i++) {
+            st = await (await api('/notify/status')).json();
+            if (!st.running && st.last && st.last.started_at !== (prev && prev.started_at)) break;
+            await page.waitForTimeout(500);
+        }
+        autoTasks = (st && st.last && st.last.task_ids) || [];
+        console.log(`  → ${st && st.last ? st.last.message : '（没等到结果）'}`);
+        check('补采没成功：这次不发，记录里写明数据源和任务号', !!st && st.last.outcome === 'failed'
+            && st.last.message.includes(tempSource.name) && st.last.message.includes('没有发送')
+            && autoTasks.length === 1 && st.last.message.includes(autoTasks[0].slice(0, 8)), st && st.last);
+        const link = byId(page, 'notify-last-tasks').locator(`a[href="/tasks/${autoTasks[0]}/progress"]`);
+        check('发送记录里有这一轮自动发起的任务链接', await link.waitFor({ timeout: 10000 }).then(() => true, () => false));
+        check('收件端没收到信', smtp.mails.length === mailsBefore, smtp.mails.length - mailsBefore);
     } finally {
         await browser.close();
         smtp.server.close();
+        for (const id of autoTasks) await api(`/tasks/${id}?force=true`, { method: 'DELETE' });
+        if (tempSource && tempSource.id) await api(`/sources/${tempSource.id}`, { method: 'DELETE' });
         const r = await api('/notify/config', { method: 'DELETE' });
         console.log(r.ok ? '\n已清除本脚本保存的邮件通知配置' : `\n清除配置失败（HTTP ${r.status}），请到页面上点「清除」`);
     }

@@ -3,7 +3,7 @@ import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import * as notifyApi from '@/api/notify'
 import { fetchSources } from '@/api/sources'
 import { useToast } from '@/composables/useToast'
-import type { NotifyConfigInput, NotifyConfigPublic, NotifyRun, NotifyStatus } from '@/types/notify'
+import type { NotifyConfigInput, NotifyConfigPublic, NotifyRun, NotifySourceBrief, NotifyStatus } from '@/types/notify'
 import type { SourcePublic } from '@/types/source'
 
 /** 邮件通知：把所选数据源近几天的新回复（原文 + 译文）发到邮箱。规格见 docs/features/email-notify.md */
@@ -152,10 +152,32 @@ async function handleTest() {
   }
 }
 
+// 所选数据源里今天还没采集翻译过的：不为空时弹确认框，等用户选（每天定时不弹，一律先采）
+const staleSources = ref<NotifySourceBrief[]>([])
+
 async function handleSendNow() {
   starting.value = true
   try {
-    status.value = await notifyApi.sendNow()
+    const check = await notifyApi.fetchPrecheck()
+    if (check.stale.length) {
+      staleSources.value = check.stale
+      return
+    }
+    status.value = await notifyApi.sendNow(false)
+    poll()
+  } catch (e: any) {
+    toast.error(errorText(e, '发送失败，请确认后端服务可用'))
+  } finally {
+    starting.value = false
+  }
+}
+
+/** 确认框里的选择：true 先采集再发送，false 直接用已有数据发送 */
+async function confirmSend(collect: boolean) {
+  staleSources.value = []
+  starting.value = true
+  try {
+    status.value = await notifyApi.sendNow(collect)
     poll()
   } catch (e: any) {
     toast.error(errorText(e, '发送失败，请确认后端服务可用'))
@@ -339,7 +361,9 @@ function poll() {
       <div class="card" data-testid="notify-status">
         <div class="card-header">📋 发送记录</div>
         <p v-if="status?.running" class="text-sm" data-testid="notify-progress">
-          <span class="spinner"></span> 正在发送：{{ status.progress }}
+          <span class="spinner"></span> {{ status.progress || '正在发送' }}
+          <router-link v-if="status.task_id" :to="`/tasks/${status.task_id}/progress`" style="margin-left: 8px;"
+                       data-testid="notify-task-link">查看任务进度</router-link>
         </p>
         <div v-if="status?.last" class="text-sm" data-testid="notify-last">
           <div class="flex items-center gap-2" style="flex-wrap: wrap;">
@@ -354,11 +378,31 @@ function poll() {
           <p v-if="status.last.subject" class="text-secondary" style="margin: 4px 0 0;">
             邮件标题：{{ status.last.subject }}{{ status.last.attachment ? '（含 HTML 附件）' : '' }}
           </p>
+          <p v-if="status.last.task_ids?.length" class="text-secondary" style="margin: 4px 0 0;" data-testid="notify-last-tasks">
+            发送前自动发起的任务：
+            <router-link v-for="tid in status.last.task_ids" :key="tid" :to="`/tasks/${tid}/progress`"
+                         style="margin-right: 8px;">{{ tid.slice(0, 8) }}</router-link>
+          </p>
         </div>
         <p v-else-if="!status?.running" class="text-sm text-secondary">还没有发送过。</p>
         <p class="text-sm text-secondary" style="margin-top: 8px;" data-testid="notify-next-run">
           {{ status?.next_run ? `下次定时发送：${fmtTime(status.next_run)}` : '没有开启每天定时发送' }}
         </p>
+      </div>
+
+      <div v-if="staleSources.length" class="modal-overlay" data-testid="notify-collect-confirm" @click.self="staleSources = []">
+        <div class="modal-content" style="max-width: 460px;">
+          <div class="modal-header"><h3>先采集再发送？</h3></div>
+          <p class="mb-2">今天还没有采集并翻译：</p>
+          <ul style="margin: 0 0 16px 20px; line-height: 1.9;">
+            <li v-for="s in staleSources" :key="s.id">{{ s.collector_name }}「{{ s.name }}」</li>
+          </ul>
+          <div class="flex gap-2" style="justify-content: flex-end; flex-wrap: wrap;">
+            <button class="btn btn-outline" data-testid="notify-collect-cancel" @click="staleSources = []">取消</button>
+            <button class="btn btn-outline" data-testid="notify-collect-skip" @click="confirmSend(false)">直接用已有数据发送</button>
+            <button class="btn btn-primary" data-testid="notify-collect-go" @click="confirmSend(true)">先采集再发送</button>
+          </div>
+        </div>
       </div>
     </template>
   </div>

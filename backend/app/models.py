@@ -252,13 +252,31 @@ class NotifyRun(BaseModel):
     root_count: int = 0         # 新主贴条数（没有回复的新主贴也进邮件）
     subject: str = ""
     attachment: bool = False
+    task_ids: List[str] = []    # 这一轮发送前自动发起的「采集 + 翻译」任务
 
 
 class NotifyStatus(BaseModel):
     running: bool = False
     progress: str = ""
+    task_id: Optional[str] = None   # 正在等的那个自动采集任务（页面据此链接到任务进度）
     last: Optional[NotifyRun] = None
     next_run: Optional[str] = None
+
+
+class NotifySendInput(BaseModel):
+    """「立即发送」：collect=True 先把今天还没采集翻译过的数据源采一遍再发（页面确认框里选「先采集再发送」）"""
+    collect: bool = False
+
+
+class NotifySourceBrief(BaseModel):
+    id: str
+    name: str
+    collector_name: str = ""
+
+
+class NotifyPrecheck(BaseModel):
+    """所选的（启用的）数据源里今天还没采集翻译过、要先采的。停用的不采，也不列"""
+    stale: List[NotifySourceBrief] = []
 
 
 # ===== SSE 事件 =====

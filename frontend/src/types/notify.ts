@@ -32,13 +32,28 @@ export interface NotifyRun {
   root_count: number
   subject: string
   attachment: boolean
+  /** 这一轮发送前自动发起的「采集 + 翻译」任务 */
+  task_ids: string[]
 }
 
 export interface NotifyStatus {
   running: boolean
   progress: string
+  /** 正在等的那个自动采集任务 */
+  task_id: string | null
   last: NotifyRun | null
   next_run: string | null
+}
+
+export interface NotifySourceBrief {
+  id: string
+  name: string
+  collector_name: string
+}
+
+/** 所选的（启用的）数据源里今天还没采集翻译过、要先采的 */
+export interface NotifyPrecheck {
+  stale: NotifySourceBrief[]
 }
 
 export interface NotifyTestResult {

@@ -220,6 +220,38 @@ class _NotifyBase:
     def _attachments(msg):
         return [(a.get_filename(), a.get_content()) for a in msg.iter_attachments()]
 
+    def _tints(self, html):
+        """{文字: 它是不是显示在「近 24 小时」的底色上}。看离它最近的、带背景色的那层 div —— 主贴那块、回复那块、
+        整张卡片，哪层垫了色读的人看到的就是哪层。只认内联样式（邮件客户端常把 <style> 剥掉）"""
+        from html.parser import HTMLParser
+        tint = f"background:{self.notify._RECENT_BG}"
+        seen = {}
+
+        class Reader(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.stack = []
+
+            def handle_starttag(self, tag, attrs):
+                if tag == "div":
+                    self.stack.append(dict(attrs).get("style") or "")
+
+            def handle_endtag(self, tag):
+                if tag == "div":
+                    self.stack.pop()
+
+            def handle_data(self, data):
+                if data.strip():
+                    bg = next((s for s in reversed(self.stack) if "background" in s), "")
+                    seen[data.strip()] = tint in bg
+
+        Reader().feed(html)
+        return seen
+
+    def _legend(self, html):
+        """抬头里那枚同色的「近 24 小时发表」图例"""
+        return re.findall(rf'<span style="[^"]*background:{self.notify._RECENT_BG}[^"]*">近 24 小时发表</span>', html)
+
 
 class TestNotifyConfigEndToEnd(_NotifyBase):
     """配置的存取：密码加密落库、只进不出；留空沿用只限同一台服务器；坏输入当场说清楚"""
@@ -589,6 +621,107 @@ class TestNotifyDigestEndToEnd(_NotifyBase):
         assert "F2-orig" in html, "20 小时前（荷兰时间）发的楼层不在近 1 天里"
         assert "F9-orig" not in html
 
+    def test_the_default_window_is_exactly_the_last_24_hours(self):
+        """2026-10-20 用户明确：「不设置（近 1 天）」就是近 24 小时 —— 从发送那一刻往前推整 24 小时，不按自然日算「今天」。
+        于是窗口里的新内容全都垫着「近 24 小时」的底色，作上下文的老主贴不垫"""
+        import smtp_site
+        self._seed([
+            post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+            post("c8", "u_c8", 23 + 50 / 60, "C8-orig", "C8-zh", parent="r1", level=1),
+            post("c9", "u_c9", 24 + 10 / 60, "C9-orig", "C9-zh", parent="r1", level=1),
+            post("r6", "u_r6", 23, "R6-orig", "R6-zh"),
+        ])
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["reply_count"] == 1 and status["last"]["root_count"] == 1, status
+        html = self._html(site.message())
+        assert "C9-orig" not in html, "24 小时 10 分钟前发的不在近 1 天里"
+        # 窗口要是按自然日算，C8 会被挤出窗口、再当「补发」进来（第一封的补发起点就是 24 小时前），只看在不在邮件里分不出来
+        assert "补发" not in html, "23 小时 50 分钟前发的就在近 1 天的窗口里，不是补发"
+        tints = self._tints(html)
+        assert tints["C8-orig"] and tints["R6-orig"], "近 1 天里的新内容都是近 24 小时发的，都要垫底色"
+        assert not tints["R1-orig"], "作上下文的老主贴不垫"
+
+    def test_posts_from_the_last_24_hours_get_a_light_background(self):
+        """2026-10-20 用户要求：不管窗口选几天，近 24 小时发表的帖子（主贴、回复都算）垫一层浅底色，一眼看出哪些是最新的。
+        只看这条帖子自己的发表时间，基准是发送那一刻、换到来源的时钟（F5：荷兰时间 22 小时前，拿上海的现在比就成了 28 小时前；
+        宿主机本身就在荷兰时区时 F5 不区分新旧代码，本机是上海时间）。
+        不从主贴推到回复：放一条读出来比主贴还早的回复（R5 / C10），整张卡片跟着主贴一起垫的写法会把它也垫上"""
+        from zoneinfo import ZoneInfo
+        import smtp_site
+        ams = datetime.now(ZoneInfo("Europe/Amsterdam")).replace(tzinfo=None)
+        self._seed([
+            post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+            post("c1", "u_c1", 2, "C1-orig", "C1-zh", parent="r1", level=1),
+            post("c8", "u_c8", 23 + 50 / 60, "C8-orig", "C8-zh", parent="r1", level=1),
+            post("c9", "u_c9", 24 + 10 / 60, "C9-orig", "C9-zh", parent="r1", level=1),
+            post("c3", "u_c3", 30, "C3-orig", "C3-zh", parent="r1", level=1),
+            post("r2", "u_r2", 3, "R2-orig", "R2-zh"),
+            post("c5", "u_c5", 1, "C5-orig", "C5-zh", parent="r2", level=1),
+            post("r4", "u_r4", 40, "R4-orig", "R4-zh"),
+            post("c7", "u_c7", 20, "C7-orig", "C7-zh", parent="r4", level=1),
+            post("r5", "u_r5", 2, "R5-orig", "R5-zh"),
+            post("c10", "u_c10", 30, "C10-orig", "C10-zh", parent="r5", level=1),
+        ] + [dict(post(fp, f"u_{fp}", 0, f"{fp.upper()}-orig", f"{fp.upper()}-zh", src=TW),
+                  timestamp=(ams - timedelta(hours=h)).strftime("%d-%m-%Y %H:%M"))
+             for fp, h in (("t0", 60 * 24), ("f5", 22), ("f9", 30))])
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site, days=3)
+        assert status["last"]["outcome"] == "sent", status
+        html = self._html(site.message())
+        tints = self._tints(html)
+        recent = {"C1", "C8", "R2", "C5", "C7", "R5", "F5"}
+        older = {"R1", "C9", "C3", "R4", "C10", "T0", "F9"}
+        for name in sorted(recent | older):
+            for text in (f"{name}-orig", f"{name}-zh"):
+                assert text in tints, f"{text} 不在邮件里"
+                assert tints[text] == (name in recent), f"{text}：近 24 小时发的才垫底色"
+        assert len(self._legend(html)) == 1, "抬头要有一枚同色的「近 24 小时发表」图例"
+        # 垫不垫底色只差一个背景：只在垫色时加内边距的话，同一封信里的卡片会错位（评审发现）
+        for cls in ("root", "reply"):
+            rules = [frozenset(d.strip() for d in s.split(";") if d.strip())
+                     for s in re.findall(rf'<div class="{cls}" style="([^"]*)"', html)]
+            plain = {r for r in rules if not any(d.startswith("background") for d in r)}
+            tinted = {frozenset(d for d in r if not d.startswith("background")) for r in rules} - plain
+            assert len(plain) == 1 and not tinted, (cls, plain, tinted)
+
+    def test_nothing_from_the_last_24_hours_means_no_background_and_no_legend(self):
+        """窗口里没有近 24 小时发的帖子：一处底色都不垫，抬头也不放图例 —— 有图例却找不到对应的帖子，读的人会以为漏了"""
+        import smtp_site
+        self._seed([post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+                    post("c3", "u_c3", 30, "C3-orig", "C3-zh", parent="r1", level=1),
+                    post("r4", "u_r4", 3 * 24, "R4-orig", "R4-zh")])
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site, source_ids=[FB], days=7)
+        assert status["last"]["outcome"] == "sent" and status["last"]["reply_count"] == 1, status
+        html = self._html(site.message())
+        assert "C3-orig" in html and "R4-orig" in html
+        assert not any(self._tints(html).values())
+        assert self._legend(html) == [] and "近 24 小时" not in html
+
+    def test_the_body_keeps_the_newest_20_by_real_time_across_sources(self):
+        """评审发现（v1.17.0 的底色把它暴露出来）：正文挑「最新 20 条」时直接拿各来源的墙上时间比。Tweakers 是荷兰时间，
+        比宿主机（上海）晚 6~7 小时，荷兰时间 20 小时前的楼层被当成 26 小时前，排到 24.5 小时前的 Facebook 回复后面、挤出正文，
+        正文还说它「比正文里的都早」。（宿主机本身就在荷兰时区时这条不区分新旧代码；本机是上海时间）"""
+        from zoneinfo import ZoneInfo
+        import smtp_site
+        ams = datetime.now(ZoneInfo("Europe/Amsterdam")).replace(tzinfo=None)
+        self._seed(
+            [post("root", "u_root", 30 * 24, "ROOT-orig", "ROOT-zh")]
+            + [post(f"n{i:02d}", f"u_n{i:02d}", 24.5 + i / 60, f"N{i:02d}-orig", f"N{i:02d}-zh", parent="root", level=1)
+               for i in range(1, 21)]
+            + [dict(post(fp, f"u_{fp}", 0, f"{fp.upper()}-orig", f"{fp.upper()}-zh", src=TW),
+                    timestamp=(ams - timedelta(hours=h)).strftime("%d-%m-%Y %H:%M"))
+               for fp, h in (("t0", 60 * 24), ("fz", 20))])
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site, days=3)
+        assert status["last"]["attachment"] is True and status["last"]["reply_count"] == 21, status
+        body = self._html(site.message())
+        assert "FZ-orig" in body, "荷兰时间 20 小时前的楼层是 21 条里最新的，正文得有它"
+        assert self._tints(body)["FZ-orig"]
+        assert "N01-orig" in body and "N20-orig" not in body, "挤出正文的应该是最早的那条 Facebook 回复"
+        assert "这些比正文里的都早" not in body
+
     def test_a_new_main_post_without_replies_is_in_the_mail_in_full(self):
         """没人回复的新主贴以前哪封邮件都不会出现 —— 一条新发的负面帖没人接话，就永远通知不到（用户让我定：要进邮件）。
         它是新内容本身而不是上下文：全文照登，不按老主贴的 600 字截断。丢了父贴的回复（reply_level > 0）不是主贴，不算"""
@@ -641,7 +774,11 @@ class TestNotifyDigestEndToEnd(_NotifyBase):
         with smtp_site.SmtpSite() as site:
             status = self._send(site, source_ids=[TW])
         assert status["last"]["reply_count"] == 1 and status["last"]["root_count"] == 0, status
-        assert "🆕 新主贴" not in self._html(site.message())
+        html = self._html(site.message())
+        assert "🆕 新主贴" not in html
+        # 底色只看发表时间：作上下文的主题楼层在 24 小时内也垫
+        tints = self._tints(html)
+        assert tints["T0-orig"] and tints["F1-orig"]
 
     def _seed_many(self, n):
         self._seed([post("root", "u_root", 30 * 24, "ROOT-orig", "ROOT-zh")] + [
@@ -663,6 +800,11 @@ class TestNotifyDigestEndToEnd(_NotifyBase):
         (name, full), = self._attachments(msg)
         assert name.endswith(".html") and full.count('class="reply"') == 25, name
         assert "N25-orig" in full and "N25-zh" in full and "<meta charset=\"utf-8\">" in full
+        # 25 条都是近 24 小时发的：正文、附件里都垫底色
+        body_tints, full_tints = self._tints(html), self._tints(full)
+        assert all(body_tints[f"N{i:02d}-orig"] for i in range(1, 21))
+        assert all(full_tints[f"N{i:02d}-orig"] for i in range(1, 26)), "附件里一样要垫底色"
+        assert len(self._legend(html)) == 1 and len(self._legend(full)) == 1, "附件要能单独看懂，也得有图例"
 
     def test_exactly_20_stay_in_the_body(self):
         import smtp_site
@@ -958,6 +1100,8 @@ class TestNotifyCatchUpEndToEnd(_NotifyBase):
             status = self._send(site, source_ids=[FB])
         html = self._html(site.message())
         assert "LATE-orig" in html and "补发" in html, "采集晚了的回复被漏掉了"
+        tints = self._tints(html)
+        assert not tints["LATE-orig"] and tints["C1-orig"], "补发的发表在窗口之外，不垫底色"
         assert "OLD25-orig" not in html, "随上一封发过的不该再发一遍"
         assert status["last"]["reply_count"] == 2, status       # C1（近 1 天里）+ LATE（补发）
         assert self._notified("late"), "补发出去的也要记下，下一封不再补"
@@ -1078,14 +1222,18 @@ class TestNotifyCatchUpEndToEnd(_NotifyBase):
         import smtp_site
         self._seed([post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
                     post("c1", "u_c1", 30, "C1-orig", "C1-zh", parent="r1", level=1),
+                    post("c3", "u_c3", 5, "C3-orig", "C3-zh", parent="r1", level=1),
                     post("c2", "u_c2", 2, "C2-orig", "C2-zh", parent="r1", level=1)])
-        self._mark_sent("c1")
+        self._mark_sent("c1", "c3")
         with smtp_site.SmtpSite() as site:
             self._send(site, source_ids=[FB], days=3)
         html = self._html(site.message())
-        assert "C1-orig" in html and "C2-orig" in html
-        tag = ">已发过</span>"                  # 只数标签：标题和抬头里还有一句「含已发过 1 条」
-        assert html.count(tag) == 1 and html.index(tag) < html.index("C1-orig"), html[:1500]
+        assert "C1-orig" in html and "C2-orig" in html and "C3-orig" in html
+        tag = ">已发过</span>"                  # 只数标签：标题和抬头里还有一句「含已发过 2 条」
+        assert html.count(tag) == 2 and html.index(tag) < html.index("C1-orig"), html[:1500]
+        # 底色只看发表时间：24 小时内的照样垫，发没发过不管（一天发不止一封时就会有这种）
+        tints = self._tints(html)
+        assert tints["C3-orig"] and not tints["C1-orig"]
 
     def test_a_window_full_of_posts_already_sent_sends_nothing(self):
         """评审发现：近 7 天窗口、每天发一封，采集停了的那几天窗口里全是前几封发过的 —— 照样每天发一封全是「已发过」的信。

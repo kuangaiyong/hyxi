@@ -276,7 +276,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 
 ## 测试
 
-**576 个测试，交付前必须全部 PASSED**（本机实测 `test_impact.py build` 576 条全过，2026-10-20，865 秒）。但**全量只在最后一次代码改动之后跑一次**
+**580 个测试，交付前必须全部 PASSED**（本机实测 `test_impact.py build` 580 条全过，2026-10-20，871 秒）。但**全量只在最后一次代码改动之后跑一次**
 —— 质量红线的另一半是：它之前的每一轮改动，都要跑到受影响的范围。
 
 ### 什么时候跑什么（在仓库根目录）
@@ -285,7 +285,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 |---|---|---|---|
 | 写用例、红 → 绿 → 反向验证 | 那一两条 | `pytest backend\tests\test_core.py::TestX::test_y` | 秒级~1 分钟 |
 | 一轮修改收尾 | 受影响的用例 | `python scripts\test_impact.py run` | 改舆情服务：151 条 **46 秒**；改采集脚本：82 条 9 分 40 秒（其中 54 条浏览器，省不掉） |
-| 想先要个快信号 | 快道（不起浏览器的 515 条） | `pytest backend\tests -m "not browser" -n 3 --dist loadgroup` | **48 秒**（当时 407 条） |
+| 想先要个快信号 | 快道（不起浏览器的 519 条） | `pytest backend\tests -m "not browser" -n 3 --dist loadgroup` | **48 秒**（当时 407 条） |
 | **交付前（最后一次代码改动之后）** | 全量 + 刷新映射 | `python scripts\test_impact.py build` | 约 12 分钟，全过才写映射，和代码一起提交 |
 | 只要全量结论、不刷映射 | 全量 | `pytest backend\tests -n 3 --dist loadgroup` | **10 分 30 秒左右**（连跑 3 轮 10:30 / 10:29 / 12:02；串行 31 分钟） |
 

@@ -57,8 +57,10 @@ JOB_ID = "notify-daily"
 
 # 新回复时间窗口（天），封闭集合：这个数字会进邮件标题（理由同 post_tree.FRESH_DAYS_CHOICES）
 DAYS_CHOICES = (1, 3, 7, 14)
-# 不设置 = 当前时间往前一天（用户定的）
+# 不设置 = 当前时间往前一天，即近 24 小时、不按自然日（用户定的，2026-10-20 再次明确）
 DAYS_DEFAULT = 1
+# 近这么多小时发表的帖子在邮件里垫一层浅底色，不管窗口选几天（用户定的）
+RECENT_HOURS = 24
 # 新回复超过这么多条：正文只列最新的这么多条，完整内容放进 HTML 附件（用户定的）
 BODY_LIMIT = 20
 # 补译失败后整轮再翻几次（用户定的）；仍有失败就不发
@@ -546,10 +548,17 @@ def _is_new_root(post: dict, base: datetime, days: int) -> bool:
     return bool(at) and at >= base - timedelta(days=days)
 
 
+def _recent(post: dict, since: datetime) -> bool:
+    """近 RECENT_HOURS 小时发表的，邮件里垫底色。每条只看自己的发表时间，不从主贴推到它下面的回复
+    （所以主贴单独包一层，见 _thread_html）"""
+    at = parse_time(post.get("timestamp"))
+    return bool(at) and at >= since
+
+
 def collect_fresh(sources: List[dict], days: int, now: datetime,
                   anchors: Optional[Dict[str, datetime]] = None) -> List[dict]:
-    """每个来源一节：{source, collector_name, threads: [{root, new_root, late_root, repeat_root,
-    replies: [{post, reply_to, late, repeat}]}]}。
+    """每个来源一节：{source, collector_name, base, threads: [{root, new_root, late_root, repeat_root, recent_root,
+    replies: [{post, reply_to, late, repeat, recent}]}]}。base 是换到这个来源时钟的「现在」。
 
     新回复的判据就是结果页「只看新回复」那一个（mark_fresh_replies），基准换成 now（换到来源时间戳的时区）。
     另外两样也进邮件（2026-10-17 用户让我定）：
@@ -558,6 +567,7 @@ def collect_fresh(sources: List[dict], days: int, now: datetime,
     · **补发**（late）：发表在这个来源的补发起点（anchors[来源]，见 _anchors）之后、还没随哪封发送成功的邮件发出去过
       （posts.notified_at 为空）的回复和新主贴。采集晚了、某一轮失败、采集停了几天，都落在这一条里
     窗口里的条目要是前几封已经发过（窗口比发送间隔长时会这样），照用户定的窗口照列，标「已发过」（repeat）方便跳过。
+    近 24 小时发表的（recent / recent_root，主贴、回复都算）垫底色，不管窗口选几天（2026-10-20 用户要求），基准同窗口。
     老主贴只作上下文 —— 回复脱离主贴读不懂。主贴按发表时间从新到旧（同结果页和导出），串里的新回复按发表先后
     """
     sections = []
@@ -568,6 +578,7 @@ def collect_fresh(sources: List[dict], days: int, now: datetime,
         flat = {sid} if collector and collector.thread_kind == "thread" else set()
         base = _source_now(collector, now)
         floor = base - timedelta(days=days)
+        recent_from = base - timedelta(hours=RECENT_HOURS)
         anchor = (anchors or {}).get(sid)
         start = min(floor, _source_now(collector, anchor)) if anchor else floor
         # 一次组树挑全部候选：窗口和补发都在「起点之后」里（起点最晚也就是窗口起点），再按时间、发没发过分开
@@ -609,11 +620,14 @@ def collect_fresh(sources: List[dict], days: int, now: datetime,
                 # 第 2 层起写明回的是谁（同结果页）；直接回主贴的不用写
                 reply_to = parent["username"] if parent and post_key(parent) != post_key(root) else ""
                 group(root)["replies"].append({"post": p, "reply_to": reply_to,
-                                               "late": key in late_replies, "repeat": repeat})
+                                               "late": key in late_replies, "repeat": repeat,
+                                               "recent": _recent(p, recent_from)})
         ordered = sorted(groups.values(), key=lambda g: sort_time(g["root"].get("timestamp")), reverse=True)
         for g in ordered:
             g["replies"].sort(key=lambda r: parse_time(r["post"].get("timestamp")))
-        sections.append({"source": source, "threads": ordered,
+            g["recent_root"] = _recent(g["root"], recent_from)
+        # base 留给 _newest：跨来源比新旧要按各自的时钟算「发表了多久」，墙上时间直接比会差出时区
+        sections.append({"source": source, "threads": ordered, "base": base,
                          "collector_name": collector.display_name if collector else source.get("collector_id", "")})
     return sections
 
@@ -734,11 +748,18 @@ _FONT = "font-family:-apple-system,'Segoe UI','PingFang SC','Microsoft YaHei',Ar
 _META = "color:#6b7280;font-size:12px"
 _ORIG = "margin:6px 0 0;color:#6b7280;font-size:13px;line-height:1.6"
 _ZH = "margin:4px 0 0;color:#111827;font-size:14px;line-height:1.6"
-_CARD = "border:1px solid #e5e7eb;border-radius:8px;padding:12px 14px;margin:0 0 12px"
-_REPLY = "margin:12px 0 0 14px;padding:2px 0 2px 10px;border-left:3px solid #f59e0b"
+_CARD = "border:1px solid #e5e7eb;border-radius:8px;padding:4px;margin:0 0 12px"
+# 主贴、回复各占一块，垫不垫底色内边距都一样：只在垫色时加内边距，同一封信里的卡片会错位（评审发现）。
+# 卡片的内边距相应减掉，文字的横向位置和原来一样；纵向每条回复多出几像素，相邻的两个垫色块才隔得开
+_ROOT = "padding:8px 10px;border-radius:6px"
+_REPLY = "margin:8px 0 0 24px;padding:6px 10px;border-left:3px solid #f59e0b;border-radius:0 6px 6px 0"
 _BADGE = "display:inline-block;padding:0 6px;border-radius:4px;background:#eef2ff;color:#4338ca;font-size:12px"
 _NEW_BADGE = "display:inline-block;padding:0 6px;border-radius:4px;background:#fff7ed;color:#c2410c;font-size:12px"
 _LATE_TAG = "display:inline-block;padding:0 6px;border-radius:4px;background:#f1f5f9;color:#475569;font-size:12px"
+# 近 24 小时发表的帖子垫的底色：浅、不艳（用户要求）。用绿是因为蓝、橙、灰几种标签垫在上面还分得清
+_RECENT_BG = "#e8f5e9"
+_TINT = f"background:{_RECENT_BG}"
+_RECENT_TAG = f"display:inline-block;padding:0 6px;border-radius:4px;background:{_RECENT_BG};color:#374151;font-size:12px"
 
 
 def _esc(text: str) -> str:
@@ -781,14 +802,18 @@ def _thread_html(thread: dict) -> str:
     for r in thread["replies"]:
         p = r["post"]
         to = f' <span style="{_META}">回复 {_esc(r["reply_to"])}</span>' if r["reply_to"] else ""
+        style = f"{_REPLY};{_TINT}" if r.get("recent") else _REPLY
         replies.append(
-            f'<div class="reply" style="{_REPLY}"><div>↳ <b>{_esc(p.get("username"))}</b>{to} '
+            f'<div class="reply" style="{style}"><div>↳ <b>{_esc(p.get("username"))}</b>{to} '
             f'<span style="{_META}">{_esc(_time(p))}</span>{_tags(r.get("late"), r.get("repeat"))}</div>'
             f'{_body_html(p)}</div>')
     # 新主贴是新内容本身，全文照登；老主贴只是上下文，太长截断。正文截取时没排进最新那几条、只因为它的回复排进去了
     # 才出现的新主贴（clip_root），在正文里也只是上下文 —— 全文在附件里
     body = _body_html(root, None if new and not thread.get("clip_root") else ROOT_CLIP)
-    return f'<div class="thread" style="{_CARD}">{head}{body}{"".join(replies)}</div>'
+    # 主贴单独包一层：底色只垫主贴自己，不连着下面的回复（见 _recent）
+    root_style = f"{_ROOT};{_TINT}" if thread.get("recent_root") else _ROOT
+    return (f'<div class="thread" style="{_CARD}"><div class="root" style="{root_style}">{head}{body}</div>'
+            f'{"".join(replies)}</div>')
 
 
 def _tags(late: bool, repeat: bool) -> str:
@@ -818,13 +843,17 @@ def render_html(sections: List[dict], days: int, now: datetime, title: str,
     """一份完整的 HTML 文档：邮件正文和附件都用它（附件要能单独用浏览器打开）。样式全部内联 —— 邮件客户端常把 <style> 剥掉"""
     start = (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
     end = now.strftime("%Y-%m-%d %H:%M")
+    # 图例只在真有垫了底色的帖子时放：有图例却找不到对应的帖子，读的人会以为漏了
+    legend = (f' · <span style="{_RECENT_TAG}">近 {RECENT_HOURS} 小时发表</span>'
+              if any(t.get("recent_root") or any(r.get("recent") for r in t["replies"])
+                     for s in sections for t in s["threads"]) else "")
     return (
         '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
         f'<title>{_esc(title)}</title></head>'
         '<body style="margin:0;padding:16px;background:#ffffff">'
         f'<div style="{_FONT};max-width:760px;margin:0 auto;color:#111827;font-size:14px">'
         '<h2 style="margin:0 0 4px;font-size:18px">HYXi 新回复 / 新主贴摘要</h2>'
-        f'<p style="{_META};margin:0 0 12px">近 {days} 天（{start} ～ {end}）· {_label(*counts)}{extras} · 只含已采集到的数据</p>'
+        f'<p style="{_META};margin:0 0 12px">近 {days} 天（{start} ～ {end}）· {_label(*counts)}{extras} · 只含已采集到的数据{legend}</p>'
         f'{note}{"".join(_section_html(s, days) for s in sections)}'
         f'<p style="{_META};margin-top:20px">由 HYXi 舆情分析平台发送 · 生成于 {end}</p>'
         '</div></body></html>'
@@ -832,15 +861,16 @@ def render_html(sections: List[dict], days: int, now: datetime, title: str,
 
 
 def _newest(sections: List[dict], limit: int) -> List[dict]:
-    """只留最新的 limit 条新内容（新回复和新主贴放在一起按时间排）。来源、串的结构不变，空了的串去掉；
-    每节记下原来的条数和「截过没有」，标题照实说"""
-    stamped = []
+    """只留最新的 limit 条新内容（新回复和新主贴放在一起，按发表了多久排）。来源、串的结构不变，空了的串去掉；
+    每节记下原来的条数和「截过没有」，标题照实说。「发表了多久」按各来源自己的时钟算（collect_fresh 留下的 base）：
+    墙上时间直接比的话，荷兰时间的楼层会被当成早了 6~7 小时、挤出正文（评审发现）"""
+    aged = []
     for s in sections:
         for t in s["threads"]:
             if t.get("new_root"):
-                stamped.append((parse_time(t["root"].get("timestamp")), id(t)))
-            stamped.extend((parse_time(r["post"].get("timestamp")), id(r)) for r in t["replies"])
-    keep = {i for _, i in sorted(stamped, key=lambda x: x[0], reverse=True)[:limit]}
+                aged.append((s["base"] - parse_time(t["root"].get("timestamp")), id(t)))
+            aged.extend((s["base"] - parse_time(r["post"].get("timestamp")), id(r)) for r in t["replies"])
+    keep = {i for _, i in sorted(aged, key=lambda x: x[0])[:limit]}
     out = []
     for s in sections:
         threads, shown = [], 0

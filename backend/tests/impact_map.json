@@ -1,7 +1,7 @@
 {
 "version": 2,
-"built_at": "2026-10-20T12:08:12",
-"git_head": "e48404192ee2dda421bed37266f1079f92db7458",
+"built_at": "2026-10-20T18:58:14",
+"git_head": "b7d8d5ca544a57997a6a35f0df1e7f8feef3e3e1",
 "tests": [
 "backend/tests/test_api.py::TestAPIEndpointsEndToEnd::test_404_for_nonexistent_task",
 "backend/tests/test_api.py::TestAPIEndpointsEndToEnd::test_cancel_task",
@@ -550,7 +550,11 @@
 "backend/tests/test_notify.py::TestNotifyDigestEndToEnd::test_a_tweakers_topic_is_never_a_new_main_post",
 "backend/tests/test_notify.py::TestNotifyDigestEndToEnd::test_exactly_20_stay_in_the_body",
 "backend/tests/test_notify.py::TestNotifyDigestEndToEnd::test_more_than_20_new_replies_go_into_an_html_attachment",
+"backend/tests/test_notify.py::TestNotifyDigestEndToEnd::test_nothing_from_the_last_24_hours_means_no_background_and_no_legend",
 "backend/tests/test_notify.py::TestNotifyDigestEndToEnd::test_nothing_new_sends_nothing",
+"backend/tests/test_notify.py::TestNotifyDigestEndToEnd::test_posts_from_the_last_24_hours_get_a_light_background",
+"backend/tests/test_notify.py::TestNotifyDigestEndToEnd::test_the_body_keeps_the_newest_20_by_real_time_across_sources",
+"backend/tests/test_notify.py::TestNotifyDigestEndToEnd::test_the_default_window_is_exactly_the_last_24_hours",
 "backend/tests/test_notify.py::TestNotifyDigestEndToEnd::test_the_default_window_is_one_day_back_from_now",
 "backend/tests/test_notify.py::TestNotifyDigestEndToEnd::test_the_mail_shows_source_original_and_translation_and_nothing_else",
 "backend/tests/test_notify.py::TestNotifyDigestEndToEnd::test_the_scheduled_send_takes_the_same_path",
@@ -1112,7 +1116,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/auth.py": [
 0,
@@ -1303,7 +1311,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/collectors/__init__.py": [
 0,
@@ -1615,7 +1627,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/collectors/base.py": [
 0,
@@ -1927,7 +1943,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/collectors/facebook_group.py": [
 0,
@@ -2239,7 +2259,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/collectors/group_feed.py": [
 0,
@@ -2551,7 +2575,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/collectors/tweakers.py": [
 0,
@@ -2863,7 +2891,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/logging_config.py": [
 0,
@@ -3103,7 +3135,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/models.py": [
 0,
@@ -3441,7 +3477,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/routers/__init__.py": [
 0,
@@ -3637,7 +3677,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/routers/config.py": [
 0,
@@ -3853,7 +3897,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/routers/notify.py": [
 0,
@@ -4044,7 +4092,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/routers/results.py": [
 0,
@@ -4261,7 +4313,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/routers/schedules.py": [
 0,
@@ -4452,7 +4508,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/routers/sources.py": [
 0,
@@ -4644,7 +4704,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/routers/tasks.py": [
 0,
@@ -4840,7 +4904,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/services/__init__.py": [
 0,
@@ -5347,7 +5415,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/services/collector_runner.py": [
 0,
@@ -5650,7 +5722,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/services/crypto.py": [
 0,
@@ -5944,7 +6020,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/services/excel_service.py": [
 0,
@@ -6210,7 +6290,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/services/llm_service.py": [
 0,
@@ -6548,7 +6632,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/services/llm_utils.py": [
 0,
@@ -6883,7 +6971,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/services/notify_service.py": [
 0,
@@ -7082,7 +7174,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/services/orchestrator.py": [
 0,
@@ -7320,7 +7416,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/services/post_tree.py": [
 0,
@@ -7696,7 +7796,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/services/progress_manager.py": [
 0,
@@ -8092,7 +8196,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/services/scheduler_service.py": [
 0,
@@ -8286,7 +8394,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/services/sentiment_service.py": [
 0,
@@ -8535,7 +8647,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/services/source_service.py": [
 0,
@@ -8829,7 +8945,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/services/storage.py": [
 0,
@@ -9329,7 +9449,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/services/translator_service.py": [
 0,
@@ -9658,7 +9782,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/app/services/vision_service.py": [
 0,
@@ -9978,7 +10106,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/main.py": [
 0,
@@ -10197,7 +10329,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/run_server.py": [
 300,
@@ -10350,13 +10486,13 @@
 529,
 531,
 534,
-569,
-570,
-571,
-572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/tests/fixtures/login_site.py": [
 172,
@@ -10453,10 +10589,10 @@
 551,
 552,
 553,
+554,
+555,
+556,
 557,
-558,
-559,
-560,
 561,
 562,
 563,
@@ -10471,7 +10607,11 @@
 572,
 573,
 574,
-575
+575,
+576,
+577,
+578,
+579
 ],
 "backend/tests/fixtures/tweakers_site/page_0.html": [
 249,
@@ -11108,7 +11248,7 @@
 "backend/app/services/excel_service.py": "d79af7c8ed8d5a9edc4e881474d5e5986690c56c",
 "backend/app/services/llm_service.py": "e3000911d890a2d715dd89ef221270a2de61e8c1",
 "backend/app/services/llm_utils.py": "c83876082f2e2601f8804fa11545109507ea1822",
-"backend/app/services/notify_service.py": "20f24b05582325a8e88a36b37da5b56a05e74b03",
+"backend/app/services/notify_service.py": "bdffeab6777b0ba17c4f4c96c5ac6c05cbb6465e",
 "backend/app/services/orchestrator.py": "95d970b124bee33da528db579a37dc4c3b45d4a4",
 "backend/app/services/post_tree.py": "2a905c6e2c043f0bda4ada1d5be08e1fa077c676",
 "backend/app/services/progress_manager.py": "c9dc5e748a5f85c05d4e9cc2b38b92e3f3514fe6",
@@ -11119,7 +11259,7 @@
 "backend/app/services/translator_service.py": "3b0e0c46e38001e6b3f591c9df0f5be4499f5f43",
 "backend/app/services/vision_service.py": "b1e3f21ac1c141fe77d9f3a9ae6ec489f0207f52",
 "backend/app/utils/__init__.py": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
-"backend/main.py": "70d50f296499768c654310a2273b59e10e734882",
+"backend/main.py": "14a54d535e4a9798478daed58446d58cc1c81c4f",
 "backend/run_server.py": "c0f15dbdbb6110d57e2b9218b23023284c47f86c",
 "backend/tests/fixtures/fixture_site.py": "8fe9fe2c1530090aeb4d929a83a196e717c18346",
 "backend/tests/fixtures/golden_tweakers.json": "73f65758ec967801f5f8768b17410adae843614a",
@@ -11135,7 +11275,7 @@
 "backend/tests/test_api.py": "946b5bac29adb4a5823f535f8883f820f318efb6",
 "backend/tests/test_core.py": "b45d3b89c2b11cc5f3a86d4aecd331e47ebf6eb8",
 "backend/tests/test_impact.py": "5dad5fd89344d67fc4248d41543e366ee4cad25d",
-"backend/tests/test_notify.py": "2774d31d834fc206baac543deb6a21d039250c52",
+"backend/tests/test_notify.py": "3c2766035374049fdcaae911d9e6f39b877dcd05",
 "collectors/facebook_group.js": "c63abc4fa57a2bdb4855394cdadf19f95d91dbfc",
 "collectors/group_feed.js": "f8e255229d63406d201d27576a0a1b0d39ff0733",
 "collectors/lib/auth.js": "07c6f4d382e7d14cf4f145ed7b54e970e6893f7e",

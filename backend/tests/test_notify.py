@@ -44,6 +44,11 @@ def post(fp, user, hours_ago, content, translation="", parent=None, level=0, src
     }
 
 
+def trust(fingerprint: str, host: str = "localhost") -> dict:
+    """一条信任的证书：绑在读到它的那台服务器上（TLS 替身的用例里服务器地址是 localhost，见 _payload）"""
+    return {"host": host, "fingerprint": fingerprint}
+
+
 def collect_step(src, status="completed"):
     return ("collect", {"source_id": src}, status)
 
@@ -270,17 +275,22 @@ class TestNotifyConfigEndToEnd(_NotifyBase):
         assert crypto.decrypt(stored["password_enc"]) == PASSWORD
 
     def test_blank_password_keeps_the_saved_one_only_for_the_same_server_and_user(self):
-        """留空 = 不修改。但服务器或用户名换了还沿用旧密码，等于把它发给一台新的服务器（谁都能借这个口子套出来）"""
+        """留空 = 不修改。但服务器或用户名换了还沿用旧密码，等于把它发给一台新的服务器（谁都能借这个口子套出来）。
+        实际连的端口、「使用 SSL」也算：已保存的是本机中继时，只改端口就能连到自己在本机监听的端口、明文收走密码（评审发现）。
+        没在用的那个端口（不勾 SSL 时的 SSL 端口）改了不算"""
         from app.services import crypto
         self._save(self._payload())
         body = self._save(self._payload(password="", recipients=["new@example.test"]))
         assert body["has_password"] is True and body["recipients"] == ["new@example.test"], body
         assert crypto.decrypt(self.storage.get_app_config("notify")["password_enc"]) == PASSWORD
 
-        for change in ({"smtp_host": "smtp.evil.test"}, {"username": "other@example.test"}):
+        for change in ({"smtp_host": "smtp.evil.test"}, {"username": "other@example.test"},
+                       {"smtp_port": 2525}, {"use_ssl": True}):
             resp = self.client.put("/api/v1/notify/config", json=self._payload(password="", **change))
             assert resp.status_code == 400 and "重新填写密码" in resp.json()["detail"], (change, resp.text)
         assert self.client.get("/api/v1/notify/config").json()["smtp_host"] == "127.0.0.1", "被拒的保存改动了配置"
+        unused = self._save(self._payload(password="", smtp_ssl_port=1465))
+        assert unused["smtp_ssl_port"] == 1465 and unused["has_password"] is True, unused
 
     def test_bad_input_is_refused_with_the_reason(self):
         cases = [
@@ -297,6 +307,9 @@ class TestNotifyConfigEndToEnd(_NotifyBase):
             ({"smtp_host": "  "}, "SMTP 服务器"),
             ({"username": ""}, "用户名"),
             ({"password": ""}, "密码"),
+            ({"trusted_certs": [trust("not-a-fingerprint")]}, "指纹"),
+            ({"trusted_certs": [trust("ab" * 32, host=" ")]}, "哪台服务器"),
+            ({"trusted_certs": [trust(f"{i:064x}") for i in range(11)]}, "最多 10 张"),
         ]
         for change, word in cases:
             resp = self.client.put("/api/v1/notify/config", json=self._payload(**change))
@@ -511,6 +524,197 @@ class TestNotifySmtpEndToEnd(_NotifyBase):
         assert [a.get("mech", "PLAIN") for a in site.auths] == ["PLAIN", "LOGIN"], site.auths
         assert len(site.messages) == 1
 
+    def test_a_self_signed_certificate_is_refused_with_its_fingerprint_before_logging_in(self):
+        """用户在公司内网实测报过（2026-10-22）：「<公司邮件服务器>:25 的证书校验没通过（self-signed certificate）」。
+        公司的邮件服务器用自签证书；同事的程序能发，是因为 smtplib.starttls() 不传 context 时根本不校验证书。
+        这边照旧严格校验，但要把这张证书的指纹和概况给出来，让人核对后只信任这一张（用户定的）。密码一个字都不能发出去"""
+        import smtp_site
+        with smtp_site.SmtpSite(tls="starttls", password=PASSWORD, trusted=False) as site:
+            body = self._test_mail(site)
+        assert body["success"] is False and "self-signed certificate" in body["message"], body
+        cert = body["untrusted_cert"]
+        assert cert and cert["fingerprint"] == site.cert_fingerprint and cert["host"] == "localhost", body
+        assert "localhost" in cert["subject"] and cert["subject"] == cert["issuer"], cert
+        assert self.notify._colon(site.cert_fingerprint) in body["message"], "每天定时发送失败时只有这句话，指纹得写在里面"
+        assert site.auths == [] and site.messages == [], "还没信任就把密码发出去了"
+
+    def test_trusting_that_certificate_lets_the_mail_through(self):
+        """页面上点「信任这张证书」= 把「这台服务器 + 它的 SHA-256 指纹」带进配置。冒号、大小写都认（页面上显示的就是 AB:CD:… 这种）"""
+        import smtp_site
+        with smtp_site.SmtpSite(tls="starttls", password=PASSWORD, trusted=False) as site:
+            body = self._test_mail(site, trusted_certs=[trust(self.notify._colon(site.cert_fingerprint))])
+        assert body["success"] is True and not body.get("untrusted_cert"), body
+        assert [a["tls"] for a in site.auths] == [True] and len(site.messages) == 1, site.auths
+
+    def test_a_certificate_not_among_the_trusted_ones_is_refused_before_logging_in(self):
+        """信任的只是那几张：换了证书、或是冒充的服务器，照样拦下。报错只说确知的（不在信任的证书里），不猜是哪种"""
+        import smtp_site
+        with smtp_site.SmtpSite(tls="starttls", password=PASSWORD, trusted=False) as site:
+            body = self._test_mail(site, trusted_certs=[trust("ab" * 32)])
+        assert body["success"] is False and "也不是信任的证书" in body["message"], body
+        assert body["untrusted_cert"]["fingerprint"] == site.cert_fingerprint, body
+        assert site.auths == [] and site.messages == [], "证书对不上还把密码发出去了"
+
+    def test_more_than_one_certificate_can_be_trusted(self):
+        """负载均衡后面几台服务器各用一张自签证书时，每张都要能信任（评审提醒：只认一张就会时好时坏）"""
+        import smtp_site
+        with smtp_site.SmtpSite(tls="starttls", password=PASSWORD, trusted=False) as site:
+            body = self._test_mail(site, trusted_certs=[trust("ab" * 32), trust(site.cert_fingerprint)])
+        assert body["success"] is True, body
+
+    def test_a_newly_trusted_certificate_needs_the_password_again(self):
+        """评审在真应用上复现过：密码留空沿用已保存的那条规则只看服务器和用户名，能调接口的人填上自己证书的指纹、
+        再冒充这台服务器，就能把已保存的密码引过去。新信任一张证书 = 认下新的服务器身份，必须重填密码；
+        信任过的照旧、取消信任，都不用"""
+        import smtp_site
+        with smtp_site.SmtpSite(tls="starttls", password=PASSWORD, trusted=False) as site:
+            self._save(self._payload(site))
+            sneaky = self._payload(site, password="", trusted_certs=[trust(site.cert_fingerprint)])
+            for method, path in (("post", "/api/v1/notify/test"), ("put", "/api/v1/notify/config")):
+                resp = getattr(self.client, method)(path, json=sneaky)
+                assert resp.status_code == 400 and "重新填写密码" in resp.json()["detail"], (path, resp.text)
+            assert site.auths == [], "没重填密码就把已保存的密码交给了新信任的证书"
+            self._save(self._payload(site, trusted_certs=[trust(site.cert_fingerprint)]))     # 重填了密码：可以
+            # 去掉一张、换上另一张，条数没变也是新信任（只比条数、只拦真超集的写法都漏这一种，评审发现）
+            swapped = self.client.put("/api/v1/notify/config",
+                                      json=self._payload(site, password="", trusted_certs=[trust("ab" * 32)]))
+            assert swapped.status_code == 400 and "重新填写密码" in swapped.json()["detail"], swapped.text
+            again = self._test_mail(site, password="", trusted_certs=[trust(site.cert_fingerprint)])
+            dropped = self._save(self._payload(site, password="", trusted_certs=[]))
+        assert again["success"] is True, again
+        assert dropped["trusted_certs"] == [] and dropped["has_password"] is True, dropped
+
+    def test_the_ssl_port_honours_the_trusted_certificate_too(self):
+        import smtp_site
+        with smtp_site.SmtpSite(tls="ssl", password=PASSWORD, trusted=False) as site:
+            refused = self._test_mail(site)
+            trusted = self._test_mail(site, trusted_certs=[trust(site.cert_fingerprint)])
+        assert refused["success"] is False and refused["untrusted_cert"]["fingerprint"] == site.cert_fingerprint, refused
+        assert trusted["success"] is True, trusted
+        assert site.auths == [{"user": "hyxi@example.test", "password": PASSWORD, "tls": True}], site.auths
+
+    def test_a_properly_verified_certificate_ignores_a_stale_trusted_one(self):
+        """IT 后来换上了正规证书：严格校验过得去就照常发，之前信任的那张指纹不碍事"""
+        import smtp_site
+        with smtp_site.SmtpSite(tls="starttls", password=PASSWORD) as site:
+            body = self._test_mail(site, trusted_certs=[trust("ab" * 32)])
+        assert body["success"] is True, body
+
+    def test_a_certificate_the_parser_cannot_read_can_still_be_trusted(self):
+        """评审实测：有的证书 OpenSSL 照常握手，cryptography 却解析不了。解析失败要是连指纹都不给，
+        这张证书就永远信任不了，接口还被当成 400「填得不对」或直接 500。指纹对字节算，概况解析不了就留空。
+        两种都要接住：PrintableString 里有下划线（抛 ValueError）、名字里有它不认识的标签（抛的是 KeyError）"""
+        import smtp_site
+        for kind in ("printable", "tag"):
+            with smtp_site.SmtpSite(tls="starttls", password=PASSWORD, trusted=False, odd_cert=kind) as site:
+                refused = self._test_mail(site)
+                trusted = self._test_mail(site, trusted_certs=[trust(site.cert_fingerprint)])
+            assert refused["success"] is False and refused["untrusted_cert"]["fingerprint"] == site.cert_fingerprint, (kind, refused)
+            assert refused["untrusted_cert"]["subject"] == "", (kind, refused)
+            assert trusted["success"] is True and len(site.messages) == 1, (kind, trusted)
+
+    def test_when_reading_the_certificate_fails_the_original_reason_is_kept(self):
+        """严格校验没过、为读证书再连一次时被拒（421 连接数超限）：确知的原因还是证书校验没过，报错以它为主，
+        不能被翻成别的（评审实测过只剩一句 421、一字不提证书）"""
+        import smtp_site
+        with smtp_site.SmtpSite(tls="starttls", password=PASSWORD, trusted=False, second_connection="refuse") as site:
+            body = self._test_mail(site)
+        msg = body["message"]
+        assert body["success"] is False and "证书校验没通过" in msg and "self-signed certificate" in msg, body
+        # 匹配整句：只认「421」的话，报错开头的端口号里凑巧带 421 也能过（评审发现）
+        assert "421，服务器原话：4.7.0 too many connections" in msg and not body.get("untrusted_cert"), body
+        assert site.auths == [], site.auths
+
+    def test_a_rejected_ehlo_on_the_second_connection_keeps_the_server_reply(self):
+        """smtplib 的 ehlo() 遇到 421 不抛，只当服务器没有扩展 —— 以前这一句被说成「服务器没有提供加密」，
+        服务器原话丢了，人会转去改 SSL 设置（评审实测过）。照实报 421 和原话"""
+        import smtp_site
+        with smtp_site.SmtpSite(tls="starttls", password=PASSWORD, trusted=False, second_connection="busy") as site:
+            body = self._test_mail(site)
+        msg = body["message"]
+        assert body["success"] is False and "证书校验没通过" in msg, body
+        assert "421，服务器原话：4.7.0 Too many connections" in msg and "没有提供加密" not in msg, body
+        assert site.auths == [], site.auths
+
+    def test_a_second_connection_without_encryption_is_not_trusted(self):
+        """本机中继第二次连接时不再通告 STARTTLS：拿到的是明文连接，没有证书可比 —— 不能信任，以前接着读证书就 500（评审实测过）"""
+        import smtp_site
+        with smtp_site.SmtpSite(tls="starttls", password=PASSWORD, trusted=False, second_connection="plain") as site:
+            body = self._test_mail(site, trusted_certs=[trust(site.cert_fingerprint)])
+        msg = body["message"]
+        assert body["success"] is False and "证书校验没通过" in msg and "没有提供加密" in msg and "勾选" not in msg, body
+        assert site.auths == [], "明文连接上把密码发出去了"
+
+    def test_a_remote_server_dropping_starttls_on_the_second_connection_is_not_told_to_tick_ssl(self):
+        """外部服务器第二次连接时不再通告 STARTTLS：以前报错里带出 _connect 那句「请勾选使用 SSL」，可第一次正是在
+        STARTTLS 里校验失败的，照着改没用（评审发现）。只说确知的：校验没过、再连一次时没有加密"""
+        import smtp_site
+        ip = lan_ip()
+        if not ip:
+            pytest.skip("本机没有非回环的 IPv4，模拟不出「外部」服务器")
+        with smtp_site.SmtpSite(tls="starttls", password=PASSWORD, trusted=False, host="0.0.0.0",
+                                second_connection="plain") as site:
+            body = self._test_mail(site, smtp_host=ip)
+        msg = body["message"]
+        assert body["success"] is False and "证书校验没通过" in msg and "没有提供加密" in msg and "勾选" not in msg, body
+        assert site.auths == []
+
+    def test_a_trusted_certificate_only_counts_for_its_own_server(self):
+        """信任绑在读到证书的那台服务器上：给 localhost 信任的证书，换成 127.0.0.1 访问就不算数 —— 只存指纹的话，
+        握有那张证书私钥的人就能冒充别的服务器（评审发现）。给新地址再信任一次就行，不会原地打转（评审实测过上一版的死循环）"""
+        import smtp_site
+        with smtp_site.SmtpSite(tls="starttls", password=PASSWORD, trusted=False) as site:
+            fp = site.cert_fingerprint
+            self._save(self._payload(site, trusted_certs=[trust(fp)]))
+            elsewhere = self._test_mail(site, smtp_host="127.0.0.1", trusted_certs=[trust(fp)])
+            again = self._test_mail(site, smtp_host="127.0.0.1", trusted_certs=[trust(fp), trust(fp, "127.0.0.1")])
+            saved = self._save(self._payload(site, smtp_host="127.0.0.1", trusted_certs=[trust(fp), trust(fp, "127.0.0.1")]))
+        assert elsewhere["success"] is False and elsewhere["untrusted_cert"]["host"] == "127.0.0.1", elsewhere
+        assert again["success"] is True, again
+        assert saved["trusted_certs"] == [trust(fp), trust(fp, "127.0.0.1")], saved
+        assert len(site.auths) == 1, "给别的服务器信任的证书放行了"
+
+    def test_the_send_record_shows_the_fingerprint_when_the_certificate_is_not_trusted(self):
+        """「立即发送」和每天定时撞上没信任的证书时，发送记录里要有指纹（好拿去和管理员核对），还要带上证书信息 ——
+        页面在记录下面给「信任这张证书」：负载均衡后面时，测试邮件未必撞得上定时发送碰到的那一台（评审发现）"""
+        import smtp_site
+        self._seed_standard()
+        with smtp_site.SmtpSite(tls="starttls", password=PASSWORD, trusted=False) as site:
+            self._save(self._payload(site))
+            status = self._run(self._send_and_wait())
+        last = status["last"]
+        assert last["outcome"] == "failed" and self.notify._colon(site.cert_fingerprint) in last["message"], status
+        assert last["untrusted_cert"]["fingerprint"] == site.cert_fingerprint, status
+        assert last["untrusted_cert"]["host"] == "localhost", status
+        assert site.auths == [] and site.messages == []
+
+    def test_a_rejected_ehlo_on_the_first_connection_is_reported_with_the_server_reply(self):
+        """EHLO 被拒（smtplib 不抛、只当没扩展）以前会被当成「不支持 STARTTLS」。拦下来之后走通用分支，
+        报错要是「421，服务器原话：…」，不是 str(e) 那种「(421, b'…')」（评审发现）。
+        SSL 端口也一样 —— 起初只在普通端口那条路上拦了，SSL 端口上只剩一句「连接断了」（评审实测过）"""
+        import smtp_site
+        for tls in ("none", "ssl"):
+            with smtp_site.SmtpSite(tls=tls, password=PASSWORD, ehlo_reject=True) as site:
+                body = self._test_mail(site)
+            msg = body["message"]
+            assert body["success"] is False and "421，服务器原话：4.7.0 Too many connections" in msg, (tls, body)
+            assert "b'" not in msg and "STARTTLS" not in msg and "unexpectedly closed" not in msg, (tls, body)
+
+    def test_the_saved_trusted_certificate_is_used_when_sending_the_digest(self):
+        """「立即发送」和每天定时用的是保存下来的配置：存进去的指纹归一成 64 位小写十六进制，发摘要时照样认它。
+        指纹的冒号、空格、大小写和主机名的大小写都认，同一张写两遍只算一张 —— 张数上限在去重之后判（这里 11 项、去重后正好 10 张）"""
+        import smtp_site
+        self._seed_standard()
+        with smtp_site.SmtpSite(tls="starttls", password=PASSWORD, trusted=False) as site:
+            fp = site.cert_fingerprint
+            spaced = " ".join(fp[i:i + 2] for i in range(0, 64, 2))
+            others = [trust(f"{i:064x}") for i in range(9)]
+            saved = self._save(self._payload(site, trusted_certs=[trust(self.notify._colon(fp)), trust(spaced, " LocalHost ")] + others))
+            assert saved["trusted_certs"] == [trust(fp)] + others, saved
+            status = self._run(self._send_and_wait())
+        assert status["last"]["outcome"] == "sent", status
+        assert len(site.messages) == 1 and [a["tls"] for a in site.auths] == [True]
+
     def test_an_unreachable_server_says_where_it_tried(self):
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
@@ -548,7 +752,7 @@ class TestNotifyDigestEndToEnd(_NotifyBase):
         seen = {}
         for days, extra in ((3, ("C3-orig", "F3-orig")), (14, ("C4-orig",))):
             with smtp_site.SmtpSite() as site:
-                status = self._send(site, days=days, password="" if seen else PASSWORD)
+                status = self._send(site, days=days)
             html = self._html(site.message())
             for word in ("C1-orig", "C2-orig", "C5-orig", "F2-orig") + extra:
                 assert word in html, (days, word)
@@ -1134,7 +1338,7 @@ class TestNotifyCatchUpEndToEnd(_NotifyBase):
         self._seed([post("back", "u_b", 60, "BACK-orig", "BACK-zh", parent="r1", level=1),     # 恢复后才采到
                     post("before", "u_x", 93, "BEFORE-orig", "BEFORE-zh", parent="r1", level=1)])
         with smtp_site.SmtpSite() as site:
-            self._send(site, source_ids=[FB], password="")
+            self._send(site, source_ids=[FB])
         html = self._html(site.message())
         assert "BACK-orig" in html and "BEFORE-orig" not in html, html[:1500]
 
@@ -1168,7 +1372,7 @@ class TestNotifyCatchUpEndToEnd(_NotifyBase):
         html = self._html(site.message())
         assert "UNTRANSLATABLE late reply" in html and "（尚未翻译）" in html and "补发" in html
         with smtp_site.SmtpSite() as site:
-            again = self._send(site, source_ids=[FB], password="")
+            again = self._send(site, source_ids=[FB])
         assert again["last"]["outcome"] == "skipped", "发过的补发帖子又被挑了出来"
 
     def test_the_anchor_is_kept_per_source(self):
@@ -1199,7 +1403,7 @@ class TestNotifyCatchUpEndToEnd(_NotifyBase):
         self._save(self._payload(source_ids=[TW]))                       # 取消勾选 FB
         assert FB not in self._anchors()
         with smtp_site.SmtpSite() as site:
-            self._send(site, source_ids=[FB, TW], password="")           # 又勾回来
+            self._send(site, source_ids=[FB, TW])                        # 又勾回来
         html = self._html(site.message())
         assert "C1-orig" in html and "MID-orig" not in html, html[:1500]
 

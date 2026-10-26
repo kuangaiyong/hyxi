@@ -10,7 +10,9 @@ EHLO / STARTTLS / AUTH PLAIN / MAIL / RCPT / DATA / RSET / NOOP / QUIT。换掉�
         site.port / site.messages / site.auths
 
 tls 不是 none 时，进出 with 会设上 / 还原 `SSL_CERT_FILE`，让发信那一侧的 `ssl.create_default_context()`
-认这张现生成的证书。生产环境不设它，照样严格校验真证书 —— 所以这里不需要、也不该在被测代码里开任何「不校验」的口子。
+认这张现生成的证书。生产环境不设它，照样严格校验真证书 —— 被测代码里唯一不校验的连接是 notify_service._pinned
+那一条（只读证书比指纹，对上了才登录）。`trusted=False` 时不设，复刻公司内网那种自签证书：严格校验必然不过，
+只有用户按指纹信任了这一张才发得出去（`site.cert_fingerprint` 是它的 SHA-256）。
 **with 块里别发真 HTTPS 请求**：httpx 也认 `SSL_CERT_FILE`，块里就只信这张自签证书了，调真模型会报
 CERTIFICATE_VERIFY_FAILED（2026-10-16 用真实数据核实时踩过）。llm_site 是 http，不受影响。
 """
@@ -19,6 +21,7 @@ import base64
 import datetime
 import email
 import email.policy
+import hashlib
 import ipaddress
 import os
 import shutil
@@ -33,10 +36,18 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 
-def _make_cert(folder: str):
-    """自签证书，SAN 同时给 localhost 和 127.0.0.1（连哪个名字都过得了主机名校验）"""
+def _make_cert(folder: str, odd: str = ""):
+    """自签证书，SAN 同时给 localhost 和 127.0.0.1（连哪个名字都过得了主机名校验）。
+
+    odd 不为空时造一张 OpenSSL 照常加载、握手，cryptography 却解析不了的证书（评审实测过这几类）：
+      printable  CN 是含下划线的 PrintableString（cryptography 抛 ValueError）
+      tag        CN 用了 cryptography 不认识的字符串标签 0x0E（抛的是 KeyError）
+    cryptography 的构建器不许这么写，所以先用合法写法造好、再改 DER 里的字节（不靠它的私有符号，升级了也不怕）；
+    签名随之失效，不影响不校验的握手
+    """
+    assert odd in ("", "printable", "tag"), odd
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "oddXname" if odd else "localhost")])
     now = datetime.datetime.now(datetime.timezone.utc)
     cert = (
         x509.CertificateBuilder().subject_name(name).issuer_name(name)
@@ -49,9 +60,16 @@ def _make_cert(folder: str):
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
         .sign(key, hashes.SHA256())
     )
+    pem = cert.public_bytes(serialization.Encoding.PEM)
+    if odd:
+        # CN 默认编成 UTF8String（标签 0x0C，长 8）：printable 改成 PrintableString（0x13）并塞进它不许有的下划线，
+        # tag 改成 cryptography 不认识的 0x0E
+        odd_cn = b"\x13\x08odd_name" if odd == "printable" else b"\x0e\x08oddXname"
+        der = cert.public_bytes(serialization.Encoding.DER).replace(b"\x0c\x08oddXname", odd_cn)
+        pem = ssl.DER_cert_to_PEM_cert(der).encode("ascii")
     cert_path, key_path = os.path.join(folder, "cert.pem"), os.path.join(folder, "key.pem")
     with open(cert_path, "wb") as f:
-        f.write(cert.public_bytes(serialization.Encoding.PEM))
+        f.write(pem)
     with open(key_path, "wb") as f:
         f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
                                   serialization.NoEncryption()))
@@ -61,6 +79,13 @@ def _make_cert(folder: str):
 class _Handler(socketserver.BaseRequestHandler):
     def handle(self):
         site = self.server.site
+        with site._lock:
+            site.connections += 1
+            later = site.connections > 1
+        if later and site.second_connection == "refuse":
+            self.request.sendall(b"421 4.7.0 too many connections from your host\r\n")
+            return
+        starttls = site.tls == "starttls" and not (later and site.second_connection == "plain")
         sock = self.request
         session = {"tls": False, "auth": None, "mail_from": "", "rcpt_to": []}
         if site.tls == "ssl":
@@ -80,14 +105,17 @@ class _Handler(socketserver.BaseRequestHandler):
             line = raw.decode("utf-8", "replace").rstrip("\r\n")
             cmd, _, arg = line.partition(" ")
             cmd = cmd.upper()
+            if cmd in ("EHLO", "HELO") and (site.ehlo_reject or (later and site.second_connection == "busy")):
+                send("421 4.7.0 Too many connections, try again later")
+                return
             if cmd in ("EHLO", "HELO"):
                 lines = ["hyxi-test"]
-                if site.tls == "starttls" and not session["tls"]:
+                if starttls and not session["tls"]:
                     lines.append("STARTTLS")
                 lines.append("AUTH PLAIN" if site.auth_failure == "reply" else "AUTH LOGIN PLAIN")
                 for i, item in enumerate(lines):
                     send(("250 " if i == len(lines) - 1 else "250-") + item)
-            elif cmd == "STARTTLS" and site.tls == "starttls" and not session["tls"]:
+            elif cmd == "STARTTLS" and starttls and not session["tls"]:
                 send("220 2.0.0 ready to start TLS")
                 sock = site.server_context.wrap_socket(sock, server_side=True)
                 r, w = sock.makefile("rb"), sock.makefile("wb")
@@ -193,22 +221,38 @@ class SmtpSite:
     其余模式下客户端用 LOGIN 只会收到 504（reject_then_421 是 421 后挂断）。
     messages：每封收到的信 {mail_from, rcpt_to, data, tls, auth}；auths：每次 AUTH 收到的用户名、密码、是否已加密。
     host 默认只听本机；要测「非本机地址」时传 "0.0.0.0"，再从局域网地址连进来。
+    trusted / odd_cert 见模块说明和 _make_cert。second_connection 是第二次起的连接怎么应对
+    （refuse 在 TLS 握手之前回话、plain 是不通告 STARTTLS，这两种只对 starttls 有意义；busy 在 SSL 端口上同样生效）：
+      same     照常
+      refuse   一上来回 421 就断开（复刻「连接数超限」）
+      busy     开场白照常，EHLO 回 421 就断开（smtplib 的 ehlo() 遇到这个不抛，只当没有扩展）
+      plain    EHLO 里不再通告 STARTTLS
+    ehlo_reject=True：每次连接（包括第一次）的 EHLO 都回 421 就断开。
     """
 
     def __init__(self, tls: str = "none", password: str = None, host: str = "127.0.0.1",
-                 auth_failure: str = "reply"):
+                 auth_failure: str = "reply", trusted: bool = True, odd_cert: str = "",
+                 second_connection: str = "same", ehlo_reject: bool = False):
         assert tls in ("none", "ssl", "starttls"), tls
         assert auth_failure in ("reply", "reply_then_hang_up", "hang_up", "temp_fail_then_hang_up",
                                 "reject_then_421", "echo_credentials", "plain_rejected"), auth_failure
+        assert second_connection in ("same", "refuse", "busy", "plain"), second_connection
         self.tls = tls
         self.password = password
         self.auth_failure = auth_failure
         self.host = host
+        self.trusted = trusted
+        self.odd_cert = odd_cert
+        self.second_connection = second_connection
+        self.ehlo_reject = ehlo_reject
+        self.connections = 0
+        self._lock = threading.Lock()
         self.messages = []
         self.auths = []
         self.errors = []
         self.port = 0
         self.cert_path = ""
+        self.cert_fingerprint = ""
         self.server_context = None
         self._dir = ""
         self._server = None
@@ -218,11 +262,14 @@ class SmtpSite:
     def __enter__(self) -> "SmtpSite":
         if self.tls != "none":
             self._dir = tempfile.mkdtemp(prefix="hyxi-smtp-")
-            self.cert_path, key_path = _make_cert(self._dir)
+            self.cert_path, key_path = _make_cert(self._dir, odd=self.odd_cert)
             self.server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             self.server_context.load_cert_chain(self.cert_path, key_path)
+            with open(self.cert_path, encoding="ascii") as f:
+                self.cert_fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(f.read())).hexdigest()
             self._old_cert_env = os.environ.get("SSL_CERT_FILE")
-            os.environ["SSL_CERT_FILE"] = self.cert_path
+            if self.trusted:
+                os.environ["SSL_CERT_FILE"] = self.cert_path
         self._server = _Server((self.host, 0), _Handler)
         self._server.site = self
         self.port = self._server.server_address[1]

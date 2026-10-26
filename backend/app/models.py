@@ -208,8 +208,15 @@ class TaskStats(BaseModel):
 
 # ===== 邮件通知 =====
 
+class NotifyTrustedCert(BaseModel):
+    """用户信任的一张证书：在哪台 SMTP 服务器上读到的 + 它的 SHA-256 指纹。只对这台服务器生效"""
+    host: str = Field(max_length=255)
+    fingerprint: str = Field(max_length=200)
+
+
 class NotifyConfigInput(BaseModel):
-    """保存 / 测试邮件通知配置。password 留空 = 沿用已保存的（只在 SMTP 服务器和用户名都没改时）"""
+    """保存 / 测试邮件通知配置。password 留空 = 沿用已保存的（只在服务器、实际连的端口、「使用 SSL」、用户名都没变、
+    也没新信任证书时）"""
     recipients: List[str] = Field(default_factory=list, max_length=50)
     source_ids: List[str] = Field(default_factory=list, max_length=50)
     days: Optional[int] = Field(None, description="新回复时间窗口（天）；不设置 = 近 1 天")
@@ -222,6 +229,10 @@ class NotifyConfigInput(BaseModel):
     sender: str = Field("", max_length=254)
     username: str = Field("", max_length=254)
     password: str = Field("", max_length=500)
+    # 用户信任的证书（公司内网的自签证书；负载均衡后面几台各用一张时就有几张），每张绑在读到它的服务器上。
+    # 指纹的冒号、空格、大小写和主机名大小写都认，去重后张数上限见 notify_service.TRUSTED_CERTS_MAX。
+    # 新信任一张时不能沿用已保存的密码。这里的 100 只防超大请求
+    trusted_certs: List[NotifyTrustedCert] = Field(default_factory=list, max_length=100)
 
 
 class NotifyConfigPublic(BaseModel):
@@ -237,8 +248,24 @@ class NotifyConfigPublic(BaseModel):
     use_ssl: bool = True
     sender: str = ""
     username: str = ""
+    trusted_certs: List[NotifyTrustedCert] = Field(default_factory=list)
     has_password: bool = False
     is_configured: bool = False
+
+
+class NotifyCertInfo(BaseModel):
+    """严格校验没过的那张证书，页面据此给出「信任这张证书」"""
+    host: str = ""              # 在哪台服务器上读到的（小写）：信任它时绑在这台上
+    fingerprint: str            # SHA-256，64 位小写十六进制
+    subject: str = ""
+    issuer: str = ""
+    not_before: str = ""
+    not_after: str = ""
+
+
+class NotifyTestResult(ConfigTestResult):
+    """测试邮件的结果。证书没过校验、也不在信任的证书里时带上它的信息"""
+    untrusted_cert: Optional[NotifyCertInfo] = None
 
 
 class NotifyRun(BaseModel):
@@ -253,6 +280,7 @@ class NotifyRun(BaseModel):
     subject: str = ""
     attachment: bool = False
     task_ids: List[str] = []    # 这一轮发送前自动发起的「采集 + 翻译」任务
+    untrusted_cert: Optional[NotifyCertInfo] = None   # 撞上没信任过的证书时带上它，页面在记录下面就能信任
 
 
 class NotifyStatus(BaseModel):

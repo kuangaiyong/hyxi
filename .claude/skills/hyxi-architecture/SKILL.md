@@ -143,17 +143,19 @@ POST   /api/v1/sources/{id}/authorize        人工登录（开有头浏览器�
 GET    /api/v1/sources/{id}/authorize/events 人工登录 SSE 进度流
 
 GET    /api/v1/notify/config         邮件通知配置（密码只回 has_password；is_configured 表示保存过）
-PUT    /api/v1/notify/config         保存（密码加密落库，留空 = 沿用已保存的，**只限 SMTP 服务器和用户名都没改**）；
+PUT    /api/v1/notify/config         保存（密码加密落库，留空 = 沿用已保存的，**只限服务器、实际连的端口、是否 SSL、用户名都没变、也没新信任证书**）；
                                      顺带照「每天定时发送」挂上 / 摘掉 APScheduler 的 notify-daily
 DELETE /api/v1/notify/config         清除配置、密码、每天定时、发送记录、补发起点和帖子上的「发过」标记；正在发 409
-POST   /api/v1/notify/test           用表单上的（不必先保存的）SMTP 设置发测试邮件；填得不对 400，发不出去 success=false + 原因
+POST   /api/v1/notify/test           用表单上的（不必先保存的）SMTP 设置发测试邮件；填得不对 400，发不出去 success=false + 原因；
+                                     证书没过严格校验、配置的 trusted_certs（[{host, fingerprint}]，只对 host 那台生效）里也没有时
+                                     带 untrusted_cert（读到它的 host、SHA-256 指纹、主体、签发者、有效期）
 GET    /api/v1/notify/precheck       所选的（启用的）数据源里今天还没成功采集并翻译过的（stale），页面据此弹确认框；停用的不采也不列
 POST   /api/v1/notify/send           用已保存的配置立即发一轮（后台跑，202）；没保存过 400，正在发 409。
                                      请求体可选 {"collect": true}：先给 stale 的来源各发起一个「采集 + 翻译」任务（给定计划，
                                      不经模型解析，scheduled_by=notify），全部成功才发；不带请求体照旧直接发。每天定时一律先补采
 GET    /api/v1/notify/status         running / progress / task_id（正在等的自动采集任务）/ last（上一次的结果：sent / skipped =
                                      没有首次出现的新内容 / failed + 原因，reply_count / root_count 分开计，task_ids 是这一轮
-                                     自动发起的任务）/ next_run
+                                     自动发起的任务，撞上没信任过的证书时带 untrusted_cert）/ next_run
 
 GET    /api/v1/media/{path}          回读采集下来的正文图（受同一套密钥保护）
 

@@ -3,7 +3,10 @@ import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import * as notifyApi from '@/api/notify'
 import { fetchSources } from '@/api/sources'
 import { useToast } from '@/composables/useToast'
-import type { NotifyConfigInput, NotifyConfigPublic, NotifyRun, NotifySourceBrief, NotifyStatus } from '@/types/notify'
+import type {
+  NotifyCertInfo, NotifyConfigInput, NotifyConfigPublic, NotifyRun, NotifySourceBrief, NotifyStatus, NotifyTestResult,
+  NotifyTrustedCert,
+} from '@/types/notify'
 import type { SourcePublic } from '@/types/source'
 
 /** 邮件通知：把所选数据源近几天的新回复（原文 + 译文）发到邮箱。规格见 docs/features/email-notify.md */
@@ -40,11 +43,14 @@ const username = ref('')
 const password = ref('')
 const hasPassword = ref(false)
 const isConfigured = ref(false)
+// 信任的证书（SHA-256）。公司内网的邮件服务器常用自签证书，严格校验过不去，只能按指纹认确认过的那几张
+const trustedCerts = ref<NotifyTrustedCert[]>([])
 
 const saving = ref(false)
 const testing = ref(false)
 const starting = ref(false)
-const testResult = ref<{ success: boolean; message: string } | null>(null)
+// 测试结果连同它测的那个地址一起存（见 smtpAddress 下面的 testResult）
+const testOutcome = ref<{ address: string; result: NotifyTestResult } | null>(null)
 const status = ref<NotifyStatus | null>(null)
 let pollTimer: number | undefined
 
@@ -67,6 +73,7 @@ function payload(): NotifyConfigInput {
     sender: sender.value.trim(),
     username: username.value.trim(),
     password: password.value,
+    trusted_certs: trustedCerts.value.map((c) => ({ ...c })),
   }
 }
 
@@ -90,6 +97,8 @@ function apply(cfg: NotifyConfigPublic) {
   password.value = ''
   hasPassword.value = cfg.has_password
   isConfigured.value = cfg.is_configured
+  // 8000 上跑着旧版本后端（便携包、改完没重启）时没有这个字段：别让整页加载失败、还说成「后端不可用」
+  trustedCerts.value = (cfg.trusted_certs ?? []).map((c) => ({ ...c }))
   savedSnapshot.value = snapshot()
 }
 
@@ -109,6 +118,31 @@ function fmtTime(iso: string | null | undefined): string {
 }
 
 const sourceLabel = (s: SourcePublic) => `${s.collector_name}「${s.name}」`
+
+/** AB:CD:… —— 和 openssl x509 -fingerprint -sha256 的输出一样（核对时比 SHA-256，大小写和冒号不算数） */
+const fmtFingerprint = (fp: string) => (fp.toUpperCase().match(/.{2}/g) || []).join(':')
+
+// 测试结果（连同「信任这张证书」）只对测的那个地址有效：地址对不上就不显示。改了地址还留着，或者请求在途时改了地址、
+// 结果回来挂到新地址下面，点信任就会把上一台的证书加进来（评审发现）。一处判定，两种情况都管
+const smtpAddress = () =>
+  JSON.stringify([smtpHost.value.trim(), Number(smtpPort.value), Number(smtpSslPort.value), useSsl.value])
+const testResult = computed(() =>
+  testOutcome.value && testOutcome.value.address === smtpAddress() ? testOutcome.value.result : null)
+
+// 发送记录里撞上的那张证书：只在它属于表单上这台服务器、又还没信任过时给「信任这张证书」——
+// 改了服务器还点，信任进来的是一条用不上的；信任过了还留着按钮，再点就是白发一封测试信（评审发现）
+const lastCertToTrust = computed(() => {
+  const cert = status.value?.last?.untrusted_cert
+  if (!cert || cert.host !== smtpHost.value.trim().toLowerCase()) return null
+  return trustedCerts.value.some((c) => c.host === cert.host && c.fingerprint === cert.fingerprint) ? null : cert
+})
+
+/** 证书概况里有值的几行（cryptography 解析不了的证书概况是空的，空行不显示） */
+const certLines = (c: NotifyCertInfo) => [
+  ['证书主体', c.subject],
+  ['签发者', c.issuer],
+  ['有效期', c.not_after ? `${fmtTime(c.not_before)} ～ ${fmtTime(c.not_after)}` : ''],
+].filter(([, value]) => value)
 
 onMounted(async () => {
   try {
@@ -142,14 +176,25 @@ async function handleSave() {
 
 async function handleTest() {
   testing.value = true
-  testResult.value = null
+  testOutcome.value = null
+  const address = smtpAddress()     // 记下发请求时的地址：等结果期间（双重校验最慢能等上一分钟）改了地址，这个结果就不显示
+  let result: NotifyTestResult
   try {
-    testResult.value = await notifyApi.sendTestMail(payload())
+    result = await notifyApi.sendTestMail(payload())
   } catch (e: any) {
-    testResult.value = { success: false, message: errorText(e, '发送测试邮件失败，请确认后端服务可用') }
+    result = { success: false, message: errorText(e, '发送测试邮件失败，请确认后端服务可用') }
   } finally {
     testing.value = false
   }
+  testOutcome.value = { address, result }
+}
+
+/** 信任撞上的那张证书（测试结果或发送记录里的；追加，不顶掉已信任的；绑在读到它的那台服务器上），并马上重发一封验证。
+ *  要「保存配置」后「立即发送」和每天定时才用得上；密码框空着时后端会要求重填密码 */
+function trustCert(cert: NotifyCertInfo) {
+  const known = trustedCerts.value.some((c) => c.host === cert.host && c.fingerprint === cert.fingerprint)
+  if (!known) trustedCerts.value = [...trustedCerts.value, { host: cert.host, fingerprint: cert.fingerprint }]
+  handleTest()
 }
 
 // 所选数据源里今天还没采集翻译过的：不为空时弹确认框，等用户选（每天定时不弹，一律先采）
@@ -191,7 +236,7 @@ async function handleClear() {
   try {
     apply(await notifyApi.deleteNotifyConfig())
     status.value = await notifyApi.fetchNotifyStatus()
-    testResult.value = null
+    testOutcome.value = null
     toast.success('已清除邮件通知配置')
   } catch (e: any) {
     toast.error(errorText(e, '清除失败，请确认后端服务可用'))
@@ -317,16 +362,31 @@ function poll() {
             data-testid="notify-password"
           />
         </div>
+        <div v-if="trustedCerts.length" class="form-group">
+          <label class="form-label">信任的证书（服务器 · SHA-256 指纹）</label>
+          <div v-for="c in trustedCerts" :key="`${c.host}|${c.fingerprint}`" class="flex gap-2 items-center"
+               style="margin-bottom: 6px;">
+            <input :value="`${c.host} · ${fmtFingerprint(c.fingerprint)}`" type="text" class="form-input" readonly
+                   style="font-family: monospace; font-size: 12px;" data-testid="notify-trusted-cert" />
+            <button class="btn btn-outline" data-testid="notify-untrust-cert"
+                    @click="trustedCerts = trustedCerts.filter((x) => x !== c)">取消信任</button>
+          </div>
+        </div>
 
         <div
           v-if="testResult"
           class="mb-4"
           :class="testResult.success ? 'text-success' : 'text-error'"
-          style="padding: 10px 12px; border-radius: 8px; font-size: 13px;"
+          style="padding: 10px 12px; border-radius: 8px; font-size: 13px; overflow-wrap: anywhere;"
           :style="{ background: testResult.success ? '#D1FAE5' : '#FEE2E2' }"
           data-testid="notify-test-result"
         >
           {{ testResult.success ? '✅' : '❌' }} {{ testResult.message }}
+          <div v-if="testResult.untrusted_cert" style="margin-top: 8px; line-height: 1.8;" data-testid="notify-cert">
+            <div v-for="[label, value] in certLines(testResult.untrusted_cert)" :key="label">{{ label }}：{{ value }}</div>
+            <button class="btn btn-outline" style="margin-top: 6px;" :disabled="testing" data-testid="notify-trust-cert"
+                    @click="trustCert(testResult.untrusted_cert)">信任这张证书</button>
+          </div>
         </div>
 
         <div class="flex gap-2 items-center" style="flex-wrap: wrap;">
@@ -374,7 +434,7 @@ function poll() {
               {{ fmtTime(status.last.finished_at) }} · {{ status.last.trigger === 'schedule' ? '每天定时' : '手动发送' }}
             </span>
           </div>
-          <p style="margin: 8px 0 0;" data-testid="notify-last-message">{{ status.last.message }}</p>
+          <p style="margin: 8px 0 0; overflow-wrap: anywhere;" data-testid="notify-last-message">{{ status.last.message }}</p>
           <p v-if="status.last.subject" class="text-secondary" style="margin: 4px 0 0;">
             邮件标题：{{ status.last.subject }}{{ status.last.attachment ? '（含 HTML 附件）' : '' }}
           </p>
@@ -383,6 +443,11 @@ function poll() {
             <router-link v-for="tid in status.last.task_ids" :key="tid" :to="`/tasks/${tid}/progress`"
                          style="margin-right: 8px;">{{ tid.slice(0, 8) }}</router-link>
           </p>
+          <div v-if="lastCertToTrust" style="margin-top: 6px; line-height: 1.8;" data-testid="notify-last-cert">
+            <div v-for="[label, value] in certLines(lastCertToTrust)" :key="label">{{ label }}：{{ value }}</div>
+            <button class="btn btn-outline" style="margin-top: 6px;" :disabled="testing"
+                    data-testid="notify-last-trust-cert" @click="trustCert(lastCertToTrust)">信任这张证书</button>
+          </div>
         </div>
         <p v-else-if="!status?.running" class="text-sm text-secondary">还没有发送过。</p>
         <p class="text-sm text-secondary" style="margin-top: 8px;" data-testid="notify-next-run">

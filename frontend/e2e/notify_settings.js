@@ -14,8 +14,16 @@
  *   6. 开了每天定时，发送记录里显示下次发送时间
  *   7. 「先采集再发送」：临时建一个指向本机死端口的数据源（就算后端配了模型、任务真跑起来，采集器也只连本机），
  *      补采必然失败 —— 这次不发、记录写明数据源和任务号、发送记录里有任务链接。收尾删掉临时数据源和那个任务
+ *   8. 自签证书的服务器（复刻公司内网那种，用户实测报过）：只换了端口、密码框空着时要求重填密码；
+ *      没信任时明说并给出指纹、不登录不发信；
+ *      点「信任这张证书」时密码框空着要求重填密码（已保存的密码不交给新信任的证书），填上后发得出去；
+ *      保存刷新后指纹还在、卡片里仍没有说明文字；「取消信任」算未保存的修改；
+ *      换一张证书（负载均衡后面另一台）：说明不是信任的证书，再信任它之后两张都在；改了地址，旧结果和「信任」按钮清掉；
+ *      同一台换个地址（127.0.0.1 → localhost）：信任绑在地址上，旧的不算数，给新地址信任一次就过、不原地打转；
+ *      测试请求还在路上时改了地址：回来的结果不挂到新地址下面（另起一个开场白慢 3 秒的收件端）
  *
  * 收件端只听 127.0.0.1、不加密：后端对本机中继允许不加密登录，对外部服务器不允许（后端用例守那一条）。
+ * 第 8 步另起一个通告 STARTTLS 的收件端，证书用后端测试替身的 _make_cert 现生成（要 backend\.venv）。
  * 收尾会调接口「清除」配置，开发库里不留痕。**已经有邮件通知配置时以退出码 2 拒跑** ——
  * 密码只进不出，覆盖掉就还原不回来；确实要跑就设 E2E_NOTIFY_OVERWRITE=1（跑完配置会被清掉）。
  * 第 5 步若窗口里有缺译文的新回复，会用「LLM 配置」里的模型补译（同结果页补译，按条计费）。
@@ -26,8 +34,11 @@
  *   # 或： cd frontend; npm run e2e:notify
  */
 import { chromium } from 'playwright';
-import { readFileSync } from 'fs';
+import { readFileSync, rmSync } from 'fs';
 import net from 'net';
+import tls from 'tls';
+import { execFileSync } from 'child_process';
+import { X509Certificate } from 'crypto';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
@@ -58,18 +69,22 @@ function check(name, ok, detail) {
     }
 }
 
-/** 最小 SMTP 收件端：EHLO / AUTH PLAIN / MAIL / RCPT / DATA / QUIT。按字节（latin1）切行，正文里的 UTF-8 不受影响 */
-function startSmtp() {
+/**
+ * 最小 SMTP 收件端：EHLO / STARTTLS / AUTH PLAIN / MAIL / RCPT / DATA / QUIT。按字节（latin1）切行，正文里的 UTF-8 不受影响。
+ * 给了 cert（{cert, key}）就在 EHLO 里通告 STARTTLS，复刻公司内网那种用自签证书的服务器；
+ * greetDelayMs：连上之后隔这么久才回开场白（造一个慢服务器，好在测试请求还在路上时改地址）
+ */
+function startSmtp(cert = null, { greetDelayMs = 0 } = {}) {
     const mails = [];
     const auths = [];
-    const server = net.createServer((sock) => {
+    const secureContext = cert && tls.createSecureContext(cert);
+    const serve = (sock, secure) => {
         let buf = '';
         let inData = false;
         let lines = [];
         let session = { from: '', to: [] };
         const send = (l) => sock.write(`${l}\r\n`);
-        send('220 e2e ESMTP');
-        sock.on('data', (chunk) => {
+        const onData = (chunk) => {
             buf += chunk.toString('latin1');
             let i;
             while ((i = buf.indexOf('\r\n')) >= 0) {
@@ -89,10 +104,21 @@ function startSmtp() {
                 const [cmd, ...rest] = line.split(' ');
                 const arg = rest.join(' ');
                 switch (cmd.toUpperCase()) {
-                    case 'EHLO': case 'HELO': send('250-e2e'); send('250 AUTH PLAIN'); break;
+                    case 'EHLO': case 'HELO':
+                        send('250-e2e');
+                        if (secureContext && !secure) send('250-STARTTLS');
+                        send('250 AUTH PLAIN');
+                        break;
+                    case 'STARTTLS':
+                        if (!secureContext || secure) { send('502 not implemented'); break; }
+                        send('220 go ahead');
+                        // 客户端等到 220 才开始握手，这时缓冲里没有别的字节；之后的读写都走加密那一层
+                        sock.removeListener('data', onData);
+                        serve(new tls.TLSSocket(sock, { isServer: true, secureContext }), true);
+                        return;
                     case 'AUTH': {
                         const [, user, pass] = Buffer.from(arg.split(' ')[1] || '', 'base64').toString('utf8').split('\0');
-                        auths.push({ user, pass });
+                        auths.push({ user, pass, tls: secure });
                         send('235 ok');
                         break;
                     }
@@ -104,11 +130,29 @@ function startSmtp() {
                     default: send('502 not implemented');
                 }
             }
-        });
-        sock.on('error', () => {});
+        };
+        sock.on('data', onData);
+        sock.on('error', () => {});     // 后端严格校验时会中途断开握手，这是预期内的
+    };
+    const server = net.createServer((sock) => {
+        serve(sock, false);
+        setTimeout(() => sock.write('220 e2e ESMTP\r\n'), greetDelayMs);
     });
     return new Promise((resolve) => server.listen(0, '127.0.0.1',
         () => resolve({ server, port: server.address().port, mails, auths })));
+}
+
+/** 现生成一张自签证书：复用后端测试替身里的 _make_cert（证书只在这一次运行里用，读完就删） */
+function makeCert() {
+    const python = join(ROOT, 'backend', '.venv', 'Scripts', 'python.exe');
+    const code = 'import sys, tempfile; sys.path.insert(0, sys.argv[1]); from smtp_site import _make_cert; '
+        + 'print(*_make_cert(tempfile.mkdtemp(prefix="hyxi-e2e-cert-")), sep="|")';
+    // 管道里 Python 默认按系统代码页输出，临时目录带中文时路径会被解成乱码
+    const [certPath, keyPath] = execFileSync(python, ['-c', code, join(ROOT, 'backend', 'tests', 'fixtures')],
+        { encoding: 'utf-8', env: { ...process.env, PYTHONIOENCODING: 'utf-8' } }).trim().split('|');
+    const pair = { cert: readFileSync(certPath), key: readFileSync(keyPath) };
+    rmSync(dirname(certPath), { recursive: true, force: true });
+    return pair;
 }
 
 /** 邮件头里的 RFC 2047 编码词（=?utf-8?b?...?= / ?q?）解回中文 */
@@ -167,6 +211,13 @@ const waitToast = (page, re, ms = 8000) => page.waitForFunction(
     re.source, { timeout: ms },
 ).then(() => true, () => false);
 const byId = (page, id) => page.locator(`[data-testid="${id}"]`);
+/** 等测试邮件的结果里出现某句话，返回结果全文（没等到也返回当时的全文，交给断言判） */
+const testResultMatching = async (page, re) => {
+    await page.waitForFunction((src) => new RegExp(src).test(
+        document.querySelector('[data-testid="notify-test-result"]')?.textContent || ''), re.source, { timeout: 40000 })
+        .catch(() => {});
+    return ((await byId(page, 'notify-test-result').textContent().catch(() => '')) || '').trim();
+};
 
 /**
  * 两张配置卡片里的说明文字（用户要求这一页不放）。标题、输入框、按钮不算；标签自己的文字是字段名，不算，
@@ -208,6 +259,7 @@ async function main() {
     const configBodies = [];
     let tempSource = null;      // 场景六临时建的数据源，收尾删掉
     let autoTasks = [];         // 场景六自动发起的任务，收尾删掉
+    const tlsSites = [];        // 场景七另起的几个收件端（两张自签证书的、一个慢的）
     page.on('response', async (r) => {
         if (r.url().endsWith('/api/v1/notify/config')) {
             try { configBodies.push(await r.text()); } catch { /* 页面跳走时响应体可能已经拿不到 */ }
@@ -372,9 +424,107 @@ async function main() {
         const link = byId(page, 'notify-last-tasks').locator(`a[href="/tasks/${autoTasks[0]}/progress"]`);
         check('发送记录里有这一轮自动发起的任务链接', await link.waitFor({ timeout: 10000 }).then(() => true, () => false));
         check('收件端没收到信', smtp.mails.length === mailsBefore, smtp.mails.length - mailsBefore);
+
+        console.log('\n场景七：自签证书的服务器 —— 没信任时给出证书指纹，确认后信任它才发得出去');
+        // 复刻用户在公司内网撞上的：不勾 SSL、普通端口上通告 STARTTLS、证书是自签的（后端严格校验必然不过）
+        const certA = makeCert();
+        const siteA = await startSmtp(certA);
+        tlsSites.push(siteA);
+        const fpA = new X509Certificate(certA.cert).fingerprint256;     // AB:CD:… 写法，同页面
+        await page.reload({ waitUntil: 'networkidle' });
+        // 换了端口，密码会交给的那一端就变了：密码框空着要求重填（已保存的是本机中继时，只改端口就能把密码引到别的端口上）
+        await byId(page, 'notify-smtp-port').fill(String(siteA.port));
+        await byId(page, 'notify-test').click();
+        const portPw = await testResultMatching(page, /重新填写密码/);
+        check('只换了端口、密码框空着：要求重填密码', /重新填写密码/.test(portPw) && siteA.auths.length === 0, portPw);
+        await byId(page, 'notify-password').fill(PASSWORD);
+        await byId(page, 'notify-save').click();
+        check('重填密码后在新端口上保存', await waitToast(page, /已保存/), await toasts(page));
+        await page.reload({ waitUntil: 'networkidle' });
+        await byId(page, 'notify-test').click();
+        const refused = await testResultMatching(page, /证书校验没通过/);
+        check('没信任：明说证书校验没通过，并给出这张证书的指纹', /证书校验没通过/.test(refused)
+            && refused.includes(fpA), refused);
+        check('没信任：没登录、没发信', siteA.auths.length === 0 && siteA.mails.length === 0, siteA.auths);
+        await byId(page, 'notify-trust-cert').click();
+        // 密码框空着（用的是已保存的）：新信任一张证书 = 认下新的服务器身份，已保存的密码不交给它
+        const needPw = await testResultMatching(page, /重新填写密码/);
+        check('点「信任这张证书」、密码框空着：要求重填密码，什么都没发出去', /重新填写密码/.test(needPw)
+            && siteA.auths.length === 0, needPw);
+        await byId(page, 'notify-password').fill(PASSWORD);
+        await byId(page, 'notify-test').click();
+        const passed = await testResultMatching(page, /已发出/);
+        check('填上密码再发：测试邮件发出去了', /已发出/.test(passed), passed);
+        check('收件端收到 1 封，加密之后才登录', siteA.mails.length === 1 && siteA.auths.length === 1
+            && siteA.auths[0].tls && siteA.auths[0].pass === PASSWORD, siteA.auths.map((a) => ({ user: a.user, tls: a.tls })));
+        await byId(page, 'notify-save').click();
+        check('保存', await waitToast(page, /已保存/), await toasts(page));
+        await page.reload({ waitUntil: 'networkidle' });
+        await byId(page, 'notify-trusted-cert').first().waitFor({ timeout: 10000 }).catch(() => {});
+        const shown = await byId(page, 'notify-trusted-cert').evaluateAll((els) => els.map((e) => e.value));
+        check('刷新后：「信任的证书」里是这台服务器和这张证书的指纹', shown.length === 1 && shown[0] === `127.0.0.1 · ${fpA}`,
+            shown);
+        const strayTrusted = await strayText(page, ['每天', '发送']);
+        check('多了「信任的证书」这一行：配置卡片里仍没有说明文字', strayTrusted.length === 0, strayTrusted);
+        check('刚保存完：「立即发送」可以点', await send.isEnabled());
+        await byId(page, 'notify-untrust-cert').click();
+        check('点「取消信任」：那一行没了，算未保存的修改', (await byId(page, 'notify-trusted-cert').count()) === 0
+            && await send.isDisabled());
+
+        // 负载均衡后面另一台、用另一张自签证书：说明不是信任的证书；再信任它，两张都在
+        await page.reload({ waitUntil: 'networkidle' });
+        const certB = makeCert();
+        const siteB = await startSmtp(certB);
+        tlsSites.push(siteB);
+        const fpB = new X509Certificate(certB.cert).fingerprint256;
+        await byId(page, 'notify-smtp-port').fill(String(siteB.port));
+        await byId(page, 'notify-password').fill(PASSWORD);     // 换了端口：照规矩重填密码
+        await byId(page, 'notify-test').click();
+        const other = await testResultMatching(page, /也不是信任的证书/);
+        check('换了一张证书：说明它不是信任的证书，并给出它的指纹', /也不是信任的证书/.test(other) && other.includes(fpB)
+            && siteB.auths.length === 0, other);
+        // 改了地址，上一个地址的结果和「信任这张证书」要跟着清掉：不然点下去信任的是上一台的证书（评审发现）
+        await byId(page, 'notify-smtp-port').fill(String(siteA.port));
+        check('改了端口：上一个地址的测试结果和「信任这张证书」都清掉了',
+            (await byId(page, 'notify-test-result').count()) === 0 && (await byId(page, 'notify-trust-cert').count()) === 0);
+        await byId(page, 'notify-smtp-port').fill(String(siteB.port));
+        await byId(page, 'notify-test').click();
+        await testResultMatching(page, /也不是信任的证书/);
+        await byId(page, 'notify-trust-cert').click();     // 密码刚填过：直接发得出去
+        const passedB = await testResultMatching(page, /已发出/);
+        const both = await byId(page, 'notify-trusted-cert').evaluateAll((els) => els.map((e) => e.value));
+        check('信任第二张、填上密码：发得出去，两张证书都在', /已发出/.test(passedB) && siteB.mails.length === 1
+            && both.length === 2 && both[0] === `127.0.0.1 · ${fpA}` && both[1] === `127.0.0.1 · ${fpB}`, { passedB, both });
+
+        // 同一台服务器换个地址（127.0.0.1 → localhost）：信任绑在地址上，旧的不算数；给新地址点一次「信任」就过，
+        // 不许原地打转（上一版实测过：页面以为已经信任、后端又不认，点多少次都一样）
+        await byId(page, 'notify-smtp-host').fill('localhost');
+        await byId(page, 'notify-smtp-port').fill(String(siteA.port));
+        await byId(page, 'notify-test').click();
+        const moved = await testResultMatching(page, /证书校验没通过/);
+        check('换了服务器地址：给原地址信任的证书不算数', /证书校验没通过/.test(moved) && !/也不是信任的证书/.test(moved), moved);
+        await byId(page, 'notify-trust-cert').click();
+        const passedMoved = await testResultMatching(page, /已发出/);
+        const all = await byId(page, 'notify-trusted-cert').evaluateAll((els) => els.map((e) => e.value));
+        check('给新地址点一次「信任这张证书」就发得出去，不原地打转', /已发出/.test(passedMoved)
+            && all.includes(`localhost · ${fpA}`) && all.length === 3, { passedMoved, all });
+
+        // 请求还在路上时改了地址：回来的结果属于上一个地址，不许挂到新地址下面（评审发现：那样点「信任」信任的是上一台的证书）
+        const slow = await startSmtp(null, { greetDelayMs: 3000 });
+        tlsSites.push(slow);
+        await byId(page, 'notify-smtp-host').fill('127.0.0.1');
+        await byId(page, 'notify-smtp-port').fill(String(slow.port));
+        await byId(page, 'notify-test').click();
+        await page.waitForTimeout(500);
+        await byId(page, 'notify-smtp-port').fill(String(siteA.port));
+        await page.waitForFunction(() => !document.querySelector('[data-testid="notify-test"]')?.disabled,
+            null, { timeout: 40000 }).catch(() => {});
+        check('请求在途时改了地址：回来的结果不挂到新地址下面', slow.mails.length === 1
+            && (await byId(page, 'notify-test-result').count()) === 0, { mails: slow.mails.length });
     } finally {
         await browser.close();
         smtp.server.close();
+        for (const site of tlsSites) site.server.close();
         for (const id of autoTasks) await api(`/tasks/${id}?force=true`, { method: 'DELETE' });
         if (tempSource && tempSource.id) await api(`/sources/${tempSource.id}`, { method: 'DELETE' });
         const r = await api('/notify/config', { method: 'DELETE' });

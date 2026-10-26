@@ -12,6 +12,8 @@
 
 import asyncio
 import base64
+import copy
+import hashlib
 import html
 import ipaddress
 import json
@@ -31,6 +33,7 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.jobstores.base import JobLookupError
 from apscheduler.triggers.cron import CronTrigger
+from cryptography import x509
 
 from app.collectors import get_collector
 from app.collectors.base import Collector
@@ -72,6 +75,8 @@ CLAIM_OWNER = "notify"
 # 同一来源正被别人翻译时最多等多久（任务超时的默认值也是 30 分钟）
 CLAIM_WAIT_SECONDS = 30 * 60
 SMTP_TIMEOUT = 30
+# 最多信任几张自签证书（负载均衡后面几台各用一张时要信任几张）
+TRUSTED_CERTS_MAX = 10
 # 发送前自动发起的「采集 + 翻译」任务打的 scheduled_by 标记：任务列表里认得出是谁发起的
 AUTO_TASK_OWNER = "notify"
 # 等任务时多久看一次它的状态
@@ -84,11 +89,12 @@ _DEFAULTS = {
     "recipients": [], "source_ids": [], "days": None,
     "schedule_enabled": False, "schedule_time": "09:00",
     "smtp_host": "", "smtp_port": 25, "smtp_ssl_port": 465, "use_ssl": True,
-    "sender": "", "username": "",
+    "sender": "", "username": "", "trusted_certs": [],
 }
 
 _EMAIL = re.compile(r'^[^@\s,;<>"]+@[^@\s,;<>"]+\.[^@\s,;<>"]+$')
 _HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+_FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
 
 # 同一时刻只跑一轮。用普通字典不用 asyncio.Lock，理由同 orchestrator._translation_claims
 _state: Dict[str, Optional[str]] = {"running": None, "progress": "", "task_id": None}
@@ -104,12 +110,20 @@ class NotifyBusy(Exception):
     """有一轮正在发送，这个操作现在不能做"""
 
 
+class UntrustedCertificate(NotifyError):
+    """证书没过严格校验，也不是用户信任的那一张。cert 是它的信息（_cert_info），页面据此给出「信任这张证书」"""
+
+    def __init__(self, message: str, cert: dict):
+        super().__init__(message)
+        self.cert = cert
+
+
 # ===== 配置 =====
 
 def load_config() -> dict:
     """已保存的配置，含 password_enc（只在本模块里用，绝不出接口）。没保存过就是默认值"""
     raw = storage.get_app_config(CONFIG_PREFIX)
-    cfg = dict(_DEFAULTS)
+    cfg = copy.deepcopy(_DEFAULTS)     # 默认值里有列表：浅拷贝的话，谁原地改一下就改到了模块级默认值上
     if raw.get("settings"):
         cfg.update(json.loads(raw["settings"]))
     cfg["password_enc"] = raw.get("password_enc", "")
@@ -138,6 +152,16 @@ def _valid_email(addr: str) -> bool:
         return Address(addr_spec=addr).addr_spec == addr
     except (ValueError, HeaderParseError):
         return False
+
+
+def _cert_keys(certs: List[dict]) -> set:
+    return {(c["host"], c["fingerprint"]) for c in certs}
+
+
+def _endpoint(cfg: dict) -> tuple:
+    """密码实际会交给的那一端：服务器、实际连的端口、要不要 SSL、用户名（没在用的那个端口改了不算）"""
+    port = cfg.get("smtp_ssl_port") if cfg.get("use_ssl") else cfg.get("smtp_port")
+    return cfg.get("smtp_host"), port, bool(cfg.get("use_ssl")), cfg.get("username")
 
 
 def _clean(payload: dict, saved: dict, require_sources: bool) -> dict:
@@ -180,16 +204,37 @@ def _clean(payload: dict, saved: dict, require_sources: bool) -> dict:
     cfg["username"] = (cfg["username"] or "").strip()
     if not cfg["username"]:
         raise ValueError("请填写 SMTP 用户名（一般是完整的邮箱地址）")
+    # 每张信任的证书都绑在读到它的那台服务器上（_pinned 只认「这台服务器 + 这个指纹」）：只存指纹的话，给 A 信任的证书
+    # 换到 B 也放行，握有它私钥的人就能冒充 B（评审发现）。指纹页面上显示、用户复制的是 AB:CD:… 这种写法，存成 64 位小写十六进制
+    certs: List[dict] = []
+    for raw in cfg["trusted_certs"] or []:
+        host = str(raw.get("host") or "").strip().lower()
+        fingerprint = re.sub(r"[\s:]", "", str(raw.get("fingerprint") or "")).lower()
+        if not _FINGERPRINT.match(fingerprint):
+            raise ValueError(f"信任的证书指纹格式不对：{raw.get('fingerprint')}（应是 SHA-256 指纹，64 位十六进制）")
+        if not host:
+            raise ValueError("信任的证书没写是哪台服务器的")
+        if {"host": host, "fingerprint": fingerprint} not in certs:
+            certs.append({"host": host, "fingerprint": fingerprint})
+    if len(certs) > TRUSTED_CERTS_MAX:
+        raise ValueError(f"信任的证书最多 {TRUSTED_CERTS_MAX} 张，先取消信任用不上的")
+    cfg["trusted_certs"] = certs
 
     password = payload.get("password") or ""
     if password:
         cfg["password_enc"] = crypto.encrypt(password)   # 没配 TWEAKERS_SECRET_KEY 时抛 ValueError，不降级成明文
     elif not saved.get("password_enc"):
         raise ValueError("请填写 SMTP 密码（不少邮箱要填「授权码」，不是登录密码）")
-    elif (saved.get("smtp_host"), saved.get("username")) != (cfg["smtp_host"], cfg["username"]):
-        # 留空沿用旧密码只限同一台服务器、同一个账号：换了服务器还沿用，等于把已保存的密码交给那台新服务器 ——
-        # 能调接口的人就能借这个口子，把「只进不出」的密码从自己搭的 SMTP 服务器上套出来
-        raise ValueError("SMTP 服务器或用户名改了，请重新填写密码 —— 已保存的密码不会带到新的服务器或账号上")
+    elif _endpoint(saved) != _endpoint(cfg):
+        # 留空沿用旧密码只限密码会交给的还是那一端：换了服务器还沿用，等于把已保存的密码交给那台新服务器 ——
+        # 能调接口的人就能借这个口子，把「只进不出」的密码从自己搭的 SMTP 服务器上套出来。
+        # 端口和「使用 SSL」也算：已保存的是本机中继时，只改端口就能连到自己在本机监听的端口、明文收走密码（评审发现）
+        raise ValueError("SMTP 服务器、端口、「使用 SSL」或用户名改了，请重新填写密码 —— 已保存的密码不会带到新的服务器或账号上")
+    elif _cert_keys(certs) - _cert_keys(saved.get("trusted_certs") or []):
+        # 新信任一张证书 = 认下一个新的服务器身份。沿用旧密码的话，能调接口的人填上自己那张证书的指纹、
+        # 再冒充这台服务器，就能把已保存的密码引过去（评审在真应用上复现过）。判据是集合差：去掉一张换上另一张也算新信任；
+        # 取消信任只会更严，不受这条限制
+        raise ValueError("新信任了证书，请重新填写密码 —— 已保存的密码不会交给新信任的证书")
     else:
         cfg["password_enc"] = saved["password_enc"]
     return cfg
@@ -324,6 +369,9 @@ async def _run(trigger: str, collect: bool = False) -> dict:
     except Exception as e:
         logger.exception("邮件通知发送失败")
         result = {"outcome": "failed", "message": str(e)}
+        # 证书没信任过：发送记录里带上它，页面在记录下面就能「信任这张证书」—— 负载均衡后面时，测试邮件未必撞得上这一台（评审发现）
+        if isinstance(e, UntrustedCertificate):
+            result["untrusted_cert"] = e.cert
     record = {
         "trigger": trigger,
         "started_at": started.isoformat(timespec="seconds"),
@@ -983,29 +1031,122 @@ def _server_said(e: smtplib.SMTPResponseException, user: str, password: str) -> 
     return f"服务器原话：{said}" if said else "服务器没有说明原因"
 
 
+def _colon(fingerprint: str) -> str:
+    """SHA-256 指纹的展示写法 AB:CD:…，和 `openssl x509 -fingerprint -sha256` 的输出一样（实测）。
+    Windows 证书对话框默认显示的「指纹」是 SHA-1、certutil 打出来是小写不带冒号：跟管理员核对时比的是 SHA-256，
+    大小写和冒号不算数（保存时也都认）"""
+    return ":".join(fingerprint[i:i + 2] for i in range(0, len(fingerprint), 2)).upper()
+
+
+def _cert_info(der: bytes) -> dict:
+    """证书的 SHA-256 指纹和概况（主体、签发者、有效期），给人核对用。
+
+    指纹直接对字节算，比对只靠它；概况解析不了就留空 —— cryptography 比 OpenSSL 严，有的证书 OpenSSL 照常握手、
+    它却解析不了，解析失败要是连指纹都不给，这张证书就永远信任不了（评审实测过几种这样的证书）。
+    失败时抛的不只 ValueError：名字里带它不认识的字符串标签时是 KeyError，所以一律接住
+    """
+    info = {"fingerprint": hashlib.sha256(der).hexdigest(), "subject": "", "issuer": "", "not_before": "", "not_after": ""}
+    try:
+        cert = x509.load_der_x509_certificate(der)
+        info.update(subject=cert.subject.rfc4514_string(), issuer=cert.issuer.rfc4514_string(),
+                    not_before=cert.not_valid_before_utc.isoformat(), not_after=cert.not_valid_after_utc.isoformat())
+    except Exception:
+        pass
+    return info
+
+
+def _ehlo(server: smtplib.SMTP) -> None:
+    """smtplib 的 ehlo() 遇到非 250 不抛，只把扩展清空 —— 不拦下的话，一句「421 连接数超限」会被说成
+    「不支持 STARTTLS，请勾选使用 SSL」（评审实测过）。照实抛出，带着服务器原话"""
+    code, said = server.ehlo()
+    if code != 250:
+        raise smtplib.SMTPResponseException(code, said)
+
+
+def _connect(cfg: dict, host: str, port: int, context: ssl.SSLContext) -> smtplib.SMTP:
+    """连上并把连接加密好（SSL 端口直接握手；普通端口用 STARTTLS 升级），还没登录"""
+    if cfg["use_ssl"]:
+        server = smtplib.SMTP_SSL(host, port, timeout=SMTP_TIMEOUT, context=context)
+        try:
+            _ehlo(server)       # SSL 端口上 EHLO 被拒也要照实报（评审实测过：不拦的话只剩一句「连接断了」）
+        except BaseException:
+            server.close()
+            raise
+        return server
+    server = smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT)
+    try:
+        _ehlo(server)
+        if server.has_extn("starttls"):
+            server.starttls(context=context)
+            _ehlo(server)
+        elif not _is_loopback(host):
+            raise NotifyError(f"SMTP 服务器 {host}:{port} 不支持加密连接（STARTTLS）。为了不明文传输密码，"
+                              "请勾选「使用 SSL」并填 SSL 端口（一般是 465）")
+    except BaseException:
+        server.close()
+        raise
+    return server
+
+
+def _pinned(cfg: dict, host: str, port: int, error: ssl.SSLCertVerificationError) -> smtplib.SMTP:
+    """严格校验没过时：服务器的证书在用户信任的证书里（按 SHA-256 指纹比）就用这条连接接着发，否则拒绝并给出它的信息。
+
+    公司内网的邮件服务器常用自签证书（用户实测报过）。校验失败的那次握手里拿不到证书，所以不校验地再连一次 ——
+    **这条连接比对指纹之前绝不能登录**：不校验又不比对，就等于把密码交给任何一台冒充的服务器。
+    再连这一次失败时，确知的原因还是第一次的校验没过，报错以它为主（评审发现：不这样会被翻成「检查端口」之类）
+    """
+    refused = f"{host}:{port} 的证书校验没通过（{error.verify_message}）"
+    no_tls = f"{refused}，没有继续发送；再连一次时服务器没有提供加密，读不到证书"
+    # 只为读证书，不用加载系统 CA（create_default_context 在 Windows 上要枚举两个系统证书库）
+    unverified = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    unverified.check_hostname = False
+    unverified.verify_mode = ssl.CERT_NONE
+    try:
+        server = _connect(cfg, host, port, unverified)
+    except NotifyError:
+        # 外部服务器这次没通告 STARTTLS。_connect 那句「请勾选使用 SSL」在这里是错的：第一次正是在 STARTTLS 里校验失败的
+        raise NotifyError(no_tls) from None
+    except Exception as e:
+        why = (f"{e.smtp_code}，{_server_said(e, cfg['username'], '')}" if isinstance(e, smtplib.SMTPResponseException)
+               else str(e) or type(e).__name__)
+        raise NotifyError(f"{refused}，没有继续发送；再连一次读取证书时失败了（{why}），没能给出证书指纹") from None
+    if not isinstance(server.sock, ssl.SSLSocket):     # 本机中继这次没通告 STARTTLS：拿到的是明文连接，没有证书可比
+        server.close()
+        raise NotifyError(no_tls)
+    der = server.sock.getpeercert(binary_form=True)
+    if not der:     # 对面没出示证书（匿名套件之类）：没有可比的，照样不信任，别让 None 一路抛成 500
+        server.close()
+        raise NotifyError(f"{refused}，没有继续发送；再连一次时服务器没有出示证书")
+    cert = _cert_info(der)
+    # 只认信任给这台服务器的：给别的服务器信任过的证书在这里不放行
+    cert["host"] = host.lower()
+    mine = {c["fingerprint"] for c in cfg["trusted_certs"] if c["host"] == cert["host"]}
+    if cert["fingerprint"] in mine:
+        return server
+    server.close()
+    # 「读到的」：负载均衡后面时，再连这一次连到的未必是第一次那台
+    shown = _colon(cert["fingerprint"])
+    if mine:
+        raise UntrustedCertificate(f"{refused}，读到的证书也不是信任的证书，没有继续发送。它的指纹（SHA-256）：{shown}", cert)
+    raise UntrustedCertificate(f"{refused}，为了不把密码交给冒充的服务器，没有继续发送。读到的证书指纹（SHA-256）：{shown}", cert)
+
+
 def deliver(cfg: dict, msg: EmailMessage) -> None:
     """把信交给 SMTP 服务器（阻塞，调用方放进线程跑）。失败一律抛 NotifyError，消息是能照着改的人话。
 
-    证书照常严格校验（ssl.create_default_context）：不校验的话，冒充的服务器就能拿到密码
+    证书照常严格校验（ssl.create_default_context）：不校验的话，冒充的服务器就能拿到密码。
+    没过校验时只有一种例外：用户按 SHA-256 指纹信任过的证书（见 _pinned）
     """
     host = cfg["smtp_host"]
     port = cfg["smtp_ssl_port"] if cfg["use_ssl"] else cfg["smtp_port"]
     where = f"{host}:{port}"
     password = crypto.decrypt(cfg["password_enc"])
     try:
-        if cfg["use_ssl"]:
-            server = smtplib.SMTP_SSL(host, port, timeout=SMTP_TIMEOUT, context=ssl.create_default_context())
-        else:
-            server = smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT)
+        try:
+            server = _connect(cfg, host, port, ssl.create_default_context())
+        except ssl.SSLCertVerificationError as e:
+            server = _pinned(cfg, host, port, e)
         with server:
-            if not cfg["use_ssl"]:
-                server.ehlo()
-                if server.has_extn("starttls"):
-                    server.starttls(context=ssl.create_default_context())
-                    server.ehlo()
-                elif not _is_loopback(host):
-                    raise NotifyError(f"SMTP 服务器 {where} 不支持加密连接（STARTTLS）。为了不明文传输密码，"
-                                      "请勾选「使用 SSL」并填 SSL 端口（一般是 465）")
             _login(server, cfg["username"], password)
             server.send_message(msg)
     except NotifyError:
@@ -1026,11 +1167,11 @@ def deliver(cfg: dict, msg: EmailMessage) -> None:
                           "不少邮箱要求发件人邮箱和登录用户名是同一个") from None
     except smtplib.SMTPRecipientsRefused as e:
         raise NotifyError(f"收件人被服务器拒绝：{'、'.join(e.recipients)}") from None
+    except smtplib.SMTPResponseException as e:
+        # 不直接 str(e)：那是「(421, b'…')」这种写法，原话也没抹过密码（评审发现，EHLO 被拒就走这里）
+        raise NotifyError(f"SMTP 发送失败（{where}）：{e.smtp_code}，{_server_said(e, cfg['username'], password)}") from None
     except smtplib.SMTPException as e:
         raise NotifyError(f"SMTP 发送失败（{where}）：{e}") from None
-    except ssl.SSLCertVerificationError as e:
-        raise NotifyError(f"{where} 的证书校验没通过（{e.verify_message}），"
-                          "为了不把密码交给冒充的服务器，没有继续发送") from None
     except ssl.SSLError as e:
         raise NotifyError(f"和 {where} 的 SSL 握手失败（{e.reason or e}）：端口和「使用 SSL」对得上吗？"
                           "465 一般是 SSL 端口，25 / 587 不是") from None

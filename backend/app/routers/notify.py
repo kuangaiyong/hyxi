@@ -6,7 +6,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 
 from app.models import (
-    ConfigTestResult, NotifyConfigInput, NotifyConfigPublic, NotifyPrecheck, NotifySendInput, NotifyStatus,
+    NotifyConfigInput, NotifyConfigPublic, NotifyPrecheck, NotifySendInput, NotifyStatus, NotifyTestResult,
 )
 from app.services import notify_service
 
@@ -37,16 +37,17 @@ async def delete_config():
         raise HTTPException(status_code=409, detail=str(e))
 
 
-@router.post("/test", response_model=ConfigTestResult)
+@router.post("/test", response_model=NotifyTestResult)
 async def send_test(payload: NotifyConfigInput):
-    """用页面上填的 SMTP 设置（不必先保存）发一封测试邮件。填得不对回 400；发不出去回 success=false 和原因"""
+    """用页面上填的 SMTP 设置（不必先保存）发一封测试邮件。填得不对回 400；发不出去回 success=false 和原因。
+    证书没过校验、也不在信任的证书里时带上它的信息（untrusted_cert），页面据此给出「信任这张证书」"""
     try:
         message = await asyncio.to_thread(notify_service.send_test, payload.model_dump())
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except notify_service.NotifyError as e:
-        return ConfigTestResult(success=False, message=str(e))
-    return ConfigTestResult(success=True, message=message)
+    except notify_service.NotifyError as e:      # UntrustedCertificate 是它的子类，带着 cert
+        return NotifyTestResult(success=False, message=str(e), untrusted_cert=getattr(e, "cert", None))
+    return NotifyTestResult(success=True, message=message)
 
 
 @router.get("/precheck", response_model=NotifyPrecheck)

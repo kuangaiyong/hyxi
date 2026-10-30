@@ -217,7 +217,7 @@ submit 按钮、Arkose 人机验证）、小组页 DOM 实测结论，以及已�
 }
 ```
 
-`fingerprint` = `SHA256("username|timestamp|content[:100]")` 取前 16 位十六进制，由 Node 端 `makeFingerprint()` 生成，是增量去重和跨文件结果合并的唯一锚点。`timestamp` 落盘始终是荷兰格式 `dd-mm-yyyy HH:MM`，只在 API 出口由 `_normalize_timestamp()` 转 ISO。
+`fingerprint` = `SHA256("username|timestamp|content[:100]")` 取前 16 位十六进制，由 Node 端 `makeFingerprint()` 生成，是增量去重和跨文件结果合并的唯一锚点。`timestamp` 落盘始终是荷兰格式 `dd-mm-yyyy HH:MM`，只在出口（API 响应、邮件）由 `post_tree.normalize_timestamp()` 转 ISO。
 它**不带时区**：Facebook 是浏览器按宿主机（上海）时区渲染的，Tweakers 是服务器给的荷兰时间（`Collector.timestamp_tz`）。
 同一来源内互相比没问题；**拿「现在」去比之前必须按来源换算**，否则窗口整体偏 6~7 小时（邮件通知评审时发现）。
 
@@ -319,7 +319,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 | `access_key_flow.js` | `npm run e2e:key` | 被 401 挡住后照提示填服务访问密钥：找得到、首屏可见、填错明说、填对当场生效 |
 | `results_thread_structure.js` | `npm run e2e:thread` | 回复全部展开且顺序同原帖、层级缩进与「回复 某某」、「已采 X · 原帖 Y」对账（没有第 2 层回复的数据时退出码 2） |
 | `results_backfill_translation.js` | `npm run e2e:backfill` | 补译提示条：N 与 `/stats`、出口三处一致；没待补译时不显示；`E2E_BACKFILL_CLICK=1` 才点按钮（真调模型） |
-| `notify_settings.js` | `npm run e2e:notify` | 邮件通知页：配置卡片里不放说明文字、占位提示里不带 QQ 等厂商信息（都是用户要求）、测试邮件真到达脚本自带的本机 SMTP 收件端、保存刷新后都在且密码读不回、改了没保存不许「立即发送」、今天没采集翻译过所选数据源时必须弹确认框（由 `/precheck` 决定弹不弹；开发库的真数据源上**绝不点「先采集再发送」**，那一步改用临时建的、指向本机死端口的数据源来点，补采必然失败、不发信）、立即发送三种结局各有硬断言、自签证书的服务器（另起通告 STARTTLS 的收件端）没信任时给出指纹且不登录、密码框空着点「信任这张证书」时要求重填密码、填上后发得出去、换一张证书再信任后两张都在；已有配置时退出码 2（密码只进不出，覆盖了还原不回），收尾调接口清除 |
+| `notify_settings.js` | `npm run e2e:notify` | 邮件通知页整段操作：不放说明文字、占位提示不带邮箱厂商（用户要求）、测试邮件真到达本机收件端、密码只进不出、改了没保存不许「立即发送」、补采确认框与三种发送结局、自签证书的信任（八步明细见脚本文件头；开发库的真数据源上**绝不点「先采集再发送」**）；已有配置时退出码 2（密码只进不出，覆盖了还原不回），收尾调接口清除 |
 
 真 Chrome、真前后端、无 mock，**要求两个服务都起着**（先跑 `.\start.ps1`），所以它们
 进不了 pytest。都自己从 `/tasks` 里挑任务，不写死任何 ID；密钥从项目根 `.env` 读。
@@ -345,7 +345,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 
 ## 前端
 
-Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/src`。已注册路由：`/tasks`（默认）、`/sentiment`、`/schedules`、`/sources`、`/config`、`/tasks/:id/progress`、`/tasks/:id/results`、`/tasks/:id/sentiment`。
+Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/src`。已注册路由：`/tasks`（默认）、`/sentiment`、`/schedules`、`/sources`、`/config`、`/notify`、`/tasks/:id/progress`、`/tasks/:id/results`、`/tasks/:id/sentiment`。
 
 `useSSE.ts` 是**任务进度流**的唯一消费点：监听 `step_start` / `step_progress` / `step_complete` / `log` / `error` / `task_complete`，收到 `task_complete` 后主动 `disconnect()`。另外三条流各由自己的页面直接连：舆情页（`sentiment/events`，等 `sentiment_complete`）、结果页补译（`translate/events`，等 `translation_complete`）、数据源页人工授权（`authorize` 的流）—— 每条流的终止事件不同，见 `Skill(hyxi-architecture)` 的 SSE 一条。
 
@@ -390,7 +390,7 @@ Vue 3 + `<script setup>` + Pinia + vue-router，路径别名 `@` → `frontend/s
 （`javascript:alert(1)//x` 拼出来是段合法脚本）、**非字符串也不给**（手工构造的 API 请求
 能把它存成数字，`.rstrip` 一抛就是整页帖子列表 500）、路径段一律 `quote()`。
 **只给主贴，判据是 `reply_level` 而不是「排在树根」** —— 丢了父贴的回复也显示在树根，
-但它的 `message_id` 是 comment_id，拿它拼出的链接点开谁也不是（见存储红线第七条）。
+但它的 `message_id` 是 comment_id，拿它拼出的链接点开谁也不是（见存储红线「提升孤儿只清 `parent_fingerprint`」那条）。
 这类卡片的徽标也要跟着说实话（`ResultsView` 按 `reply_level > 0` 标成
 「回复（主贴缺失）」）：它是**唯一没有原帖链接**的卡片，标成「主贴」只会让人以为
 链接掉了。回归见 `e2e:link` 的场景二之二 —— **断言由出口数据驱动**（先从

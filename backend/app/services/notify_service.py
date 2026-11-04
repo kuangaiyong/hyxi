@@ -88,6 +88,7 @@ _UNFINISHED = (TaskStatus.PENDING, TaskStatus.PARSING, TaskStatus.RUNNING)
 _DEFAULTS = {
     "recipients": [], "source_ids": [], "days": None,
     "schedule_enabled": False, "schedule_time": "09:00",
+    # use_ssl: true = SSL/TLS（连 smtp_ssl_port）；false = STARTTLS（连 smtp_port，先明文连接再升级）
     "smtp_host": "", "smtp_port": 25, "smtp_ssl_port": 465, "use_ssl": True,
     "sender": "", "username": "", "trusted_certs": [],
 }
@@ -159,7 +160,7 @@ def _cert_keys(certs: List[dict]) -> set:
 
 
 def _endpoint(cfg: dict) -> tuple:
-    """密码实际会交给的那一端：服务器、实际连的端口、要不要 SSL、用户名（没在用的那个端口改了不算）"""
+    """密码实际会交给的那一端：服务器、实际连的端口、加密方式、用户名（没在用的那个端口改了不算）"""
     port = cfg.get("smtp_ssl_port") if cfg.get("use_ssl") else cfg.get("smtp_port")
     return cfg.get("smtp_host"), port, bool(cfg.get("use_ssl")), cfg.get("username")
 
@@ -228,8 +229,8 @@ def _clean(payload: dict, saved: dict, require_sources: bool) -> dict:
     elif _endpoint(saved) != _endpoint(cfg):
         # 留空沿用旧密码只限密码会交给的还是那一端：换了服务器还沿用，等于把已保存的密码交给那台新服务器 ——
         # 能调接口的人就能借这个口子，把「只进不出」的密码从自己搭的 SMTP 服务器上套出来。
-        # 端口和「使用 SSL」也算：已保存的是本机中继时，只改端口就能连到自己在本机监听的端口、明文收走密码（评审发现）
-        raise ValueError("SMTP 服务器、端口、「使用 SSL」或用户名改了，请重新填写密码 —— 已保存的密码不会带到新的服务器或账号上")
+        # 端口和加密方式也算：已保存的是本机中继时，只改端口就能连到自己在本机监听的端口、明文收走密码（评审发现）
+        raise ValueError("SMTP 服务器、端口、加密方式或用户名改了，请重新填写密码 —— 已保存的密码不会带到新的服务器或账号上")
     elif _cert_keys(certs) - _cert_keys(saved.get("trusted_certs") or []):
         # 新信任一张证书 = 认下一个新的服务器身份。沿用旧密码的话，能调接口的人填上自己那张证书的指纹、
         # 再冒充这台服务器，就能把已保存的密码引过去（评审在真应用上复现过）。判据是集合差：去掉一张换上另一张也算新信任；
@@ -1057,14 +1058,14 @@ def _cert_info(der: bytes) -> dict:
 
 def _ehlo(server: smtplib.SMTP) -> None:
     """smtplib 的 ehlo() 遇到非 250 不抛，只把扩展清空 —— 不拦下的话，一句「421 连接数超限」会被说成
-    「不支持 STARTTLS，请勾选使用 SSL」（评审实测过）。照实抛出，带着服务器原话"""
+    「不支持 STARTTLS，请把加密方式改成 SSL/TLS」（评审实测过）。照实抛出，带着服务器原话"""
     code, said = server.ehlo()
     if code != 250:
         raise smtplib.SMTPResponseException(code, said)
 
 
 def _connect(cfg: dict, host: str, port: int, context: ssl.SSLContext) -> smtplib.SMTP:
-    """连上并把连接加密好（SSL 端口直接握手；普通端口用 STARTTLS 升级），还没登录"""
+    """连上并把连接加密好（SSL/TLS 模式直接握手；STARTTLS 模式在普通端口上先明文连接再升级），还没登录"""
     if cfg["use_ssl"]:
         server = smtplib.SMTP_SSL(host, port, timeout=SMTP_TIMEOUT, context=context)
         try:
@@ -1080,8 +1081,8 @@ def _connect(cfg: dict, host: str, port: int, context: ssl.SSLContext) -> smtpli
             server.starttls(context=context)
             _ehlo(server)
         elif not _is_loopback(host):
-            raise NotifyError(f"SMTP 服务器 {host}:{port} 不支持加密连接（STARTTLS）。为了不明文传输密码，"
-                              "请勾选「使用 SSL」并填 SSL 端口（一般是 465）")
+            raise NotifyError(f"SMTP 服务器 {host}:{port} 没有提供 STARTTLS 加密。为了不明文传输密码，"
+                              "请把「加密方式」改成 SSL/TLS 并填 SSL 端口（一般是 465）")
     except BaseException:
         server.close()
         raise
@@ -1104,7 +1105,7 @@ def _pinned(cfg: dict, host: str, port: int, error: ssl.SSLCertVerificationError
     try:
         server = _connect(cfg, host, port, unverified)
     except NotifyError:
-        # 外部服务器这次没通告 STARTTLS。_connect 那句「请勾选使用 SSL」在这里是错的：第一次正是在 STARTTLS 里校验失败的
+        # 外部服务器这次没通告 STARTTLS。_connect 那句「请把加密方式改成 SSL/TLS」在这里是错的：第一次正是在 STARTTLS 里校验失败的
         raise NotifyError(no_tls) from None
     except Exception as e:
         why = (f"{e.smtp_code}，{_server_said(e, cfg['username'], '')}" if isinstance(e, smtplib.SMTPResponseException)
@@ -1173,10 +1174,10 @@ def deliver(cfg: dict, msg: EmailMessage) -> None:
     except smtplib.SMTPException as e:
         raise NotifyError(f"SMTP 发送失败（{where}）：{e}") from None
     except ssl.SSLError as e:
-        raise NotifyError(f"和 {where} 的 SSL 握手失败（{e.reason or e}）：端口和「使用 SSL」对得上吗？"
-                          "465 一般是 SSL 端口，25 / 587 不是") from None
+        raise NotifyError(f"和 {where} 的 SSL 握手失败（{e.reason or e}）：加密方式和端口对得上吗？"
+                          "「SSL/TLS」一般用 465，「STARTTLS」一般用 25 / 587") from None
     except TimeoutError:
-        raise NotifyError(f"连接 {where} 超时：检查服务器地址、端口和「使用 SSL」是否对应，"
+        raise NotifyError(f"连接 {where} 超时：检查服务器地址、端口和「加密方式」是否对应，"
                           "以及这个端口有没有被防火墙拦住") from None
     except OSError as e:
         raise NotifyError(f"连不上 SMTP 服务器 {where}（{e.strerror or e}）") from None

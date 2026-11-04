@@ -4,7 +4,7 @@ export interface NotifyTrustedCert {
   fingerprint: string
 }
 
-/** 邮件通知配置（提交）。password 留空 = 沿用已保存的（只在服务器、实际连的端口、「使用 SSL」、用户名都没变、也没新信任证书时） */
+/** 邮件通知配置（提交）。password 留空 = 沿用已保存的（只在服务器、实际连的端口、加密方式、用户名都没变、也没新信任证书时） */
 export interface NotifyConfigInput {
   recipients: string[]
   source_ids: string[]
@@ -13,8 +13,11 @@ export interface NotifyConfigInput {
   schedule_enabled: boolean
   schedule_time: string
   smtp_host: string
+  /** STARTTLS 模式使用的端口 */
   smtp_port: number
+  /** SSL/TLS 模式使用的端口 */
   smtp_ssl_port: number
+  /** 加密方式：true = SSL/TLS（连 smtp_ssl_port）；false = STARTTLS（连 smtp_port，先明文连接再升级） */
   use_ssl: boolean
   sender: string
   username: string

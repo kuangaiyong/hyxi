@@ -276,8 +276,8 @@ class TestNotifyConfigEndToEnd(_NotifyBase):
 
     def test_blank_password_keeps_the_saved_one_only_for_the_same_server_and_user(self):
         """留空 = 不修改。但服务器或用户名换了还沿用旧密码，等于把它发给一台新的服务器（谁都能借这个口子套出来）。
-        实际连的端口、「使用 SSL」也算：已保存的是本机中继时，只改端口就能连到自己在本机监听的端口、明文收走密码（评审发现）。
-        没在用的那个端口（不勾 SSL 时的 SSL 端口）改了不算"""
+        实际连的端口、加密方式也算：已保存的是本机中继时，只改端口就能连到自己在本机监听的端口、明文收走密码（评审发现）。
+        没在用的那个端口（STARTTLS 模式下的 SSL 端口）改了不算"""
         from app.services import crypto
         self._save(self._payload())
         body = self._save(self._payload(password="", recipients=["new@example.test"]))
@@ -288,6 +288,7 @@ class TestNotifyConfigEndToEnd(_NotifyBase):
                        {"smtp_port": 2525}, {"use_ssl": True}):
             resp = self.client.put("/api/v1/notify/config", json=self._payload(password="", **change))
             assert resp.status_code == 400 and "重新填写密码" in resp.json()["detail"], (change, resp.text)
+            assert "加密方式" in resp.json()["detail"], (change, resp.text)
         assert self.client.get("/api/v1/notify/config").json()["smtp_host"] == "127.0.0.1", "被拒的保存改动了配置"
         unused = self._save(self._payload(password="", smtp_ssl_port=1465))
         assert unused["smtp_ssl_port"] == 1465 and unused["has_password"] is True, unused
@@ -449,7 +450,8 @@ class TestNotifySmtpEndToEnd(_NotifyBase):
             pytest.skip("本机没有非回环的 IPv4，模拟不出「远端」服务器")
         with smtp_site.SmtpSite(tls="none", host="0.0.0.0") as site:
             body = self._test_mail(site, smtp_host=ip)
-        assert body["success"] is False and "SSL" in body["message"], body
+        msg = body["message"]
+        assert body["success"] is False and "加密方式" in msg and "SSL/TLS" in msg, body
         assert site.auths == [] and site.messages == [], "明文把密码发给远端了"
 
     def test_a_rejected_login_tells_to_use_the_authorization_code(self):

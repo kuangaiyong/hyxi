@@ -22,7 +22,8 @@
  *      同一台换个地址（127.0.0.1 → localhost）：信任绑在地址上，旧的不算数，给新地址信任一次就过、不原地打转；
  *      测试请求还在路上时改了地址：回来的结果不挂到新地址下面（另起一个开场白慢 3 秒的收件端）
  *
- * 收件端只听 127.0.0.1、不加密：后端对本机中继允许不加密登录，对外部服务器不允许（后端用例守那一条）。
+ * 收件端只听 127.0.0.1、不加密：页面选 STARTTLS，本机中继没通告 STARTTLS，后端按回环例外允许不加密登录；
+ * 对外部服务器不允许（后端用例守那一条）。
  * 第 8 步另起一个通告 STARTTLS 的收件端，证书用后端测试替身的 _make_cert 现生成（要 backend\.venv）。
  * 收尾会调接口「清除」配置，开发库里不留痕。**已经有邮件通知配置时以退出码 2 拒跑** ——
  * 密码只进不出，覆盖掉就还原不回来；确实要跑就设 E2E_NOTIFY_OVERWRITE=1（跑完配置会被清掉）。
@@ -288,8 +289,12 @@ async function main() {
         await page.locator(`[data-testid="notify-source"][value="${source.id}"]`).check();
         await byId(page, 'notify-days').selectOption({ label: '近 3 天' });
         await byId(page, 'notify-smtp-host').fill('127.0.0.1');
+        const security = byId(page, 'notify-smtp-security');
+        const securityOptions = await security.locator('option').evaluateAll((els) => els.map((e) => e.value));
+        check('加密方式里有 SSL/TLS 和 STARTTLS 两个选项',
+            securityOptions.includes('ssl') && securityOptions.includes('starttls'), securityOptions);
+        await security.selectOption('starttls');
         await byId(page, 'notify-smtp-port').fill(String(smtp.port));
-        await byId(page, 'notify-use-ssl').uncheck();
         await byId(page, 'notify-sender').fill(SENDER);
         await byId(page, 'notify-username').fill(SENDER);
         await byId(page, 'notify-password').fill(PASSWORD);
@@ -315,15 +320,15 @@ async function main() {
             sourceChecked: await page.locator(`[data-testid="notify-source"][value="${source.id}"]`).isChecked(),
             days: await byId(page, 'notify-days').evaluate((el) => el.options[el.selectedIndex].text),
             port: await byId(page, 'notify-smtp-port').inputValue(),
-            ssl: await byId(page, 'notify-use-ssl').isChecked(),
+            security: await byId(page, 'notify-smtp-security').inputValue(),
             schedule: await byId(page, 'notify-schedule').isChecked(),
             time: await byId(page, 'notify-schedule-time').inputValue(),
             password: await byId(page, 'notify-password').inputValue(),
             placeholder: await byId(page, 'notify-password').getAttribute('placeholder'),
         };
-        check('收件人、数据源、时间窗口、端口、SSL、定时都还在',
+        check('收件人、数据源、时间窗口、端口、加密方式、定时都还在',
             form.recipients.split('\n').join(',') === RECIPIENTS.join(',') && form.sourceChecked
-            && form.days === '近 3 天' && form.port === String(smtp.port) && !form.ssl
+            && form.days === '近 3 天' && form.port === String(smtp.port) && form.security === 'starttls'
             && form.schedule && form.time === '07:30', form);
         check('密码框是空的，提示「已保存」', form.password === '' && /已保存/.test(form.placeholder || ''), form);
         check(`读配置的 ${configBodies.length} 次响应里都没有密码`,
@@ -426,7 +431,7 @@ async function main() {
         check('收件端没收到信', smtp.mails.length === mailsBefore, smtp.mails.length - mailsBefore);
 
         console.log('\n场景七：自签证书的服务器 —— 没信任时给出证书指纹，确认后信任它才发得出去');
-        // 复刻用户在公司内网撞上的：不勾 SSL、普通端口上通告 STARTTLS、证书是自签的（后端严格校验必然不过）
+        // 复刻用户在公司内网撞上的：加密方式选 STARTTLS、服务器通告 STARTTLS、证书是自签的（后端严格校验必然不过）
         const certA = makeCert();
         const siteA = await startSmtp(certA);
         tlsSites.push(siteA);

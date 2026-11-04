@@ -37,7 +37,17 @@ const scheduleTime = ref('09:00')
 const smtpHost = ref('')
 const smtpPort = ref(25)
 const smtpSslPort = ref(465)
-const useSsl = ref(true)
+// 加密方式：页面上是 SSL/TLS / STARTTLS；提交给后端的仍是 use_ssl（true = SSL/TLS，false = STARTTLS）
+const smtpSecurity = ref<'ssl' | 'starttls'>('ssl')
+const useSsl = computed(() => smtpSecurity.value === 'ssl')
+// 当前加密方式实际会用的那个端口：SSL/TLS 用 SSL 端口，STARTTLS 用普通端口（后端按 use_ssl 选）
+const activePort = computed({
+  get: () => (useSsl.value ? smtpSslPort.value : smtpPort.value),
+  set: (value: number) => {
+    if (useSsl.value) smtpSslPort.value = value
+    else smtpPort.value = value
+  },
+})
 const sender = ref('')
 const username = ref('')
 const password = ref('')
@@ -91,7 +101,7 @@ function apply(cfg: NotifyConfigPublic) {
   smtpHost.value = cfg.smtp_host
   smtpPort.value = cfg.smtp_port
   smtpSslPort.value = cfg.smtp_ssl_port
-  useSsl.value = cfg.use_ssl
+  smtpSecurity.value = cfg.use_ssl ? 'ssl' : 'starttls'
   sender.value = cfg.sender
   username.value = cfg.username
   password.value = ''
@@ -125,7 +135,7 @@ const fmtFingerprint = (fp: string) => (fp.toUpperCase().match(/.{2}/g) || []).j
 // 测试结果（连同「信任这张证书」）只对测的那个地址有效：地址对不上就不显示。改了地址还留着，或者请求在途时改了地址、
 // 结果回来挂到新地址下面，点信任就会把上一台的证书加进来（评审发现）。一处判定，两种情况都管
 const smtpAddress = () =>
-  JSON.stringify([smtpHost.value.trim(), Number(smtpPort.value), Number(smtpSslPort.value), useSsl.value])
+  JSON.stringify([smtpHost.value.trim(), Number(smtpPort.value), Number(smtpSslPort.value), smtpSecurity.value])
 const testResult = computed(() =>
   testOutcome.value && testOutcome.value.address === smtpAddress() ? testOutcome.value.result : null)
 
@@ -327,18 +337,15 @@ function poll() {
 
         <div class="flex gap-4">
           <div class="form-group">
-            <label class="form-label" for="notify-smtp-port">端口</label>
-            <input id="notify-smtp-port" v-model.number="smtpPort" type="number" min="1" max="65535" class="form-input" style="width: 120px;" data-testid="notify-smtp-port" />
+            <label class="form-label" for="notify-smtp-security">加密方式</label>
+            <select id="notify-smtp-security" v-model="smtpSecurity" class="form-input" style="width: auto; min-width: 140px;" data-testid="notify-smtp-security">
+              <option value="ssl">SSL/TLS</option>
+              <option value="starttls">STARTTLS</option>
+            </select>
           </div>
           <div class="form-group">
-            <label class="form-label" for="notify-smtp-ssl-port">SSL 端口</label>
-            <input id="notify-smtp-ssl-port" v-model.number="smtpSslPort" type="number" min="1" max="65535" class="form-input" style="width: 120px;" data-testid="notify-smtp-ssl-port" />
-          </div>
-          <div class="form-group" style="align-self: flex-end;">
-            <label class="check-line">
-              <input v-model="useSsl" type="checkbox" data-testid="notify-use-ssl" />
-              使用 SSL（连 SSL 端口）
-            </label>
+            <label class="form-label" for="notify-smtp-port">端口</label>
+            <input id="notify-smtp-port" v-model.number="activePort" type="number" min="1" max="65535" class="form-input" style="width: 120px;" data-testid="notify-smtp-port" />
           </div>
         </div>
 

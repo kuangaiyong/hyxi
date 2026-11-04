@@ -161,7 +161,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 凭据**只进不出**：`SourcePublic` 只回 `has_credential` 和 `credential_username`，任何端点都不会把密码或密文读回去；`get_credential_secret()` 仅供采集器子进程的启动路径调用。`CollectorRunner` 也**不再把命令行 emit 到 SSE 和任务日志**（旧 `ScraperService` 会），密码既不进 argv 也不进 job 文件。
 
 **邮件通知的 SMTP 密码走同一套**（`notify_service`）：加密落库、`NotifyConfigPublic` 只回 `has_password`。
-另加一条：密码留空 = 沿用已保存的，**只限密码会交给的那一端（服务器、实际连的端口、是否 SSL、用户名）没变、也没新信任证书**
+另加一条：密码留空 = 沿用已保存的，**只限密码会交给的那一端（服务器、实际连的端口、加密方式、用户名）没变、也没新信任证书**
 （`notify_service._endpoint`；端口那一半防的是：已保存的是本机中继时，只改端口就能连到自己在本机监听的端口）—— 换了服务器（或认下一张新证书）
 还沿用，等于把「只进不出」的密码交给另一台服务器，能调接口的人就能从自己搭的 SMTP 上套出来（证书那一半是评审在真应用上复现的）。
 发信时证书严格校验，唯一的例外是用户按 SHA-256 指纹信任的证书（公司内网的自签证书，`notify_service._pinned`）——

@@ -215,7 +215,7 @@ class NotifyTrustedCert(BaseModel):
 
 
 class NotifyConfigInput(BaseModel):
-    """保存 / 测试邮件通知配置。password 留空 = 沿用已保存的（只在服务器、实际连的端口、「使用 SSL」、用户名都没变、
+    """保存 / 测试邮件通知配置。password 留空 = 沿用已保存的（只在服务器、实际连的端口、加密方式、用户名都没变、
     也没新信任证书时）"""
     recipients: List[str] = Field(default_factory=list, max_length=50)
     source_ids: List[str] = Field(default_factory=list, max_length=50)
@@ -223,9 +223,9 @@ class NotifyConfigInput(BaseModel):
     schedule_enabled: bool = False
     schedule_time: str = Field("09:00", max_length=5)
     smtp_host: str = Field("", max_length=255)
-    smtp_port: int = Field(25, ge=1, le=65535)
-    smtp_ssl_port: int = Field(465, ge=1, le=65535)
-    use_ssl: bool = True
+    smtp_port: int = Field(25, ge=1, le=65535)       # STARTTLS 模式使用的端口
+    smtp_ssl_port: int = Field(465, ge=1, le=65535)  # SSL/TLS 模式使用的端口
+    use_ssl: bool = True                              # true = SSL/TLS；false = STARTTLS（先明文连接再升级）
     sender: str = Field("", max_length=254)
     username: str = Field("", max_length=254)
     password: str = Field("", max_length=500)
@@ -243,9 +243,9 @@ class NotifyConfigPublic(BaseModel):
     schedule_enabled: bool = False
     schedule_time: str = "09:00"
     smtp_host: str = ""
-    smtp_port: int = 25
-    smtp_ssl_port: int = 465
-    use_ssl: bool = True
+    smtp_port: int = 25          # STARTTLS 模式使用的端口
+    smtp_ssl_port: int = 465     # SSL/TLS 模式使用的端口
+    use_ssl: bool = True         # true = SSL/TLS；false = STARTTLS
     sender: str = ""
     username: str = ""
     trusted_certs: List[NotifyTrustedCert] = Field(default_factory=list)

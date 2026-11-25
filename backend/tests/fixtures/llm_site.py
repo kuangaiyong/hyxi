@@ -49,6 +49,48 @@ class _Handler(BaseHTTPRequestHandler):
             # 复刻 8K 上下文模型：输入 + max_tokens 超过上下文就整个请求 400
             self._reply(400, {"error": {"message": f"max_tokens exceeds the limit of {limit}"}})
             return
+
+        if "帖子类型分类器" in system_msg:
+            # 邮件帖子类型分类：按本条帖子内容里放的关键词回固定标签，供测试断言。
+            # 不能看 root 上下文 —— 测试要钉的是「本条帖子」的标签。
+            self.server.seen.append("labels")
+            try:
+                items = json.loads(user_msg)
+            except ValueError:
+                items = []
+            if not isinstance(items, list):
+                items = []
+            self.server.label_requests.append((len(items), body.get("max_tokens") or 0))
+            if self.server.label_broken:
+                self._reply(200, {"choices": [{"message": {"content": "这不是 JSON"}}],
+                                  "usage": {"total_tokens": 1}})
+                return
+            if self.server.label_min_tokens and (body.get("max_tokens") or 0) < self.server.label_min_tokens:
+                # 复刻推理模型：输出预算不够时 content 为空，不是报错
+                self._reply(200, {"choices": [{"message": {"content": ""}}],
+                                  "usage": {"total_tokens": 1}})
+                return
+            labels = []
+            for item in items:
+                text = " ".join(str(item.get(k) or "") for k in ("content", "translation", "image_desc"))
+                if "无法判断" in text:
+                    label = "unknown"
+                elif "故障" in text or "报错" in text:
+                    label = "issue"
+                elif "请问" in text or "咨询" in text:
+                    label = "consultation"
+                else:
+                    label = "discussion"
+                if self.server.label_chinese:
+                    label = {"issue": "问题反馈", "consultation": "咨询",
+                             "discussion": "正常交流", "unknown": "未分类"}[label]
+                labels.append({"id": item.get("id"), "label": label})
+            if self.server.label_partial and len(items) > 1:
+                labels = labels[:max(1, len(labels) // 2)]
+            self._reply(200, {"choices": [{"message": {"content": json.dumps(labels, ensure_ascii=False)}}],
+                              "usage": {"total_tokens": 1}})
+            return
+
         if n_posts and self.server.sentiment_gate is not None and "智能调度器" not in system_msg:
             # 卡住舆情请求：任务停在舆情步骤里，帖子已读进内存、翻译步骤还没开始
             self.server.sentiment_blocked.append(n_posts)
@@ -138,7 +180,9 @@ class LLMSite:
                  retry_reply: str = None, reasoning_floor: int = 0,
                  translate_gate: threading.Event = None, gate_after: int = 0,
                  sentiment_gate: threading.Event = None, max_tokens_limit: int = 0,
-                 fail_texts: tuple = ()):
+                 fail_texts: tuple = (), label_broken: bool = False,
+                 label_min_tokens: int = 0, label_partial: bool = False,
+                 label_chinese: bool = False):
         self._port = port
         # 翻译请求里含其中任何一段就回 400
         self.fail_texts = fail_texts
@@ -157,11 +201,19 @@ class LLMSite:
         self.sentiment_gate = sentiment_gate
         self.sentiment_blocked = []
         self.max_tokens_limit = max_tokens_limit
+        # 邮件帖子类型分类：True 时回非法内容，供「失败也要发信并标未分类」用例
+        self.label_broken = label_broken
+        # 输出预算低于它时回空（复刻推理模型吃 reasoning）；批量只回一半，供单条重试用例
+        self.label_min_tokens = label_min_tokens
+        self.label_partial = label_partial
+        self.label_chinese = label_chinese
         self._server = None
         self._thread = None
         self.seen = []
         self.prompts = []
         self.user_prompts = []
+        # 每次邮件类型分类请求的 (条数, max_tokens)
+        self.label_requests = []
         # 每次翻译请求里有几条 —— 「增量跳过」和「全量重译」的唯一分辨点。
         # 必须是 list：int 是不可变的，赋到 server 上就成了两份各自增长的计数
         self.translated = []
@@ -183,6 +235,11 @@ class LLMSite:
         self._server.sentiment_blocked = self.sentiment_blocked
         self._server.max_tokens_limit = self.max_tokens_limit
         self._server.fail_texts = self.fail_texts
+        self._server.label_broken = self.label_broken
+        self._server.label_min_tokens = self.label_min_tokens
+        self._server.label_partial = self.label_partial
+        self._server.label_chinese = self.label_chinese
+        self._server.label_requests = self.label_requests
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         return "http://127.0.0.1:{}".format(self._server.server_address[1])

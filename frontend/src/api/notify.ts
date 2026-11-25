@@ -1,6 +1,6 @@
 import apiClient from './client'
 import type {
-  NotifyConfigInput, NotifyConfigPublic, NotifyPrecheck, NotifyStatus, NotifyTestResult,
+  NotifyConfigInput, NotifyConfigPublic, NotifyPrecheck, NotifyPreview, NotifyStatus, NotifyTestResult,
 } from '@/types/notify'
 
 export async function fetchNotifyConfig(): Promise<NotifyConfigPublic> {
@@ -21,6 +21,12 @@ export async function deleteNotifyConfig(): Promise<NotifyConfigPublic> {
 /** 用表单上的（不必先保存的）SMTP 设置发一封测试邮件 */
 export async function sendTestMail(payload: NotifyConfigInput): Promise<NotifyTestResult> {
   const { data } = await apiClient.post('/notify/test', payload)
+  return data
+}
+
+/** 只读预览当前会发出的摘要，用来验证分类/着色；不发送、不写已发状态 */
+export async function previewNotify(): Promise<NotifyPreview> {
+  const { data } = await apiClient.post('/notify/preview')
   return data
 }
 

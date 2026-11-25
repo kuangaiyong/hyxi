@@ -6967,7 +6967,7 @@ class TestFreshReplyDetectionEndToEnd:
             post_key(f1): 1, post_key(f2): 2}
 
     def test_wider_windows_never_drop_a_reply(self):
-        """3 天 ⊆ 7 天 ⊆ 14 天（用户实测报过：近 3 天有的回复，近 7 天、近 14 天里反而没有）。
+        """1 天 ⊆ 3 天 ⊆ 7 天 ⊆ 14 天（用户实测报过：近 3 天有的回复，近 7 天、近 14 天里反而没有）。
         按旧规则「主贴也得早于窗口」，窗口一放宽，主贴就可能落进窗口，回复跟着被踢出去"""
         from app.services.post_tree import mark_fresh_replies
 
@@ -6978,8 +6978,8 @@ class TestFreshReplyDetectionEndToEnd:
             for lag in (1, 2, 5, 9):                  # 主贴之后 1 / 2 / 5 / 9 天各一条回复
                 if day + lag <= 20:
                     posts.append(self._post(f"r{day}-{lag}", f"{day + lag:02d}-08-2026 12:00", parent=f"r{day}"))
-        got = {d: set(mark_fresh_replies(posts, d)) for d in (3, 7, 14)}
-        assert got[3] and got[3] <= got[7] <= got[14], {d: len(v) for d, v in got.items()}
+        got = {d: set(mark_fresh_replies(posts, d)) for d in (1, 3, 7, 14)}
+        assert got[1] and got[1] <= got[3] <= got[7] <= got[14], {d: len(v) for d, v in got.items()}
 
     def test_the_users_real_case_is_in_every_window(self):
         """便携包真实数据里的那一串（2026-10-16 实测）：主贴 12-09 00:33，两条回复 14-09，基准 15-09 15:44。

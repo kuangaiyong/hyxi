@@ -96,7 +96,8 @@ FastAPI (backend/main.py — lifespan 建目录 + 启停 APScheduler)
     ├── app/services/vision_service.py     多模态图片理解（只服务于舆情，翻译不用）
     ├── app/services/sentiment_service.py  LLM 舆情分析（3 条/批，结论按帖子身份落库）
     ├── app/services/excel_service.py   openpyxl 生成双语 Excel + 舆情报告
-    ├── app/services/notify_service.py  邮件通知（选新回复 → 补译 → HTML 邮件 → SMTP；每天定时）
+    ├── app/services/notify_service.py  邮件通知（选新回复 → 补译 → 帖子类型分类 → HTML 邮件 → SMTP；每天定时）
+    ├── app/services/email_labels.py   邮件专用帖子类型分类（问题反馈/咨询/正常交流，不落库）
     ├── app/services/storage.py         SQLite 存储层（全部持久化，见「持久化」一节）
     ├── app/services/progress_manager.py SSE 事件广播 (asyncio.Queue pub/sub 单例)
     └── app/services/scheduler_service.py APScheduler（SQLAlchemyJobStore，Asia/Shanghai）
@@ -168,6 +169,26 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 那条连接不校验证书，**比对指纹必须在登录之前**；每条信任绑在读到证书的服务器地址上、只对那台生效（只存指纹的话，
 握有那张证书私钥的人能冒充别的服务器）；
 外部服务器既不走 SSL 又不支持 STARTTLS 时拒绝登录（本机回环地址上的中继除外，E2E 的收件端靠这一条）。
+**邮件配图**：正文用 `cid:` 内嵌、HTML 附件用 `data:` URI；只从 `data/media` 经 `vision_service.media_path()` 读，
+绝不引用 `/api/v1/media`（收件端没有密钥，也连不到发件人本机）；单张 1 MB / 整封 2.5 MB / 单帖 6 张 / 处理长边 2048，
+跳过要在邮件里注明「未附」；`build_message` 走 `asyncio.to_thread`，别让读图/转码卡住事件循环。
+**邮件帖子类型标签**（v1.21.2，`email_labels.py`）：正文和 HTML 附件里每条帖子（含上下文老主贴、附件独有帖子）
+都标「问题反馈 / 咨询 / 正常交流 / 未分类」；每封现场用同一 LLM 配置分类，**5 条/批 + 4096 输出 tokens**，**不落库**，
+不改 `posts` / `sentiment_results`。**推理型模型（deepseek-v4-flash）的 reasoning 也计入 max_tokens**：10 条/1024
+会把 content 吃成空串、整批 unknown；这是 2026-11-24 用户收到大量「未分类」的根因。批量解析后缺失的 id 必须逐条重试；
+模型空返回/不完整返回要打 warning。prompt 只在正文/译文/图片描述全空时才允许 unknown，有可读内容一律三选一、拿不准归
+discussion。中文 label 要归一化。未配置 LLM、请求失败、格式不对都只把相关条目落 `unknown` 并在邮件抬头说明原因，
+**不拦发信**。问题反馈贴整块浅红底 `#fef2f2` + 左侧红边 `#dc2626`，正文和附件都生效，问题红优先于近 24 小时的浅绿。
+这是邮件专用的意图分类，不是舆情结论 —— 邮件仍不放正面/负面/强度/理由/维度。附件也标意味着所有帖子都参与分类，
+大摘要会多花几轮调用；别把它接到舆情结果上（语义不对，且没跑舆情的帖子没有结论）。
+**邮件头**：摘要顶层是 `MIMEMultipart`，**不要复制 `EmailMessage` 的 header 对象**（`meta.items()` + `top[key] = value`）——
+`From` 是已解码的 header 对象，会被 compat32 整串编码成一个 RFC 2047 encoded-word，QQ 回 550「From header is missing or invalid」。
+统一走 `_set_headers()`：`From` 用 `formataddr((_FROM_NAME, cfg["sender"]))` 只编码显示名，地址留在 encoded-word 外面；
+测试邮件和摘要邮件必须共用这一条路。
+**预览**（v1.21.3）：`POST /api/v1/notify/preview` + 邮件通知页「预览当前摘要」是**只读**的——不发送、不写
+`notified_at`、不改 anchors、不采集、不补译；用已保存配置，走与发送相同的 `collect_fresh` / `classify_posts` /
+`_digest_layout` / `render_html`，正文和附件都用 `data:` URI 以便浏览器看。已发过的内容也要列出来（「全是已发过」
+的跳过是发送侧的正确保护，不要在预览里复用）；正文/附件分 tab，问题贴着色和标签必须与真实邮件同源。
 
 **改邮件通知「哪些帖子进这一封」之前先读 `docs/features/email-notify.md` 的「设计」一节。**补发曾两次拿时间去推
 「这条发没发过」（先是入库时间，再是每轮挪动的水位线），两次都被评审找出漏法、推翻重来。现在的做法是直接记
@@ -280,7 +301,7 @@ LLM 解析用户自然语言 → 生成执行计划 `[{action, params}]` → 逐
 
 ## 测试
 
-**596 个测试，交付前必须全部 PASSED**（本机实测 `test_impact.py build` 596 条全过，2026-10-26，848 秒）。但**全量只在最后一次代码改动之后跑一次**
+**618 个测试，交付前必须全部 PASSED**（本机实测 `test_impact.py build -n 1` 618 条全过，2026-11-25）。但**全量只在最后一次代码改动之后跑一次**
 —— 质量红线的另一半是：它之前的每一轮改动，都要跑到受影响的范围。
 
 ### 什么时候跑什么（在仓库根目录）

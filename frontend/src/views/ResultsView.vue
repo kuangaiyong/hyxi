@@ -20,7 +20,7 @@ const searchText = ref('')
 // 位置去，用户根本翻不到。这个开关把它们挑出来。
 // **筛选在后端做**：一页只有 50 个主贴，在前端筛只能筛出当前页里的 —— 而它们恰恰
 // 就在后面几页，等于什么都没做。
-const FRESH_DAYS_CHOICES = [3, 7, 14]
+const FRESH_DAYS_CHOICES = [1, 3, 7, 14]
 const freshDays = ref(7)
 const onlyFresh = ref(false)
 const isSearching = ref(false)

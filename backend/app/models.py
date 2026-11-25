@@ -307,6 +307,21 @@ class NotifyPrecheck(BaseModel):
     stale: List[NotifySourceBrief] = []
 
 
+class NotifyPreview(BaseModel):
+    """只读预览：不发送、不写已发状态。正文/附件 HTML 已含标签与问题贴着色"""
+    subject: str = ""
+    reply_count: int = 0
+    root_count: int = 0
+    late_count: int = 0
+    repeat_count: int = 0
+    label_counts: Dict[str, int] = Field(default_factory=dict)
+    labels_note: str = ""
+    body_html: str = ""
+    attachment_html: str = ""
+    attachment_name: str = ""
+    body_truncated: bool = False
+
+
 # ===== SSE 事件 =====
 
 class SSEEvent(BaseModel):

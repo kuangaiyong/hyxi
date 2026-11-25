@@ -12,7 +12,7 @@ from typing import Collection, Dict, List, Optional, Tuple
 # 「近 N 天」的默认窗口与可选值。**必须是封闭集合** —— 这个数字会进 Excel 的文案和
 # 概览统计，放任调用方传任意整数等于让它决定报告口径，两份报告就再也对不上了
 FRESH_DAYS_DEFAULT = 7
-FRESH_DAYS_CHOICES = (3, 7, 14)
+FRESH_DAYS_CHOICES = (1, 3, 7, 14)
 
 
 def post_key(post: dict) -> str:

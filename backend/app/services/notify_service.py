@@ -5,6 +5,9 @@
 发送前先看所选数据源今天有没有成功采集翻译过，没有就自动发起「采集 + 翻译」任务，跑完再挑新回复
 （每天定时一律如此；手动发送由页面的确认框决定）。
 
+正文/附件里每条帖子还带一个邮件专用类型标签（问题反馈/咨询/正常交流，见 email_labels.py）；
+未配置 LLM 或分类失败时标「未分类」并说明，不拦发信。它是意图分类，不是舆情结论。
+
 配置存 app_config：`notify.settings`（JSON）+ `notify.password_enc`（SMTP 密码的密文。同数据源凭据：
 加密落库、只进不出）。最近一次发送的结果存 `notify_status.last`，页面靠它看到定时发送发没发成。
 规格与证据见 docs/features/email-notify.md
@@ -15,9 +18,11 @@ import base64
 import copy
 import hashlib
 import html
+import io
 import ipaddress
 import json
 import math
+import os
 import re
 import smtplib
 import ssl
@@ -26,14 +31,25 @@ import uuid
 from datetime import datetime, timedelta
 from email.errors import HeaderParseError
 from email.headerregistry import Address
-from email.message import EmailMessage
-from email.utils import formatdate, make_msgid
+from email.message import EmailMessage, Message
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import formataddr, formatdate, make_msgid
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from apscheduler.jobstores.base import JobLookupError
 from apscheduler.triggers.cron import CronTrigger
 from cryptography import x509
+
+# 邮件配图用 Pillow 校验/缩放/转码。它在 requirements 与便携包（--include-package=PIL）里都有；
+# 万一缺失也不能让整封邮件发不出去，下面按「所有配图无法读取」降级
+try:
+    from PIL import Image as PILImage, ImageOps
+except ImportError:       # pragma: no cover - 依赖清单里有，留作防御
+    PILImage = None
+    ImageOps = None
 
 from app.collectors import get_collector
 from app.collectors.base import Collector
@@ -46,7 +62,9 @@ from app.services.post_tree import (
     flat_thread_starts, mark_fresh_replies, normalize_timestamp, parent_key, parse_time,
     post_key, sort_time, thread_of,
 )
+from app.services.email_labels import LABEL_TEXT, classify_posts
 from app.services.translator_service import TranslatorService, needs_translation
+from app.services.vision_service import media_path
 
 logger = get_logger(__name__)
 
@@ -555,8 +573,10 @@ async def _send_digest(now: datetime) -> dict:
     if roots_failed:
         note = f"（另有 {roots_failed} 条主贴没翻成，邮件里只放了原文）{note}"
 
+    _state["progress"] = "正在给邮件帖子分类"
+    labels, labels_note = await classify_posts(_label_items(sections))
     _state["progress"] = "正在发送邮件"
-    msg = build_message(cfg, sections, days, now)
+    msg = await asyncio.to_thread(build_message, cfg, sections, days, now, labels, labels_note)
     await asyncio.to_thread(deliver, cfg, msg)
     # 信已经发出去了，下面记账失败也不能报成「发送失败」—— 只是下一封可能把这几条当补发再发一遍
     try:
@@ -820,47 +840,313 @@ def _time(post: dict) -> str:
     return normalize_timestamp(post.get("timestamp") or "").strip() or "时间未知"
 
 
-def _body_html(post: dict, clip: Optional[int] = None) -> str:
-    """原文在上（灰）、译文在下，同结果页的「双语」视图"""
+# ===== 邮件配图 =====
+# 正文用 cid 内嵌，HTML 附件用 data URI（附件要能单独用浏览器打开）。只从 data/media 读，
+# 绝不引用 /api/v1/media —— 收件端没有本机密钥，也可能根本连不到发件人的电脑。
+# 上限按「唯一原图字节」计：正文 related 和附件 data URI 各 base64 一次，HTML 附件本身还会被
+# MIMEText 再 base64 一次；2.5MB 原图最坏约 8MB 邮件，低于常见 10MB 的 Exchange 单封上限。
+EMAIL_IMAGE_MAX_BYTES = 1 * 1024 * 1024
+EMAIL_IMAGE_TOTAL_BYTES = 2560 * 1024
+EMAIL_IMAGE_MAX_PER_POST = 6
+EMAIL_IMAGE_MAX_PX = 2048
+EMAIL_IMAGE_DISPLAY_PX = 600
+EMAIL_IMAGE_MAX_PIXELS = 40_000_000
+_IMAGE_STYLE = "display:block;max-width:100%;height:auto;border-radius:4px;margin:6px 0 0;border:0"
+_IMAGE_MIME = {"JPEG": ("image/jpeg", "jpg"), "PNG": ("image/png", "png"), "GIF": ("image/gif", "gif")}
+_IMAGE_REASONS = {
+    "missing": "文件已丢失或路径不可用",
+    "unreadable": "无法读取或格式不支持",
+    "too_big": "超出单张大小限制",
+    "budget": "超出邮件大小限制",
+    "per_post": "单帖最多显示 %d 张" % EMAIL_IMAGE_MAX_PER_POST,
+}
+
+
+class EmailImages:
+    """为这一封邮件挑选、转换并缓存配图；正文取 cid，HTML 附件取 data URI。
+
+    只按帖子对象工作，不碰数据库/接口。所有失败都降级成「该帖 N 张未附」，
+    绝不让一张坏图拦住整封邮件。同一张图（按 media 内绝对路径）只读盘/转换/内联一次。
+    """
+
+    def __init__(self):
+        self._selected: Dict[str, dict] = {}
+        self._posts: Dict[str, List[Optional[dict]]] = {}
+        self._notes: Dict[str, str] = {}
+        self._inline: Dict[str, dict] = {}
+        self._total = 0
+        self._seq = 0
+
+    def select(self, posts) -> None:
+        """按传入顺序挑图；先传正文帖子再传全部帖子，正文的图优先占预算。"""
+        for post in posts:
+            key = post_key(post)
+            if key in self._posts:
+                continue
+            rels = post.get("images") or []
+            if not isinstance(rels, list):
+                rels = []
+            chosen: List[Optional[dict]] = []
+            reasons: Dict[str, int] = {}
+            seen = set()
+            for index, rel in enumerate(rels):
+                if index >= EMAIL_IMAGE_MAX_PER_POST:
+                    reasons["per_post"] = reasons.get("per_post", 0) + 1
+                    chosen.append(None)
+                    continue
+                if not isinstance(rel, str) or not rel:
+                    reasons["missing"] = reasons.get("missing", 0) + 1
+                    chosen.append(None)
+                    continue
+                if rel in seen:        # 同一帖里重复的路径只显示一次，也不重复占预算
+                    chosen.append(None)
+                    continue
+                seen.add(rel)
+                abs_path = media_path(rel)
+                if not abs_path:
+                    reasons["missing"] = reasons.get("missing", 0) + 1
+                    chosen.append(None)
+                    continue
+                info = self._selected.get(abs_path)
+                if info is None:
+                    info, why = self._load(abs_path)
+                    if info is None:
+                        reasons[why] = reasons.get(why, 0) + 1
+                        chosen.append(None)
+                        continue
+                if abs_path not in self._selected:
+                    if self._total + len(info["data"]) > EMAIL_IMAGE_TOTAL_BYTES:
+                        reasons["budget"] = reasons.get("budget", 0) + 1
+                        chosen.append(None)
+                        continue
+                    self._selected[abs_path] = info
+                    self._total += len(info["data"])
+                chosen.append(info)
+            self._posts[key] = chosen
+            self._notes[key] = self._note(reasons)
+
+    def render(self, post: dict, mode: str = "cid") -> Tuple[str, str]:
+        """返回 (图片标签, 未附说明)。mode=cid 给正文，mode=data 给 HTML 附件。"""
+        chosen = self._posts.get(post_key(post))
+        if not chosen:
+            return "", ""
+        tags = []
+        for index, info in enumerate(chosen, 1):
+            if info is None:
+                continue
+            src = self._data_uri(info) if mode == "data" else self._cid_src(info)
+            if not src:
+                continue
+            width, height = self._display_size(info["width"], info["height"])
+            size = f' width="{width}" height="{height}"' if width and height else ""
+            tags.append(f'<img class="post-image" src="{src}"{size} alt="配图 {index}" style="{_IMAGE_STYLE}">')
+        return "".join(tags), self._notes.get(post_key(post), "")
+
+    def inline_parts(self) -> List[Tuple[str, dict]]:
+        """正文 HTML 里用到的 cid 部件；build_message 逐个做成 MIMEImage 放进 related。"""
+        return list(self._inline.items())
+
+    @staticmethod
+    def _display_size(width: int, height: int) -> Tuple[int, int]:
+        longest = max(width or 0, height or 0)
+        if longest <= EMAIL_IMAGE_DISPLAY_PX:
+            return int(width or 0), int(height or 0)
+        scale = EMAIL_IMAGE_DISPLAY_PX / longest
+        return max(1, int(width * scale)), max(1, int(height * scale))
+
+    @staticmethod
+    def _note(reasons: Dict[str, int]) -> str:
+        if not reasons:
+            return ""
+        labels = []
+        for key in ("missing", "unreadable", "too_big", "budget"):
+            count = reasons.get(key, 0)
+            if count:
+                labels.append(f"{_IMAGE_REASONS[key]} {count} 张")
+        per_post = reasons.get("per_post", 0)
+        if per_post:
+            labels.append(f"{_IMAGE_REASONS['per_post']}（另有 {per_post} 张）")
+        return (f'<p class="image-note" style="{_META};margin:4px 0 0">'
+                f'另有 {sum(reasons.values())} 张图片未附（{"、".join(labels)}）</p>')
+
+    def _cid_src(self, info: dict) -> str:
+        if not info.get("cid"):
+            cid = make_msgid(domain="hyxi.local")
+            info["cid"] = cid
+            self._inline[cid] = info
+        return "cid:" + info["cid"][1:-1]
+
+    @staticmethod
+    def _data_uri(info: dict) -> str:
+        if not info.get("data_uri"):
+            encoded = base64.b64encode(info["data"]).decode("ascii")
+            info["data_uri"] = f"data:{info['mime']};base64,{encoded}"
+        return info["data_uri"]
+
+    def _info(self, data: bytes, mime: str, ext: str, width: int, height: int) -> dict:
+        self._seq += 1
+        return {
+            "data": data, "mime": mime, "subtype": mime.split("/", 1)[1],
+            "filename": f"hyxi-image-{self._seq}.{ext}",
+            "width": width, "height": height, "cid": None, "data_uri": None,
+        }
+
+    def _load(self, abs_path: str) -> Tuple[Optional[dict], str]:
+        """读一张图并按邮件客户端兼容性处理。返回 (info, 失败原因)。"""
+        if PILImage is None:
+            return None, "unreadable"
+        try:
+            raw_size = os.path.getsize(abs_path)
+            with PILImage.open(abs_path) as im:
+                width, height = im.size
+                if width * height > EMAIL_IMAGE_MAX_PIXELS:
+                    return None, "too_big"
+                fmt = (getattr(im, "format", "") or "").upper()
+                try:
+                    orientation = im.getexif().get(0x0112, 1)
+                except Exception:
+                    orientation = 1
+                if (fmt in _IMAGE_MIME and orientation in (1, None)
+                        and raw_size <= EMAIL_IMAGE_MAX_BYTES
+                        and max(width, height) <= EMAIL_IMAGE_MAX_PX):
+                    with open(abs_path, "rb") as f:
+                        data = f.read()
+                    if len(data) <= EMAIL_IMAGE_MAX_BYTES:
+                        mime, ext = _IMAGE_MIME[fmt]
+                        return self._info(data, mime, ext, width, height), ""
+                    return None, "too_big"
+                if fmt == "GIF":
+                    # 动画 GIF 不压成静帧：超限就注明未附，避免悄悄丢动画
+                    return None, "too_big"
+                if ImageOps is not None:
+                    im = ImageOps.exif_transpose(im)
+                im.thumbnail((EMAIL_IMAGE_MAX_PX, EMAIL_IMAGE_MAX_PX), PILImage.Resampling.LANCZOS)
+                width, height = im.size
+                if fmt == "PNG":
+                    out = io.BytesIO()
+                    if im.mode not in ("RGB", "RGBA", "L", "LA", "P"):
+                        im = im.convert("RGBA")
+                    im.save(out, format="PNG", optimize=True)
+                    data = out.getvalue()
+                    if len(data) <= EMAIL_IMAGE_MAX_BYTES:
+                        return self._info(data, "image/png", "png", width, height), ""
+                if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+                    rgba = im.convert("RGBA")
+                    bg = PILImage.new("RGB", rgba.size, (255, 255, 255))
+                    bg.paste(rgba, mask=rgba.split()[-1])
+                    im = bg
+                else:
+                    im = im.convert("RGB")
+                out = io.BytesIO()
+                im.save(out, format="JPEG", quality=85, optimize=True)
+                data = out.getvalue()
+                if len(data) > EMAIL_IMAGE_MAX_BYTES:
+                    return None, "too_big"
+                return self._info(data, "image/jpeg", "jpg", *im.size), ""
+        except Exception as e:
+            logger.warning("邮件配图读取失败 %s: %s", os.path.basename(abs_path), str(e)[:100])
+            return None, "unreadable"
+
+
+def _iter_posts(sections: List[dict]):
+    """按显示顺序产出主贴和它下面的回复，供 EmailImages.select 占预算。"""
+    for section in sections:
+        for thread in section["threads"]:
+            yield thread["root"]
+            for reply in thread["replies"]:
+                yield reply["post"]
+
+
+def _label_items(sections: List[dict]) -> List[dict]:
+    """邮件类型分类器的输入：正文和附件里的所有帖子，按 post_key 去重。
+
+    回复带上所在串主贴作上下文；译文可用就带上，翻不成的只用原文。
+    """
+    items = {}
+    for section in sections:
+        for thread in section["threads"]:
+            root = thread["root"]
+            root_text = root.get("content") or ""
+            items.setdefault(post_key(root), {
+                "id": post_key(root), "role": "主贴", "root": "", "post": root,
+                "translation": "" if needs_translation(root) else (root.get("translation") or ""),
+            })
+            for reply in thread["replies"]:
+                p = reply["post"]
+                items.setdefault(post_key(p), {
+                    "id": post_key(p), "role": "回复", "root": root_text, "post": p,
+                    "translation": "" if needs_translation(p) else (p.get("translation") or ""),
+                })
+    return list(items.values())
+
+
+def _body_html(post: dict, clip: Optional[int] = None,
+                images: Optional[EmailImages] = None, image_mode: str = "cid") -> str:
+    """原文在上（灰）、译文在下，同结果页的「双语」视图；有配图时嵌图并注明未附项"""
     def cut(text):
         text = (text or "").strip()
         return text[:clip] + "…" if clip and len(text) > clip else text
 
+    image_html, image_note = images.render(post, image_mode) if images is not None else ("", "")
     content = cut(post.get("content"))
     if content:
         # 判据同 needs_translation：失败标记（「[翻译失败] 原文…」）不是译文，不能当译文放进邮件
         parts = [f'<p style="{_ORIG}">{_esc(content)}</p>',
                  f'<p style="{_ZH}">{_esc(cut(post.get("translation")))}</p>' if not needs_translation(post)
                  else f'<p style="{_ORIG};font-style:italic">（尚未翻译）</p>']
+    elif image_html:
+        parts = [f'<p style="{_ORIG};font-style:italic">（没有文字，配图如下）</p>']
     else:
         parts = [f'<p style="{_ORIG};font-style:italic">（没有文字，可能是图片或表情）</p>']
-    images = len(post.get("images") or [])
-    if images:
-        parts.append(f'<p style="{_META};margin:4px 0 0">含 {images} 张图片（邮件里不附图片，到结果页查看）</p>')
+    if image_html:
+        parts.append(f'<div class="post-images">{image_html}</div>')
+    if image_note:
+        parts.append(image_note)
+    if images is None:
+        # 直接调用 _body_html 的旧路径没有选图器：只报张数，不再写「邮件里不附图片」
+        count = len(post.get("images") or [])
+        if count:
+            parts.append(f'<p style="{_META};margin:4px 0 0">含 {count} 张图片</p>')
     return "".join(parts)
 
 
-def _thread_html(thread: dict) -> str:
+def _thread_html(thread: dict, images: Optional[EmailImages] = None,
+                 image_mode: str = "cid", labels: Optional[Dict[str, str]] = None) -> str:
     root = thread["root"]
     new = thread.get("new_root")
     badge = f'<span style="{_NEW_BADGE}">🆕 新主贴</span>' if new else f'<span style="{_BADGE}">主贴</span>'
     head = (f'<div>{badge} <b>{_esc(root.get("username"))}</b> '
             f'<span style="{_META}">{_esc(_time(root))}</span>'
-            f'{_tags(thread.get("late_root"), new and thread.get("repeat_root"))}</div>')
+            f'{_tags(thread.get("late_root"), new and thread.get("repeat_root"))}'
+            f'{_type_badge(labels.get(post_key(root)) if labels else None)}</div>')
     replies = []
     for r in thread["replies"]:
         p = r["post"]
         to = f' <span style="{_META}">回复 {_esc(r["reply_to"])}</span>' if r["reply_to"] else ""
-        style = f"{_REPLY};{_TINT}" if r.get("recent") else _REPLY
+        reply_label = labels.get(post_key(p)) if labels else None
+        if reply_label == "issue":
+            style = f"{_REPLY};{_ISSUE_TINT}"
+        elif r.get("recent"):
+            style = f"{_REPLY};{_TINT}"
+        else:
+            style = _REPLY
         replies.append(
             f'<div class="reply" style="{style}"><div>↳ <b>{_esc(p.get("username"))}</b>{to} '
-            f'<span style="{_META}">{_esc(_time(p))}</span>{_tags(r.get("late"), r.get("repeat"))}</div>'
-            f'{_body_html(p)}</div>')
+            f'<span style="{_META}">{_esc(_time(p))}</span>{_tags(r.get("late"), r.get("repeat"))}'
+            f'{_type_badge(reply_label)}</div>'
+            f'{_body_html(p, images=images, image_mode=image_mode)}</div>')
     # 新主贴是新内容本身，全文照登；老主贴只是上下文，太长截断。正文截取时没排进最新那几条、只因为它的回复排进去了
     # 才出现的新主贴（clip_root），在正文里也只是上下文 —— 全文在附件里
-    body = _body_html(root, None if new and not thread.get("clip_root") else ROOT_CLIP)
+    body = _body_html(root, None if new and not thread.get("clip_root") else ROOT_CLIP,
+                      images=images, image_mode=image_mode)
     # 主贴单独包一层：底色只垫主贴自己，不连着下面的回复（见 _recent）
-    root_style = f"{_ROOT};{_TINT}" if thread.get("recent_root") else _ROOT
+    root_label = labels.get(post_key(root)) if labels else None
+    if root_label == "issue":
+        root_style = f"{_ROOT};{_ISSUE_TINT}"
+    elif thread.get("recent_root"):
+        root_style = f"{_ROOT};{_TINT}"
+    else:
+        root_style = _ROOT
     return (f'<div class="thread" style="{_CARD}"><div class="root" style="{root_style}">{head}{body}</div>'
             f'{"".join(replies)}</div>')
 
@@ -873,12 +1159,34 @@ def _tags(late: bool, repeat: bool) -> str:
     return f' <span style="{_LATE_TAG}">已发过</span>' if repeat else ""
 
 
-def _section_html(section: dict, days: int) -> str:
+_TYPE_STYLES = {
+    "issue": "background:#fef2f2;color:#b91c1c",
+    "consultation": "background:#f5f3ff;color:#6d28d9",
+    "discussion": "background:#ecfdf5;color:#047857",
+    "unknown": "background:#f1f5f9;color:#6b7280",
+}
+# 问题反馈贴整块着色：浅红底 + 左侧红边。放在这里而不是 badge 上，用户翻邮件能一眼看到
+_ISSUE_TINT = "background:#fef2f2;border-left:3px solid #dc2626"
+
+
+def _type_badge(label: Optional[str]) -> str:
+    """邮件帖子类型小标签；未分类也照实显示，正文/附件共用。"""
+    text = LABEL_TEXT.get(label or "")
+    if not text:
+        return ""
+    style = _TYPE_STYLES.get(label or "", _TYPE_STYLES["unknown"])
+    return (f' <span class="post-type" style="display:inline-block;padding:0 6px;'
+            f'border-radius:4px;font-size:12px;{style}">{text}</span>')
+
+
+def _section_html(section: dict, days: int, images: Optional[EmailImages] = None,
+                  image_mode: str = "cid", labels: Optional[Dict[str, str]] = None) -> str:
     replies, roots = section.get("counts") or _counts([section])
     title = f'来自：{_esc(section["collector_name"])}「{_esc(section["source"].get("name"))}」'
     count = _label(replies, roots) + ("（正文只列了其中最新的一部分，其余见附件）" if section.get("truncated") else "")
     if section["threads"]:
-        body = "".join(_thread_html(t) for t in section["threads"])
+        body = "".join(_thread_html(t, images=images, image_mode=image_mode, labels=labels)
+                       for t in section["threads"])
     elif replies or roots:
         body = f'<p style="{_META}">这些比正文里的都早，见附件</p>'
     else:
@@ -888,7 +1196,9 @@ def _section_html(section: dict, days: int) -> str:
 
 
 def render_html(sections: List[dict], days: int, now: datetime, title: str,
-                counts: Tuple[int, int], note: str = "", extras: str = "") -> str:
+                counts: Tuple[int, int], note: str = "", extras: str = "",
+                images: Optional[EmailImages] = None, image_mode: str = "cid",
+                labels: Optional[Dict[str, str]] = None, labels_note: str = "") -> str:
     """一份完整的 HTML 文档：邮件正文和附件都用它（附件要能单独用浏览器打开）。样式全部内联 —— 邮件客户端常把 <style> 剥掉"""
     start = (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
     end = now.strftime("%Y-%m-%d %H:%M")
@@ -896,6 +1206,8 @@ def render_html(sections: List[dict], days: int, now: datetime, title: str,
     legend = (f' · <span style="{_RECENT_TAG}">近 {RECENT_HOURS} 小时发表</span>'
               if any(t.get("recent_root") or any(r.get("recent") for r in t["replies"])
                      for s in sections for t in s["threads"]) else "")
+    label_note = (f'<p style="{_META};margin:0 0 12px">{_esc(labels_note)}</p>'
+                  if labels_note else "")
     return (
         '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
         f'<title>{_esc(title)}</title></head>'
@@ -903,7 +1215,7 @@ def render_html(sections: List[dict], days: int, now: datetime, title: str,
         f'<div style="{_FONT};max-width:760px;margin:0 auto;color:#111827;font-size:14px">'
         '<h2 style="margin:0 0 4px;font-size:18px">HYXi 新回复 / 新主贴摘要</h2>'
         f'<p style="{_META};margin:0 0 12px">近 {days} 天（{start} ～ {end}）· {_label(*counts)}{extras} · 只含已采集到的数据{legend}</p>'
-        f'{note}{"".join(_section_html(s, days) for s in sections)}'
+        f'{label_note}{note}{"".join(_section_html(s, days, images=images, image_mode=image_mode, labels=labels) for s in sections)}'
         f'<p style="{_META};margin-top:20px">由 HYXi 舆情分析平台发送 · 生成于 {end}</p>'
         '</div></body></html>'
     )
@@ -945,21 +1257,38 @@ def subject_for(sections: List[dict], days: int, counts: Tuple[int, int]) -> str
     return f"【HYXi】{label}{more} · 近 {days} 天 · {_label(*counts)}{_extras_note(*_extras(sections))}"
 
 
-def _new_message(cfg: dict, subject: str) -> EmailMessage:
-    msg = EmailMessage()
+# 测试邮件和摘要邮件共用的 From 显示名。**非 ASCII 显示名必须只把显示名交给 formataddr 编码**，
+# 不能把 EmailMessage 的 From header 对象直接赋给 MIMEMultipart（见 _set_headers）
+_FROM_NAME = "HYXi 舆情分析"
+
+
+def _set_headers(msg: Message, cfg: dict, subject: str) -> None:
+    """给 EmailMessage / MIMEMultipart 写同一套顶层 header。
+
+    QQ 等严格服务器会拒收把「显示名 + 地址」整体编码成一个 RFC 2047 encoded-word 的 From。
+    formataddr 只编码显示名，地址留在 encoded-word 外面；测试邮件和摘要邮件必须走同一条路。
+    """
     msg["Subject"] = subject
-    msg["From"] = Address(display_name="HYXi 舆情分析", addr_spec=cfg["sender"])
+    msg["From"] = formataddr((_FROM_NAME, cfg["sender"]))
     msg["To"] = ", ".join(cfg["recipients"])
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain=cfg["sender"].rsplit("@", 1)[-1])
+
+
+def _new_message(cfg: dict, subject: str) -> EmailMessage:
+    msg = EmailMessage()
+    _set_headers(msg, cfg, subject)
     return msg
 
 
-def build_message(cfg: dict, sections: List[dict], days: int, now: datetime) -> EmailMessage:
+def _digest_layout(sections: List[dict], days: int, now: datetime) -> Dict[str, object]:
+    """组一封邮件/一份预览共用的版式：计数、主题、正文/附件切分、未附说明、图片选择。
+
+    预览和真实发送必须用同一份版式，否则「预览里好的、发出去的不一样」。
+    """
     counts = _counts(sections)
     total = sum(counts)
     subject = subject_for(sections, days, counts)
-    msg = _new_message(cfg, subject)
     attach = total > BODY_LIMIT
     filename = f"hyxi-digest-{now:%Y%m%d-%H%M}.html"
     body_sections, note = sections, ""
@@ -968,14 +1297,138 @@ def build_message(cfg: dict, sections: List[dict], days: int, now: datetime) -> 
         note = (f'<p style="margin:0 0 12px;padding:8px 10px;background:#fffbeb;border:1px solid #fde68a;'
                 f'border-radius:6px">新内容共 {total} 条（{_label(*counts)}），正文只列最新的 {BODY_LIMIT} 条；'
                 f'完整的 {total} 条见附件「{filename}」（用浏览器打开）。</p>')
-    msg.set_content(f"{subject}\n\n本邮件是 HTML 格式，请用支持 HTML 的邮件客户端查看"
-                    + (f"；完整内容见附件 {filename}" if attach else "") + "。\n")
     extras = _extras_note(*_extras(sections))
-    msg.add_alternative(render_html(body_sections, days, now, subject, counts, note, extras), subtype="html")
+    images = EmailImages()
+    images.select(_iter_posts(body_sections))
     if attach:
-        msg.add_attachment(render_html(sections, days, now, subject, counts, extras=extras),
-                           subtype="html", filename=filename)
-    return msg
+        images.select(_iter_posts(sections))
+    return {
+        "counts": counts, "total": total, "subject": subject, "attach": attach,
+        "filename": filename, "body_sections": body_sections, "note": note,
+        "extras": extras, "images": images,
+    }
+
+
+def build_message(cfg: dict, sections: List[dict], days: int, now: datetime,
+                  labels: Optional[Dict[str, str]] = None, labels_note: str = "") -> Message:
+    layout = _digest_layout(sections, days, now)
+    counts = layout["counts"]
+    subject = layout["subject"]
+    attach = layout["attach"]
+    filename = layout["filename"]
+    body_sections = layout["body_sections"]
+    note = layout["note"]
+    extras = layout["extras"]
+    images = layout["images"]
+    plain = (f"{subject}\n\n本邮件是 HTML 格式，图片已嵌入 HTML 版；请用支持 HTML 的邮件客户端查看"
+             + (f"；完整内容见附件 {filename}" if attach else "") + "。\n")
+
+    # MIME 结构照 Microsoft/Exchange 的推荐写法：related 包住 alternative，图片与 alternative 平级。
+    # 不能做成 alternative 里面再套 related —— Outlook 对那种嵌套的兼容性更差。
+    alternative = MIMEMultipart("alternative")
+    alternative.attach(MIMEText(plain, "plain", "utf-8"))
+    alternative.attach(MIMEText(render_html(body_sections, days, now, subject, counts, note, extras,
+                                            images=images, image_mode="cid",
+                                            labels=labels, labels_note=labels_note), "html", "utf-8"))
+    inline = images.inline_parts()
+    if inline:
+        root = MIMEMultipart("related")
+        root.attach(alternative)
+        for cid, info in inline:
+            part = MIMEImage(info["data"], _subtype=info["subtype"])
+            part.add_header("Content-ID", cid)
+            part.add_header("Content-Disposition", "inline", filename=info["filename"])
+            root.attach(part)
+    else:
+        root = alternative
+    if attach:
+        top = MIMEMultipart("mixed")
+        top.attach(root)
+        html_attachment = MIMEText(render_html(sections, days, now, subject, counts, extras=extras,
+                                               images=images, image_mode="data",
+                                               labels=labels, labels_note=labels_note), "html", "utf-8")
+        html_attachment.add_header("Content-Disposition", "attachment", filename=filename)
+        top.attach(html_attachment)
+    else:
+        top = root
+    _set_headers(top, cfg, subject)
+    return top
+
+
+def _preview_anchors(source_ids: List[str]) -> Dict[str, datetime]:
+    """预览只读补发起点：不调用 _anchors()，避免预览顺手把缺的起点写进配置。"""
+    raw = _raw_anchors()
+    out: Dict[str, datetime] = {}
+    for sid in source_ids:
+        try:
+            out[sid] = datetime.fromisoformat(raw[sid])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _label_counts(labels: Dict[str, str]) -> Dict[str, int]:
+    counts = {label: 0 for label in LABEL_TEXT}
+    for label in labels.values():
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def _render_preview_html(sections: List[dict], layout: Dict[str, object],
+                         labels: Dict[str, str], labels_note: str) -> Tuple[str, str]:
+    """预览 HTML：正文和附件都用 data URI，浏览器里能直接看图；版式/标签/着色与发送同源。"""
+    body_html = render_html(
+        layout["body_sections"], layout["days"], layout["now"], layout["subject"],
+        layout["counts"], layout["note"], layout["extras"],
+        images=layout["images"], image_mode="data", labels=labels, labels_note=labels_note,
+    )
+    attachment_html = ""
+    if layout["attach"]:
+        attachment_html = render_html(
+            sections, layout["days"], layout["now"], layout["subject"],
+            layout["counts"], extras=layout["extras"],
+            images=layout["images"], image_mode="data", labels=labels, labels_note=labels_note,
+        )
+    return body_html, attachment_html
+
+
+async def preview_digest(now: Optional[datetime] = None) -> dict:
+    """只读预览当前会发出的摘要：不发送、不写 notified_at、不改 anchors、不采集、不补译。"""
+    cfg = load_config()
+    if not cfg["saved"]:
+        raise ValueError("邮件通知还没配置，请先保存配置再预览")
+    days = cfg["days"] or DAYS_DEFAULT
+    registry = {s["id"]: s for s in source_service.list_sources()}
+    sources = [registry[sid] for sid in cfg["source_ids"] if sid in registry]
+    if not sources:
+        raise ValueError("所选的数据源都已被删除，请到「邮件通知」页重新选择")
+    now = now or datetime.now()
+    sections = collect_fresh(sources, days, now, _preview_anchors([s["id"] for s in sources]))
+    replies, roots = _counts(sections)
+    if not replies + roots:
+        html = render_html([], days, now, "HYXi 新回复 / 新主贴摘要（预览）", (0, 0))
+        return {
+            "subject": f"近 {days} 天没有新回复和新主贴", "reply_count": 0, "root_count": 0,
+            "late_count": 0, "repeat_count": 0,
+            "label_counts": {label: 0 for label in LABEL_TEXT}, "labels_note": "",
+            "body_html": html, "attachment_html": "", "attachment_name": "", "body_truncated": False,
+        }
+
+    labels, labels_note = await classify_posts(_label_items(sections))
+    layout = _digest_layout(sections, days, now)
+    layout["days"] = days
+    layout["now"] = now
+    body_html, attachment_html = await asyncio.to_thread(
+        _render_preview_html, sections, layout, labels, labels_note)
+    late, repeat = _extras(sections)
+    return {
+        "subject": layout["subject"], "reply_count": replies, "root_count": roots,
+        "late_count": late, "repeat_count": repeat,
+        "label_counts": _label_counts(labels), "labels_note": labels_note,
+        "body_html": body_html, "attachment_html": attachment_html,
+        "attachment_name": layout["filename"] if layout["attach"] else "",
+        "body_truncated": bool(layout["attach"]),
+    }
 
 
 # ===== 发信 =====
@@ -1132,7 +1585,7 @@ def _pinned(cfg: dict, host: str, port: int, error: ssl.SSLCertVerificationError
     raise UntrustedCertificate(f"{refused}，为了不把密码交给冒充的服务器，没有继续发送。读到的证书指纹（SHA-256）：{shown}", cert)
 
 
-def deliver(cfg: dict, msg: EmailMessage) -> None:
+def deliver(cfg: dict, msg: Message) -> None:
     """把信交给 SMTP 服务器（阻塞，调用方放进线程跑）。失败一律抛 NotifyError，消息是能照着改的人话。
 
     证书照常严格校验（ssl.create_default_context）：不校验的话，冒充的服务器就能拿到密码。

@@ -35,13 +35,16 @@ def ts(hours_ago: float) -> str:
     return (datetime.now() - timedelta(hours=hours_ago)).strftime("%d-%m-%Y %H:%M")
 
 
-def post(fp, user, hours_ago, content, translation="", parent=None, level=0, src=FB):
-    return {
+def post(fp, user, hours_ago, content, translation="", parent=None, level=0, src=FB, images=None):
+    data = {
         "username": user, "timestamp": ts(hours_ago), "content": content, "translation": translation,
         "page_number": 1, "fingerprint": fp, "source": src, "message_id": f"m_{fp}",
         "parent_fingerprint": parent, "reply_level": level,
         **({"_processed": {"translated": True}} if translation else {}),
     }
+    if images:
+        data["images"] = list(images)
+    return data
 
 
 def trust(fingerprint: str, host: str = "localhost") -> dict:
@@ -223,7 +226,10 @@ class _NotifyBase:
 
     @staticmethod
     def _attachments(msg):
-        return [(a.get_filename(), a.get_content()) for a in msg.iter_attachments()]
+        """普通附件（HTML 摘要）；related 里的 inline CID 图不算附件"""
+        return [(a.get_filename(), a.get_content()) for a in msg.iter_attachments()
+                if not (a.get_content_maintype() == "image"
+                        and (a.get("Content-Disposition") or "").lower().startswith("inline"))]
 
     def _tints(self, html):
         """{文字: 它是不是显示在「近 24 小时」的底色上}。看离它最近的、带背景色的那层 div —— 主贴那块、回复那块、
@@ -728,6 +734,34 @@ class TestNotifySmtpEndToEnd(_NotifyBase):
 class TestNotifyDigestEndToEnd(_NotifyBase):
     """「立即发送」整条链路：选新回复（基准 = 当前时间）→ 组 HTML → 真 SMTP 收到"""
 
+    def test_the_digest_from_header_keeps_the_address_outside_the_encoded_word(self):
+        """QQ 550 回归：MIMEMultipart 顶层的 From 只能编码显示名，地址必须留在 encoded-word 外面。
+
+        旧实现把 EmailMessage 的 From header 对象复制到 MIMEMultipart，整串
+        「HYXi 舆情分析 <地址>」被编码成一个 encoded-word，QQ 判 RFC 2047 非法拒收。
+        """
+        from email import message_from_bytes, policy
+        from app.services.notify_service import build_message
+
+        cfg = self._payload()
+        root = post("r1", "u_r1", 1, "问题", "问题-zh")
+        section = {
+            "source": {"id": FB, "name": "HYXi 用户群"},
+            "collector_name": "Facebook 公开小组",
+            "base": datetime.now(),
+            "threads": [{"root": root, "new_root": True, "late_root": False,
+                         "repeat_root": False, "recent_root": False,
+                         "clip_root": False, "replies": []}],
+        }
+        msg = build_message(cfg, [section], 1, datetime.now())
+        raw = msg.as_bytes()
+        header_blob = raw.split(b"\n\n", 1)[0].decode("utf-8", "replace")
+        from_line = next(line for line in header_blob.splitlines() if line.startswith("From:"))
+        assert f"<{cfg['sender']}>" in from_line, from_line
+        parsed = message_from_bytes(raw, policy=policy.default)
+        assert parsed["From"].addresses[0].addr_spec == cfg["sender"]
+        assert "HYXi 舆情分析" in str(parsed["From"]), parsed["From"]
+
     def test_the_default_window_is_one_day_back_from_now(self):
         import smtp_site
         self._seed_standard()
@@ -1041,6 +1075,380 @@ class TestNotifyDigestEndToEnd(_NotifyBase):
         status = self.notify.status()
         assert status["last"]["trigger"] == "schedule" and status["last"]["outcome"] == "sent", status
         assert len(site.messages) == 1
+
+
+class TestNotifyImagesEndToEnd(_NotifyBase):
+    """邮件配图：正文用 cid 内嵌、HTML 附件用 data URI；缺图/超限不能拦住邮件"""
+
+    def _image(self, rel, size=(120, 80), fmt="JPEG", color=(200, 30, 30)):
+        """在临时 data/media 下造一张真图，返回 (相对路径, 绝对路径)"""
+        from PIL import Image
+        path = os.path.join(self.cfg.settings.data_dir, "media", rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        Image.new("RGB", size, color).save(path, format=fmt)
+        return rel, path
+
+    def _seed_with_reply(self, images):
+        self._seed([
+            post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+            post("c1", "u_c1", 1, "C1-orig", "C1-zh", parent="r1", level=1, images=images),
+        ])
+
+    def test_images_are_inlined_in_the_body(self):
+        import smtp_site
+        rel, path = self._image("src_nf_fb/pic.jpg", size=(1920, 1169))
+        self._seed_with_reply([rel])
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["outcome"] == "sent", status
+        msg = site.message()
+        # Microsoft/Exchange 推荐结构：related 里放 alternative，图片与 alternative 平级
+        assert msg.get_content_type() == "multipart/related", msg.get_content_type()
+        assert msg.get_payload()[0].get_content_type() == "multipart/alternative"
+        body = self._html(msg)
+        assert "邮件里不附图片" not in body
+        match = re.search(r'<img[^>]+src="cid:([^"]+)"', body)
+        assert match, body
+        assert 'width="600"' in body, "1920 宽的图显示宽度要收到 600"
+        image_parts = [p for p in msg.walk() if p.get_content_maintype() == "image"]
+        assert len(image_parts) == 1, [p.get_content_type() for p in msg.walk()]
+        part = image_parts[0]
+        assert part.get_content_type() == "image/jpeg"
+        assert part.get("Content-ID") == f"<{match.group(1)}>", (part.get("Content-ID"), match.group(1))
+        with open(path, "rb") as f:
+            assert part.get_content() == f.read(), "正文里的图不是原图字节"
+        assert self._attachments(msg) == [], "内嵌图不该被列成普通附件"
+        assert "data:image" not in body
+
+    def test_images_are_embedded_in_the_html_attachment_too(self):
+        import smtp_site
+        rel1, path1 = self._image("src_nf_fb/a.jpg", color=(255, 0, 0))
+        rel2, path2 = self._image("src_nf_fb/b.jpg", color=(0, 0, 255))
+        posts = [post("root", "u_root", 30 * 24, "ROOT-orig", "ROOT-zh")]
+        for i in range(1, 22):
+            p = post(f"n{i:02d}", f"u_n{i:02d}", i / 60, f"N{i:02d}-orig", f"N{i:02d}-zh",
+                     parent="root", level=1)
+            if i == 1:
+                p["images"] = [rel1]
+            if i == 21:
+                p["images"] = [rel2]
+            posts.append(p)
+        self._seed(posts)
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["attachment"] is True, status
+        msg = site.message()
+        assert msg.get_content_type() == "multipart/mixed", msg.get_content_type()
+        assert msg.get_payload()[0].get_content_type() == "multipart/related"
+        assert msg.get_payload()[0].get_payload()[0].get_content_type() == "multipart/alternative"
+        body = self._html(msg)
+        assert "N01-orig" in body and "N21-orig" not in body
+        assert re.search(r'<img[^>]+src="cid:', body)
+        (name, full), = self._attachments(msg)
+        assert name.endswith(".html") and "N01-orig" in full and "N21-orig" in full, name
+        assert "cid:" not in full, "附件单独打开时 cid: 解析不了"
+        for p in (path1, path2):
+            with open(p, "rb") as f:
+                encoded = base64.b64encode(f.read()).decode("ascii")
+            assert f"data:image/jpeg;base64,{encoded}" in full, p
+        # 正文里只有 N01 的内联图；N21 只在附件里
+        assert len([p for p in msg.walk() if p.get_content_maintype() == "image"]) == 1
+
+    def test_missing_or_out_of_media_images_are_noted_without_failing_the_mail(self):
+        import smtp_site
+        self._seed([
+            post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+            post("c1", "u_c1", 1, "C1-orig", "C1-zh", parent="r1", level=1,
+                 images=["src_nf_fb/missing.jpg", "../hyxi.db"]),
+        ])
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["outcome"] == "sent", status
+        msg = site.message()
+        body = self._html(msg)
+        assert "<img" not in body
+        assert "未附" in body and "文件已丢失或路径不可用" in body, body
+        assert [p for p in msg.walk() if p.get_content_maintype() == "image"] == []
+
+    def test_a_webp_image_is_converted_for_mail_clients(self):
+        import smtp_site
+        try:
+            rel, _path = self._image("src_nf_fb/pic.webp", fmt="WEBP", color=(0, 160, 0))
+        except Exception as e:      # 极少数 Pillow 没带 WebP 插件
+            pytest.skip(f"Pillow 不支持 WebP：{e}")
+        old = self.notify.BODY_LIMIT
+        self.notify.BODY_LIMIT = 1
+        try:
+            self._seed([
+                post("root", "u_root", 30 * 24, "ROOT-orig", "ROOT-zh"),
+                post("n01", "u_n01", 1 / 60, "N01-orig", "N01-zh", parent="root", level=1, images=[rel]),
+                post("n02", "u_n02", 2 / 60, "N02-orig", "N02-zh", parent="root", level=1),
+            ])
+            with smtp_site.SmtpSite() as site:
+                status = self._send(site, source_ids=[FB])
+        finally:
+            self.notify.BODY_LIMIT = old
+        assert status["last"]["attachment"] is True, status
+        msg = site.message()
+        parts = [p for p in msg.walk() if p.get_content_maintype() == "image"]
+        assert [p.get_content_type() for p in parts] == ["image/jpeg"], [p.get_content_type() for p in parts]
+        (_, full), = self._attachments(msg)
+        assert "data:image/jpeg;base64," in full and "image/webp" not in full
+
+    def test_a_png_image_keeps_its_png_bytes(self):
+        import smtp_site
+        rel, path = self._image("src_nf_fb/pic.png", size=(80, 60), fmt="PNG")
+        self._seed_with_reply([rel])
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["outcome"] == "sent", status
+        msg = site.message()
+        parts = [p for p in msg.walk() if p.get_content_maintype() == "image"]
+        assert [p.get_content_type() for p in parts] == ["image/png"]
+        with open(path, "rb") as f:
+            assert parts[0].get_content() == f.read(), "PNG 不该被无条件转成 JPEG"
+
+    def test_the_image_budget_skips_what_does_not_fit_and_says_so(self):
+        import smtp_site
+        rel1, path1 = self._image("src_nf_fb/one.jpg", size=(40, 40))
+        rel2, _path2 = self._image("src_nf_fb/two.jpg", size=(40, 40), color=(0, 200, 0))
+        old = getattr(self.notify, "EMAIL_IMAGE_TOTAL_BYTES", 3 * 1024 * 1024)
+        self.notify.EMAIL_IMAGE_TOTAL_BYTES = os.path.getsize(path1) + 1
+        try:
+            self._seed_with_reply([rel1, rel2])
+            with smtp_site.SmtpSite() as site:
+                status = self._send(site, source_ids=[FB])
+        finally:
+            self.notify.EMAIL_IMAGE_TOTAL_BYTES = old
+        assert status["last"]["outcome"] == "sent", status
+        body = self._html(site.message())
+        assert body.count("<img") == 1, body
+        assert "超出邮件大小限制" in body, body
+
+    def test_a_post_shows_at_most_six_images(self):
+        import smtp_site
+        rels = [self._image(f"src_nf_fb/p{i}.jpg", size=(40, 40), color=(i * 20, 0, 0))[0] for i in range(8)]
+        self._seed_with_reply(rels)
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["outcome"] == "sent", status
+        body = self._html(site.message())
+        assert body.count("<img") == 6, body
+        assert "单帖最多" in body, body
+
+    def test_an_image_on_a_context_root_is_shown_too(self):
+        import smtp_site
+        rel, _path = self._image("src_nf_fb/root.jpg")
+        self._seed([
+            post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh", images=[rel]),
+            post("c1", "u_c1", 1, "C1-orig", "C1-zh", parent="r1", level=1),
+        ])
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["outcome"] == "sent", status
+        body = self._html(site.message())
+        assert re.search(r'<img[^>]+src="cid:', body), body
+
+    def test_a_post_with_only_an_image_shows_it(self):
+        import smtp_site
+        rel, _path = self._image("src_nf_fb/only.jpg")
+        self._seed([
+            post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"),
+            post("c1", "u_c1", 1, "", "", parent="r1", level=1, images=[rel]),
+        ])
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["outcome"] == "sent", status
+        body = self._html(site.message())
+        assert re.search(r'<img[^>]+src="cid:', body), body
+        assert "配图如下" in body and "可能是图片" not in body, body
+
+class TestNotifyLabelsEndToEnd(_NotifyBase):
+    """邮件帖子类型标签：问题反馈 / 咨询 / 正常交流 / 未分类；正文和附件都标，失败不拦发信"""
+
+    def _seed_types(self, n=21):
+        """一个老主贴（咨询）+ n 条新回复；N01 报错、N02 分享、N21 故障。
+        N21 只会出现在正文的附件里（正文只列最新 20 条）。"""
+        posts = [post("root", "u_root", 40 * 24, "请问这款支持并联吗", "请问这款支持并联吗-zh")]
+        for i in range(1, n + 1):
+            if i == 1:
+                content = "升级后一直报错 03，无法充电"
+            elif i == 2:
+                content = "我用了半年，分享一下经验"
+            elif i == n:
+                content = "我也遇到故障，无法充电"
+            else:
+                content = f"正常交流 N{i:02d}"
+            posts.append(post(f"n{i:02d}", f"u_n{i:02d}", i / 60, content,
+                              content + "-zh", parent="root", level=1))
+        self._seed(posts)
+
+    def test_type_labels_appear_in_body_and_attachment(self):
+        import smtp_site
+        server = self._llm_site().LLMSite()
+        with server as url, smtp_site.SmtpSite() as site:
+            self._configure_llm(url)
+            self._seed_types()
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["outcome"] == "sent", status
+        assert "labels" in server.seen, server.seen
+        body = self._html(site.message())
+        (_, full), = self._attachments(site.message())
+        # 正文：上下文主贴是咨询；N01 问题反馈；N02 正常交流
+        assert "❓ 咨询" in body and "🛠 问题反馈" in body and "💬 正常交流" in body, body
+        # N21 只在附件；附件里两类问题各一条，正文只有 N01 那条
+        assert full.count("🛠 问题反馈") == 2, full
+        assert body.count("🛠 问题反馈") == 1, body
+        assert full.count("❓ 咨询") == 1 and "💬 正常交流" in full
+        assert "u_n21" not in body and "u_n21" in full
+
+    def test_no_llm_marks_all_unknown_and_explains(self):
+        import smtp_site
+        self._seed_standard()
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["outcome"] == "sent", status
+        body = self._html(site.message())
+        assert "未分类" in body and "未配置 LLM" in body, body
+
+    def test_no_llm_attachment_is_marked_too(self):
+        import smtp_site
+        self._seed_types()
+        with smtp_site.SmtpSite() as site:
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["outcome"] == "sent", status
+        body = self._html(site.message())
+        (_, full), = self._attachments(site.message())
+        assert "未分类" in body and "未配置 LLM" in body, body
+        assert "未分类" in full and "未配置 LLM" in full, full
+
+    def test_a_broken_classifier_still_sends_and_explains(self):
+        import smtp_site
+        server = self._llm_site().LLMSite(label_broken=True)
+        with server as url, smtp_site.SmtpSite() as site:
+            self._configure_llm(url)
+            self._seed_standard()
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["outcome"] == "sent", status
+        assert "labels" in server.seen, server.seen
+        body = self._html(site.message())
+        assert "未分类" in body and "模型未返回" in body, body
+
+    def test_a_pure_image_post_is_classified_from_its_description(self):
+        import smtp_site
+        server = self._llm_site().LLMSite()
+        with server as url, smtp_site.SmtpSite() as site:
+            self._configure_llm(url)
+            reply = post("c1", "u_c1", 1, "", "", parent="r1", level=1)
+            reply["image_desc"] = "安装检查报告，设备报错 03"
+            self._seed([post("r1", "u_r1", 40 * 24, "R1-orig", "R1-zh"), reply])
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["outcome"] == "sent", status
+        assert "🛠 问题反馈" in self._html(site.message())
+
+    def test_the_classifier_uses_enough_output_budget_for_reasoning(self):
+        """deepseek-v4-flash 的 reasoning 计入 max_tokens：5 条/批 + 4096 才能稳定出标签。"""
+        import smtp_site
+        server = self._llm_site().LLMSite(label_min_tokens=4096)
+        with server as url, smtp_site.SmtpSite() as site:
+            self._configure_llm(url)
+            self._seed_types()
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["outcome"] == "sent", status
+        assert server.label_requests[0] == (5, 4096), server.label_requests
+        assert all(tokens >= 4096 for _, tokens in server.label_requests), server.label_requests
+        body = self._html(site.message())
+        (_, full), = self._attachments(site.message())
+        assert "未分类" not in body and "未分类" not in full
+
+    def test_a_partial_batch_is_retried_one_by_one(self):
+        import smtp_site
+        server = self._llm_site().LLMSite(label_partial=True)
+        with server as url, smtp_site.SmtpSite() as site:
+            self._configure_llm(url)
+            self._seed_types()
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["outcome"] == "sent", status
+        assert any(n == 1 for n, _ in server.label_requests), server.label_requests
+        body = self._html(site.message())
+        (_, full), = self._attachments(site.message())
+        assert "未分类" not in body and "未分类" not in full
+
+    def test_chinese_labels_are_normalized(self):
+        import smtp_site
+        server = self._llm_site().LLMSite(label_chinese=True)
+        with server as url, smtp_site.SmtpSite() as site:
+            self._configure_llm(url)
+            self._seed_types()
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["outcome"] == "sent", status
+        body = self._html(site.message())
+        assert "🛠 问题反馈" in body and "❓ 咨询" in body and "💬 正常交流" in body
+        assert "未分类" not in body
+
+    def test_issue_posts_are_tinted_red_in_body_and_attachment(self):
+        import smtp_site
+        server = self._llm_site().LLMSite()
+        with server as url, smtp_site.SmtpSite() as site:
+            self._configure_llm(url)
+            self._seed_types()
+            status = self._send(site, source_ids=[FB])
+        assert status["last"]["outcome"] == "sent", status
+        body = self._html(site.message())
+        (_, full), = self._attachments(site.message())
+        tint = "background:#fef2f2;border-left:3px solid #dc2626"
+        assert body.count(tint) == 1, body
+        assert full.count(tint) == 2, full
+
+
+class TestNotifyPreviewEndToEnd(_NotifyBase):
+    """只读预览：全部已发过也要能渲染，不发送、不写已发状态"""
+
+    def _seed_preview(self):
+        posts = [post("root", "u_root", 40 * 24, "请问这款支持并联吗", "请问这款支持并联吗-zh")]
+        for i in range(1, 22):
+            if i == 1 or i == 21:
+                content = "设备报错 03，无法充电"
+            elif i == 2:
+                content = "我用了半年，分享一下经验"
+            else:
+                content = f"正常交流 N{i:02d}"
+            posts.append(post(f"n{i:02d}", f"u_n{i:02d}", i / 60, content,
+                              content + "-zh", parent="root", level=1))
+        self._seed(posts)
+
+    def test_preview_lists_all_posts_even_when_everything_was_already_sent(self):
+        server = self._llm_site().LLMSite()
+        with server as url:
+            self._configure_llm(url)
+            self._save(self._payload(source_ids=[FB], days=3))
+            self._seed_preview()
+            all_posts = self.storage.load_posts([FB])
+            self.storage.mark_notified(all_posts, datetime.now().isoformat(timespec="seconds"))
+            notified_before = set(self.storage.notified_fingerprints(FB))
+            anchors_before = self.storage.get_app_config("notify_marks")
+            resp = self.client.post("/api/v1/notify/preview")
+            notified_after = set(self.storage.notified_fingerprints(FB))
+            anchors_after = self.storage.get_app_config("notify_marks")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["reply_count"] == 21 and data["root_count"] == 0, data
+        assert data["repeat_count"] == 21 and data["late_count"] == 0, data
+        assert data["label_counts"] == {
+            "issue": 2, "consultation": 1, "discussion": 19, "unknown": 0,
+        }, data
+        assert data["labels_note"] == ""
+        assert data["body_truncated"] is True
+        assert data["attachment_name"].startswith("hyxi-digest-")
+        tint = "background:#fef2f2;border-left:3px solid #dc2626"
+        assert tint in data["body_html"] and tint in data["attachment_html"]
+        assert "u_n21" not in data["body_html"] and "u_n21" in data["attachment_html"]
+        assert notified_after == notified_before, "预览不能写已发状态"
+        assert anchors_after == anchors_before, "预览不能改补发起点"
+
+    def test_preview_requires_saved_config(self):
+        resp = self.client.post("/api/v1/notify/preview")
+        assert resp.status_code == 400, resp.text
 
 
 class TestNotifyTranslationEndToEnd(_NotifyBase):

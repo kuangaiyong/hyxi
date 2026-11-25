@@ -4,8 +4,8 @@ import * as notifyApi from '@/api/notify'
 import { fetchSources } from '@/api/sources'
 import { useToast } from '@/composables/useToast'
 import type {
-  NotifyCertInfo, NotifyConfigInput, NotifyConfigPublic, NotifyRun, NotifySourceBrief, NotifyStatus, NotifyTestResult,
-  NotifyTrustedCert,
+  NotifyCertInfo, NotifyConfigInput, NotifyConfigPublic, NotifyPreview, NotifyRun, NotifySourceBrief,
+  NotifyStatus, NotifyTestResult, NotifyTrustedCert,
 } from '@/types/notify'
 import type { SourcePublic } from '@/types/source'
 
@@ -59,6 +59,11 @@ const trustedCerts = ref<NotifyTrustedCert[]>([])
 const saving = ref(false)
 const testing = ref(false)
 const starting = ref(false)
+// 只读预览：不发送、不改已发状态。previewSeq 让「请求还没回来就关掉」的旧响应不会把弹窗重新弹出来
+const previewing = ref(false)
+const preview = ref<NotifyPreview | null>(null)
+const previewTab = ref<'body' | 'attachment'>('body')
+let previewSeq = 0
 // 测试结果连同它测的那个地址一起存（见 smtpAddress 下面的 testResult）
 const testOutcome = ref<{ address: string; result: NotifyTestResult } | null>(null)
 const status = ref<NotifyStatus | null>(null)
@@ -241,6 +246,29 @@ async function confirmSend(collect: boolean) {
   }
 }
 
+/** 只读预览：用已保存配置和当前数据渲染正文/附件，不发送、不写已发状态 */
+async function handlePreview() {
+  const seq = ++previewSeq
+  previewing.value = true
+  preview.value = null
+  try {
+    const data = await notifyApi.previewNotify()
+    if (seq !== previewSeq) return
+    preview.value = data
+    previewTab.value = 'body'
+  } catch (e: any) {
+    if (seq === previewSeq) toast.error(errorText(e, '生成预览失败，请确认后端服务和 LLM 配置可用'))
+  } finally {
+    if (seq === previewSeq) previewing.value = false
+  }
+}
+
+function closePreview() {
+  previewSeq++
+  previewing.value = false
+  preview.value = null
+}
+
 async function handleClear() {
   if (!confirm('清除邮件通知配置？已保存的密码和每天定时发送会一起删掉。')) return
   try {
@@ -406,6 +434,16 @@ function poll() {
           </button>
           <button
             class="btn btn-outline"
+            :disabled="!isConfigured || dirty || previewing || status?.running"
+            :title="!isConfigured ? '先保存配置' : dirty ? '有未保存的修改，先保存再预览' : ''"
+            data-testid="notify-preview"
+            @click="handlePreview"
+          >
+            <span v-if="previewing" class="spinner"></span>
+            {{ previewing ? '生成预览中...' : '👁 预览当前摘要' }}
+          </button>
+          <button
+            class="btn btn-outline"
             :disabled="!isConfigured || dirty || starting || status?.running"
             :title="!isConfigured ? '先保存配置' : dirty ? '有未保存的修改，先保存再发送' : ''"
             data-testid="notify-send"
@@ -421,7 +459,7 @@ function poll() {
             data-testid="notify-clear"
             @click="handleClear"
           >清除</button>
-          <span v-if="isConfigured && dirty" class="text-sm text-secondary">有未保存的修改，「立即发送」用的是已保存的配置</span>
+          <span v-if="isConfigured && dirty" class="text-sm text-secondary">有未保存的修改，「立即发送 / 预览」用的是已保存的配置</span>
         </div>
       </div>
 
@@ -476,6 +514,54 @@ function poll() {
           </div>
         </div>
       </div>
+      <div v-if="previewing || preview" class="modal-overlay" data-testid="notify-preview-modal" @click.self="closePreview">
+        <div class="modal-content preview-modal">
+          <div class="modal-header">
+            <h3>预览当前摘要（不会发送）</h3>
+            <button class="btn btn-outline btn-sm" data-testid="notify-preview-close" @click="closePreview">关闭</button>
+          </div>
+          <div v-if="previewing" class="text-sm" style="padding: 24px 0;">
+            <span class="spinner"></span> 正在用当前配置和真实模型生成预览，可能需要十几秒...
+          </div>
+          <template v-else-if="preview">
+            <p class="preview-banner">
+              这是只读预览：不会发邮件，也不会更新「已发过」记录；窗口内已发过的内容也会列出来。
+            </p>
+            <p v-if="preview.subject" class="text-sm" style="margin: 0 0 6px;">
+              <b>标题：</b>{{ preview.subject }}
+            </p>
+            <p class="text-sm text-secondary" style="margin: 0 0 8px;">
+              近 {{ days ?? 1 }} 天 · 新回复 {{ preview.reply_count }} 条、新主贴 {{ preview.root_count }} 条
+              <span v-if="preview.repeat_count"> · 已发过 {{ preview.repeat_count }} 条</span>
+              <span v-if="preview.late_count"> · 补发 {{ preview.late_count }} 条</span>
+              <span v-if="preview.body_truncated"> · 正文只列最新 20 条，完整内容见附件</span>
+            </p>
+            <div class="preview-counts">
+              <span class="preview-count issue">🛠 问题反馈 {{ preview.label_counts.issue || 0 }}</span>
+              <span class="preview-count consultation">❓ 咨询 {{ preview.label_counts.consultation || 0 }}</span>
+              <span class="preview-count discussion">💬 正常交流 {{ preview.label_counts.discussion || 0 }}</span>
+              <span class="preview-count unknown">未分类 {{ preview.label_counts.unknown || 0 }}</span>
+            </div>
+            <p v-if="preview.labels_note" class="text-sm text-secondary" style="margin: 6px 0;">
+              {{ preview.labels_note }}
+            </p>
+            <div class="preview-tabs">
+              <button class="btn btn-sm" :class="{ 'btn-primary': previewTab === 'body' }"
+                      data-testid="notify-preview-body" @click="previewTab = 'body'">正文</button>
+              <button v-if="preview.attachment_html" class="btn btn-sm"
+                      :class="{ 'btn-primary': previewTab === 'attachment' }"
+                      data-testid="notify-preview-attachment" @click="previewTab = 'attachment'">
+                附件{{ preview.attachment_name ? `（${preview.attachment_name}）` : '' }}
+              </button>
+            </div>
+            <iframe
+              class="preview-frame"
+              :title="previewTab === 'body' ? '邮件正文预览' : '邮件附件预览'"
+              :srcdoc="previewTab === 'body' ? preview.body_html : preview.attachment_html"
+            ></iframe>
+          </template>
+        </div>
+      </div>
     </template>
   </div>
 </template>
@@ -488,5 +574,46 @@ function poll() {
   font-size: 14px;
   margin: 4px 0;
   cursor: pointer;
+}
+.preview-modal {
+  max-width: 1100px;
+  width: 96%;
+  max-height: 92vh;
+  overflow: auto;
+}
+.preview-banner {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border: 1px solid #fde68a;
+  background: #fffbeb;
+  border-radius: 6px;
+  font-size: 13px;
+}
+.preview-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0;
+}
+.preview-count {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+}
+.preview-count.issue { background: #fef2f2; color: #b91c1c; }
+.preview-count.consultation { background: #f5f3ff; color: #6d28d9; }
+.preview-count.discussion { background: #ecfdf5; color: #047857; }
+.preview-count.unknown { background: #f1f5f9; color: #6b7280; }
+.preview-tabs {
+  display: flex;
+  gap: 8px;
+  margin: 10px 0 8px;
+}
+.preview-frame {
+  width: 100%;
+  height: 65vh;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
 }
 </style>

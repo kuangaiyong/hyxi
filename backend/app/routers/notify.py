@@ -6,7 +6,8 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 
 from app.models import (
-    NotifyConfigInput, NotifyConfigPublic, NotifyPrecheck, NotifySendInput, NotifyStatus, NotifyTestResult,
+    NotifyConfigInput, NotifyConfigPublic, NotifyPrecheck, NotifyPreview,
+    NotifySendInput, NotifyStatus, NotifyTestResult,
 )
 from app.services import notify_service
 
@@ -56,6 +57,17 @@ async def precheck():
     if not notify_service.is_configured():
         raise HTTPException(status_code=400, detail="请先填好邮件通知配置并保存")
     return notify_service.precheck()
+
+
+@router.post("/preview", response_model=NotifyPreview)
+async def preview():
+    """只读预览当前会发出的摘要：不发送、不写已发状态、不改 anchors；用于验证分类/着色"""
+    if not notify_service.is_configured():
+        raise HTTPException(status_code=400, detail="请先填好邮件通知配置并保存")
+    try:
+        return await notify_service.preview_digest()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/send", response_model=NotifyStatus, status_code=202)

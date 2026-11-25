@@ -77,13 +77,13 @@ async function pickTask() {
  */
 async function pickWindows(taskId) {
     const counts = {};
-    for (const d of [3, 7, 14]) {
+    for (const d of [1, 3, 7, 14]) {
         counts[d] = (await api(
             `/api/v1/tasks/${taskId}/posts?page=1&page_size=1&fresh_days=${d}&only_fresh=true`
         )).total;
     }
-    const empty = [3, 7, 14].find(d => counts[d] === 0);
-    const nonEmpty = [14, 7, 3].find(d => counts[d] > 0);
+    const empty = [1, 3, 7, 14].find(d => counts[d] === 0);
+    const nonEmpty = [14, 7, 3, 1].find(d => counts[d] > 0);
     return empty && nonEmpty ? { empty, nonEmpty, counts } : null;
 }
 
@@ -96,6 +96,7 @@ const snapshot = (page) => page.evaluate(() => {
     return {
         搜索框: shown(document.querySelector('input[placeholder*="搜索"]')),
         只看新回复: button('只看新回复'),
+        近1天: button('近 1 天'),
         线程数: document.querySelectorAll('article.thread').length,
         空提示: empty ? empty.innerText.replace(/\s+/g, ' ').trim() : null,
         分页条: [...document.querySelectorAll('span')]
@@ -156,7 +157,16 @@ async function main() {
         check('空提示消失', s.空提示 === null, s);
 
         if (!windows) {
-            console.log('\n场景三：跳过 —— 现有数据凑不出「筛得空」和「筛得出」两个窗口');
+            console.log('\n场景三：现有数据凑不出两个窗口，只验证近 1 天选项');
+            await page.getByRole('button', { name: /只看新回复/ }).click();
+            await settle(page);
+            s = await snapshot(page);
+            check('搜索栏与开关都还在', s.搜索框 && s.只看新回复, s);
+            check('有「近 1 天」选项', s.近1天, s);
+            await page.getByRole('button', { name: /只看新回复/ }).click();
+            await settle(page);
+            s = await snapshot(page);
+            check('关掉开关回到全部', s.线程数 > 0, s);
         } else {
             console.log(`\n场景三：只看新回复，切到近 ${windows.empty} 天（后端返回 0 条）`);
             await page.getByRole('button', { name: /只看新回复/ }).click();
@@ -165,6 +175,7 @@ async function main() {
             await settle(page);
             s = await snapshot(page);
             check('搜索栏与开关都还在', s.搜索框 && s.只看新回复, s);
+            check('有「近 1 天」选项', s.近1天, s);
             check('给出了空提示', !!s.空提示, s);
             check('没有帖子', s.线程数 === 0, s);
 

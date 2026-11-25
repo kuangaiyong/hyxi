@@ -47,9 +47,9 @@ const filterDimension = ref('')
 const filterKeyword = ref('')
 /** 【发表时间】列的排序方向。默认倒序（最新在前），与结果页 / 导出的既定口径一致 */
 const timeSort = ref<'desc' | 'asc'>('desc')
-/** 导出报告里「近期新回复」工作表用的时间窗口。后端只认 3/7/14，别的会 400。
+/** 导出报告里「近期新回复」工作表用的时间窗口。后端只认 1/3/7/14，别的会 400。
  *  页面上的新回复展示已经整体搬到任务结果页，这里只剩导出还要用它 */
-const FRESH_DAYS_CHOICES = [3, 7, 14]
+const FRESH_DAYS_CHOICES = [1, 3, 7, 14]
 const freshDays = ref(7)
 
 // 所有维度列表（从数据中提取）

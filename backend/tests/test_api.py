@@ -851,6 +851,14 @@ class TestOnlyFreshFilterEndToEnd:
         wider = self._posts(page_size=200, only_fresh=True, fresh_days=7)
         assert set(self._roots(data)) <= set(self._roots(wider))
 
+    def test_the_one_day_window_is_the_narrowest_and_still_a_subset(self):
+        """新增的近 1 天：基准 20-08 10:00 时，19-08 10:00 恰好落在边界内；
+        15-08 的 D 不进 1 天；1 天结果必须是 3 天的子集"""
+        data = self._posts(page_size=200, only_fresh=True, fresh_days=1)
+        assert self._roots(data) == ["新主贴C", "老主贴A"], self._roots(data)
+        three = self._posts(page_size=200, only_fresh=True, fresh_days=3)
+        assert set(self._roots(data)) <= set(self._roots(three))
+
     def test_only_fresh_and_search_are_combined_with_and(self):
         """两个条件同时给就都生效 —— 搜到的那串不新，结果必须是空的"""
         both = self._posts(page_size=200, only_fresh=True, fresh_days=7, search="独特词乙")
@@ -865,7 +873,7 @@ class TestOnlyFreshFilterEndToEnd:
             params={"only_fresh": True, "fresh_days": 5},
         )
         assert resp.status_code == 400
-        assert "3/7/14" in resp.json()["detail"]
+        assert "1/3/7/14" in resp.json()["detail"]
 
 
 class TestOnlyFreshFlatThreadEndToEnd:

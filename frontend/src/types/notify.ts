@@ -71,6 +71,21 @@ export interface NotifyPrecheck {
   stale: NotifySourceBrief[]
 }
 
+/** 当前摘要的只读预览：不发送、不写已发状态 */
+export interface NotifyPreview {
+  subject: string
+  reply_count: number
+  root_count: number
+  late_count: number
+  repeat_count: number
+  label_counts: Record<string, number>
+  labels_note: string
+  body_html: string
+  attachment_html: string
+  attachment_name: string
+  body_truncated: boolean
+}
+
 /** 严格校验没过的那张证书 */
 export interface NotifyCertInfo {
   /** 在哪台服务器上读到的（小写）：信任它时绑在这台上 */
